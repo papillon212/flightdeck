@@ -1,4 +1,4 @@
-# Flightdeck — 설계 문서 v0.8
+# Flightdeck — 설계 문서 v0.9
 
 > 코딩 에이전트 시대의 원격 페어 프로그래밍 워크플로우 도구
 > 작성일: 2026-10-01 · 상태: 초안(Draft)
@@ -28,6 +28,12 @@
 >   - **AgentAdapter** 도입. 1차는 Claude Code이고, 이후 Codex CLI, Gemini CLI, jcode 등으로 확장한다.
 >   - 지원 등급(완전·부분·최소)을 두고, 관문은 에이전트와 무관하게 동일하게 적용한다.
 >   - 조종 넘기기·리뷰는 에이전트 종류와 무관하므로 한 에픽 안에서 여러 에이전트를 섞어 쓸 수 있다.
+> - **v0.9** (M0 로컬 검증 1~5 반영, 근거: [m0-results.md](m0-results.md))
+>   - 에이전트 편집은 도구 페이로드가 아니라 **훅이 뜬 디스크 전후 스냅샷**으로 기록한다. 오프셋 단위와 해시 기준을 명시했다(§8.6).
+>   - 체크포인트·셸 스냅샷은 **디스크 바이트 그대로** 저장한다(줄바꿈 변환·`.gitattributes` 끔). 복원 절차와 CAS를 명시했다(§8.1).
+>   - transcript는 **허용 목록 필터**를 거쳐서만 중계·저장한다(개인 정보 보호, §6.4, §8.3).
+>   - 훅 연동의 확정 사항(입출력 필드, resume, 신뢰 확인 창, 환경변수, 훅 오류 처리)을 §6.1에 기록했다.
+>   - 의견 전달 시점(다음 모델 턴), 대화 스트림 단위(블록), 메타 push 재시도 정책을 구체화했다.
 
 ---
 
@@ -167,8 +173,8 @@ interface TrackerAdapter {
 | `refs/flightdeck/ckpt/<epic-id>/<member>` | 멤버별 체크포인트 체인 | main 반영 후 `retention.ckpt_days`(기본 14일) 뒤 삭제 |
 | `refs/flightdeck/runs/<epic-id>` | 에이전트 세션 원본 (압축) | main 반영 후 `retention.runs_days`(기본 30일) 뒤 삭제 |
 
-- 체크포인트와 세션 원본은 크기가 크다. 그래서 **별도 ref**에 둔다. ref를 지우면 원격 저장소에서 실제로 공간이 회수된다(gc).
-- fetch 설정(refspec)은 확장이 관리한다.
+- 체크포인트와 세션 원본은 크기가 크다. 그래서 **별도 ref**에 둔다. ref를 지우면 원격 저장소에서 실제로 공간이 회수된다(gc). 회수 시점은 호스트의 gc 주기를 따른다.
+- fetch 설정(refspec)은 확장이 관리한다. `refs/flightdeck/*`는 기본 clone/fetch로 받아지지 않으므로 필요한 refspec(예: `+refs/flightdeck/ckpt/<epic-id>/*:refs/flightdeck/ckpt/<epic-id>/*`)을 명시해 fetch한다.
 
 ### 2.2 에픽 브랜치
 
@@ -270,6 +276,10 @@ flightdeck-config/
 | `session.started` / `session.ended` / `session.published` | sid, … |
 
 - 파일 이름은 `<ULID>-<member>.json`이다. 내용 충돌이 없다. push가 거절되면 `fetch → rebase → push`를 자동으로 재시도한다.
+  - 거절 사유(non-fast-forward, `cannot lock ref` 등)와 무관하게 같은 경로로 재시도한다. 지수 백오프에 지터를 둔다.
+  - 재시도 상한에 걸려도 이벤트를 버리지 않는다. 로컬 커밋으로 남겨 두고 다음 주기에 다시 보낸다(append-only라 안전).
+  - 대기 중인 이벤트는 한 번의 push로 묶어 보낸다.
+  - M0 확인: 클라이언트 10개가 동시에 연속 push해도 유실·rebase 충돌 0, 선형 이력. 경합이 심하면 한 이벤트가 수십 번 밀릴 수 있다.
 - 쓰레드 ID는 `t-<ULID 앞 8자>`다.
 
 ### 3.2 문서 인라인 쓰레드
@@ -534,12 +544,21 @@ retention:
 - `.mcp.json`: flightdeck MCP 서버
 
 사용자 전역 설정(`~/.claude/`)은 건드리지 않는다. 모델은 **권장 기본값**일 뿐이며 조종수가 `/model`로 바꿀 수 있다.
+- 사용자 전역 훅(`~/.claude/settings.json`)과 worktree 훅은 같은 세션에서 함께 실행된다(M0 확인).
+- **신뢰 확인 창**: 대화형 Claude Code는 처음 여는 프로젝트에서 "이 폴더를 신뢰하는가"를 묻고, 기본 선택은 "No, exit"다. 신뢰하기 전에는 프로젝트 설정(훅)이 적용되지 않는다.
+  - 신뢰는 worktree가 아니라 **원본 레포 경로** 기준으로 저장된다. 제품 레포를 한 번 신뢰하면 이후 에픽 worktree는 다시 묻지 않는다.
+  - 확장은 `~/.claude.json`을 고치지 않는다. 첫 에픽 시작 때 "Claude Code에서 이 레포를 신뢰해 주세요"를 안내한다(§9.1).
+  - headless(`-p`)는 신뢰 확인을 건너뛴다.
+- **설정 검증**: `-p` 모드는 검증에 실패한 설정 파일을 경고 없이 무시한다. 확장은 `settings.local.json`을 쓸 때 스키마를 검증하고, 세션이 시작됐는데 SessionStart 훅이 오지 않으면 "훅 미동작"으로 표시한다.
+- **경로 정규화**: 훅 입력의 `cwd`·`file_path`는 실제 경로(예: macOS `/tmp` → `/private/tmp`)로 들어온다. 쓰기 허용 목록·보호 경로(§6.2) 판정은 양쪽을 realpath로 정규화한 뒤 비교한다.
 
 #### 자동 초안 (headless)
 
 - 일감 접수 직후의 분석 초안처럼 사람이 없는 실행만 백그라운드 `claude -p`로 돌린다.
   - 같은 훅이 적용된다. `settings.local.json`이 worktree에 있기 때문이다.
 - 끝나면 확장이 조종수에게 알린다. 조종수는 그 세션을 **이어서(resume)** 대화형으로 계속한다. 본인 계정·본인 PC이므로 이어가기가 가능하다.
+  - `claude --resume <session_id>`는 같은 `session_id`, 같은 transcript 파일을 이어 쓴다. 훅에는 SessionStart `source: "resume"`이 온다(M0 확인).
+- 확장이 claude를 띄울 때는 부모 프로세스에서 물려받은 `CLAUDECODE`·`CLAUDE_CODE_*` 환경변수를 지운다. 예를 들어 `CLAUDE_CODE_CHILD_SESSION`이 상속되면 대화형 세션이 transcript를 저장하지 않는다.
 
 #### 강제의 위치
 
@@ -547,7 +566,24 @@ retention:
 - 훅을 끄고 고친 내용은 다음 경로로 걸러진다.
   - 파일 감시에 "외부 도구" 변경으로 잡혀 메모가 필수가 된다(§7.4).
   - diff 대조와 반영 서버 검증에서 걸린다.
-- 정확한 훅 입출력(추가 컨텍스트 필드, 실행 중 전달 가능 여부), `.mcp.json` 최초 승인 흐름, resume 동작은 M0에서 확정한다.
+- **훅 오류는 실행을 막지 않는다.** 종료 코드 2가 아닌 훅 오류(예외, 비정상 종료)는 에이전트 실행을 그대로 진행시키고, 모델과 사용자 모두 알아채지 못한다. 그래서 다음을 둔다.
+  - `flightdeck-hook`은 자체 오류를 확장에 보고하고, 확장은 "훅 오류 n건"을 표시한다.
+  - 훅 오류로 빠진 편집은 외부 변경 감지(§7.4)가 `external:unknown`으로 잡는다.
+
+#### 훅 입출력 (Claude Code, M0 확정)
+
+| 항목 | 내용 |
+|---|---|
+| 공통 입력 | `session_id`, `transcript_path`, `cwd`, `permission_mode`, `prompt_id`, `hook_event_name` |
+| 도구 훅 입력 | `tool_name`, `tool_input`, `tool_use_id`. PostToolUse는 `tool_response`, `duration_ms` 추가 |
+| SessionStart 입력 | `source` (`startup` \| `resume` 등) |
+| Stop 입력 | `last_assistant_message`, `stop_hook_active` |
+| 추가 컨텍스트 | `{"hookSpecificOutput": {"hookEventName": <이벤트>, "additionalContext": "…"}}`. SessionStart·UserPromptSubmit·PostToolUse에서 동작. transcript에 `hook_additional_context`로 남는다 |
+| 차단 | PreToolUse에서 `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "…"}}`. `--allowedTools`·권한 설정보다 우선하며, 사유가 오류 tool_result로 모델에 전달된다 |
+| 실행 중 전달 | 가능. PostToolUse 추가 컨텍스트는 다음 모델 턴부터 반영된다(§8.4) |
+
+- 편집 기록의 `source.message`(§8.6)에는 `prompt_id`와 `tool_use_id`를 쓴다.
+- `.mcp.json` 최초 승인 흐름과 VS Code 공식 확장에서의 동작은 M0에서 확인한다(§14).
 
 | MCP 도구 | 설명 |
 |---|---|
@@ -610,6 +646,11 @@ handoff.md 형식(강제):
 - `flightdeck_search_run(run_id?, query, max_tokens=2000)`
   - 원본 메시지를 키워드·BM25로 검색한다.
   - 앞뒤 맥락을 포함한 발췌만 반환한다.
+- **기록 종류 허용 목록 필터** (비밀값 제거보다 먼저)
+  - transcript에는 대화뿐 아니라 세션 시작 때 에이전트에게 넘긴 배경 정보도 기록된다. 계정 이메일, 사용자 전역 `CLAUDE.md`, 개인 자동 메모리, 개인 플러그인·MCP 목록, 시스템 프롬프트 전체가 여기에 해당한다(M0 확인).
+  - 그래서 저장·중계할 기록 종류를 **허용 목록**으로 정한다: 사람의 프롬프트, 에이전트의 텍스트·도구 호출, 도구 결과, Flightdeck이 주입한 컨텍스트(`hook_additional_context`). 나머지는 모두 버린다.
+  - 차단 목록이 아니라 허용 목록이므로, 에이전트 업데이트로 새 기록 종류가 생겨도 기본적으로 걸러진다. 허용 목록은 어댑터가 정한다(`transcript()`, §6.5).
+  - 부수 효과로 크기도 크게 준다(작은 세션 260KB 중 약 90%가 버리는 부분).
 - 비밀값 제거
   - 환경변수 값, 토큰 패턴(정규식), `.env` 내용을 저장 전에 가린다.
   - 세션 시작 시 "이 실행은 기록됩니다"를 표시한다.
@@ -627,8 +668,8 @@ interface AgentAdapter {
   protectedPaths(): string[];                      // 에이전트가 고치면 안 되는 설정 파일 (§6.2)
   parseHookEvent(raw: unknown): HookEvent;         // 도구별 훅 입력 → 공통 이벤트
   renderHookResponse(r: HookResponse): HookOutput; // 허용/거부/추가 컨텍스트 → 도구별 출력·종료 코드
-  extractEdits(e: ToolEvent): Edit[];              // Edit/Write, apply_patch 등 → 공통 편집 기록 (§8.6)
-  transcript?(s: SessionRef): AsyncIterable<TranscriptItem>; // 관찰 뷰·원본 검색용
+  extractEdits(e: ToolEvent, before: FileSnapshot, after: FileSnapshot): Edit[]; // 디스크 전후 스냅샷 → 공통 편집 기록. 페이로드는 범위 분할 힌트 (§8.6)
+  transcript?(s: SessionRef): AsyncIterable<TranscriptItem>; // 관찰 뷰·원본 검색용. 허용 목록 필터 적용 (§6.4)
   headless?(prompt: string, o: RunOpts): Promise<SessionRef>; // 자동 초안
   resumeCommand?(s: SessionRef): string;           // 초안 이어가기
   capabilities: {
@@ -780,6 +821,14 @@ verification: "pnpm test auth  # ✅ 12 passed"
 
 - 체크포인트에는 그 시점의 편집 기록 순번(`Flightdeck-Seq`)을 trailer로 남긴다. git 스냅샷과 편집 기록이 서로를 가리킨다.
 
+**구현 규칙 (M0 확인)**
+- **디스크 바이트 그대로 저장한다.** 체크포인트를 만드는 git 호출에는 `-c core.autocrlf=false`와 `GIT_ATTR_SOURCE=<빈 트리 4b825dc…>`를 줘서 줄바꿈 변환과 레포 `.gitattributes`(filter 포함)를 끈다. 그래야 편집 기록의 `base_hash`(§8.6)와 체크포인트가 같은 바이트를 가리키고, 복원 결과가 그 시점 디스크와 바이트 단위로 같다.
+  - 대가: LFS 대상 파일도 원본 그대로 체크포인트에 들어간다. 체크포인트는 별도 ref라 retention 후 회수된다(§2.1).
+  - 에픽 브랜치 커밋(단계 전환·제출)은 레포 규칙대로 변환한다. 체크포인트만 예외다.
+- 임시 index는 사용자 index를 복사해 만든다(stat 캐시 재사용). 사용자 index·HEAD·브랜치는 건드리지 않는다.
+- `update-ref`는 항상 **이전 값을 지정(CAS)**한다. 커스텀 ref에는 reflog가 남지 않으므로 덮어쓰기 실수를 되돌릴 수단이 없다. 이력은 커밋 체인(parent)으로만 따라간다.
+- **복원 절차**: 복원 직전 상태를 체크포인트로 남김 → 임시 index에 현재 트리를 `read-tree` → `update-index --refresh`로 stat 정보 채움 → `read-tree -m -u <현재 트리> <대상 체크포인트>`. 대상에 없는 파일의 삭제까지 처리되고 사용자 index는 그대로다.
+
 ### 8.2 조종수 모델
 
 XP 페어 프로그래밍에서는 드라이버가 작성하고 내비게이터가 방향을 잡는다. 에이전트 시대에는 **에이전트가 작성하고 사람들이 방향을 잡는다**. 그래서 같은 텍스트를 함께 고치는 동시 편집 대신, **한 명이 조종하고 나머지가 실시간으로 보며 의견을 내는** 구조로 한다.
@@ -801,9 +850,10 @@ XP 페어 프로그래밍에서는 드라이버가 작성하고 내비게이터�
 
 | 스트림 | 내용 | 관찰자 화면 |
 |---|---|---|
-| **대화 스트림** | 조종수 세션의 대화 전체: 조종수의 지시, 에이전트 메시지, 도구 호출, 결과. 출처는 두 가지다. ① 훅이 알려준 **세션 기록 파일(`transcript_path`)을 따라 읽기** ② 훅 이벤트 자체. 세션 기록 파일 형식은 공식 규격이 아니므로 너그러운 파서를 쓰고, 읽지 못하면 ②만으로 진행 상황을 보여준다 | Flightdeck 패널의 **읽기 전용 대화 뷰** (입력 기능 없음) |
+| **대화 스트림** | 조종수 세션의 대화: 조종수의 지시, 에이전트 메시지, 도구 호출, 결과. 출처는 두 가지다. ① 훅이 알려준 **세션 기록 파일(`transcript_path`)을 따라 읽기** ② 훅 이벤트 자체. 세션 기록 파일 형식은 공식 규격이 아니므로 너그러운 파서를 쓰고, 읽지 못하면 ②만으로 진행 상황을 보여준다. **§6.4의 허용 목록 필터를 거친 기록만** 보낸다 | Flightdeck 패널의 **읽기 전용 대화 뷰** (입력 기능 없음) |
 | **편집 스트림** | 편집 기록(§8.6)을 생기는 즉시 전송 | 읽기 전용 창에 바로 적용. 바뀐 파일·줄 강조, "조종수 커서 따라가기" 선택 가능 |
 
+- **반영 단위는 블록이다.** 세션 기록 파일에는 에이전트 메시지가 토큰 단위가 아니라 블록(생각·도구 호출·텍스트)이 끝날 때마다 기록된다. 블록이 기록된 뒤 관찰자가 읽기까지는 1초 안이다(M0: 85~600ms). 긴 답변이나 긴 생각은 끝날 때까지 보이지 않는다. 그동안은 훅 이벤트(②)로 "작업 중"을 표시한다.
 - **사람이 보는 것은 토큰을 쓰지 않는다.** 그래서 관찰자에게는 대화 전체를 보여준다. 에이전트에게 넘기는 맥락만 3계층 기록(§6.4)으로 줄인다.
 - 쓰는 사람이 한 명이라 관찰자 쪽은 편집을 **순서대로 적용**만 하면 된다. 충돌 해결이 없다.
 - 늦게 들어온 관찰자는 최신 체크포인트와 그 이후 편집 기록을 받아 따라잡는다.
@@ -823,6 +873,9 @@ XP 페어 프로그래밍에서는 드라이버가 작성하고 내비게이터�
 | 처리 | 동작 |
 |---|---|
 | **에이전트에 전달** | 그대로 또는 고쳐서 전달 대기열에 넣는다. 에이전트가 실행 중이면 **다음 PostToolUse 훅의 추가 컨텍스트**로 들어간다. 멈춰 있으면 조종수의 다음 프롬프트에 **UserPromptSubmit 훅**이 붙인다. 표시 형식: `[관찰자 @park 의견 · 조종수 전달] …` |
+
+- **반영 시점**: PostToolUse로 주입된 의견은 **다음 모델 턴부터** 반영된다. 에이전트가 한 턴에 여러 도구 호출을 이미 요청했다면, 남은 호출은 의견과 무관하게 그대로 실행된다(M0 확인: 파일 3개 쓰기를 한 메시지로 요청한 경우).
+- **급한 의견**(중지·금지 등)은 PreToolUse 훅이 대기열을 확인해 해당 도구 호출을 거부하고, 의견을 거부 사유로 돌려주는 경로를 둔다. 같은 턴 안의 남은 호출도 막을 수 있다. 이 경로는 M0에서 확인한다.
 | **쓰레드로 남기기** | 해당 위치에 쓰레드를 만든다 (공식 기록) |
 | **답장** | 관찰자에게만 짧게 답한다 |
 | **닫기** | 처리 없이 닫는다 |
@@ -857,8 +910,8 @@ XP 페어 프로그래밍에서는 드라이버가 작성하고 내비게이터�
 | 편집 경로 | 잡는 방법 | 출처 |
 |---|---|---|
 | 조종수의 에디터 편집 | `onDidChangeTextDocument` | `human:<member>` |
-| 에이전트 파일 편집 | `tool.after` 훅 → 어댑터의 `extractEdits()` (Claude Code는 Edit/Write 변경 전후, Codex는 패치) | `agent:<adapter>/<run>/<step>/<message_id>` |
-| 에이전트 셸 결과 (포맷터·코드 생성 등) | 명령 전후 파일 감시 → diff를 편집으로 변환 | `agent_shell:<run>/<step>/<cmd>` |
+| 에이전트 파일 편집 | `tool.before`·`tool.after` 훅이 대상 파일의 **디스크 내용을 직접 읽어** 전후 스냅샷을 뜬다 → 어댑터의 `extractEdits()`가 편집으로 변환. 도구 페이로드(Claude Code의 Edit 변경 전후 문자열, Codex의 패치)는 범위를 잘게 나누는 힌트로만 쓴다 | `agent:<adapter>/<run>/<step>/<prompt_id>/<tool_use_id>` |
+| 에이전트 셸 결과 (포맷터·코드 생성 등) | 셸 도구의 `tool.before`·`tool.after`에서 임시 index로 작업 트리 tree를 만들고(`add -A` + `write-tree`, §8.1과 같은 바이트 그대로 옵션), 두 tree의 diff를 편집으로 변환 | `agent_shell:<run>/<step>/<cmd>` |
 | 수정 제안 반영 | 패치 적용 | `patch:<thread>/<member>` |
 | 외부 반영 (main rebase 등) | diff를 편집으로 변환 | `external:<commit>` |
 | 외부 도구 변경 (Flightdeck 밖 에이전트·에디터·터미널) | 파일 감시. 위 경로에 해당하지 않는 디스크 변경 | `external:unknown` (메모 필수, §7.4) |
@@ -868,11 +921,17 @@ XP 페어 프로그래밍에서는 드라이버가 작성하고 내비게이터�
   "epic": "CU-86abc123", "file": "src/auth/token.ts", "seq": 1842,
   "base_hash": "…",                       // 편집 직전 파일 해시 (순서 검증)
   "range": [1203, 1240], "insert": "…",   // 오프셋 기준 교체
-  "source": { "kind": "agent", "member": "dh.lee", "run": "01JB7…", "step": 3, "message": "msg_…" },
+  "source": { "kind": "agent", "member": "dh.lee", "run": "01JB7…", "step": 3, "prompt_id": "…", "tool_use_id": "toolu_…" },
   "ts": "2026-10-02T10:01:22.481+09:00"
 }
 ```
 
+- **오프셋과 해시의 기준**
+  - `range`는 UTF-16 code unit 오프셋이다(VS Code `TextDocument`와 같은 기준).
+  - `base_hash`는 **디스크 원본 바이트**의 sha256이다. git 블롭이나 줄바꿈을 정규화한 문자열이 아니다.
+- **도구 페이로드만으로 기록하지 않는 이유**: Claude Code가 훅에 주는 변경 전 내용(`tool_response.originalFile`)은 줄바꿈이 LF로 바뀌어 있다. 디스크는 CRLF 그대로다. 그래서 페이로드만으로 계산한 오프셋은 CRLF 파일에서 줄마다 어긋난다. M0에서 디스크 스냅샷 방식으로 편집 10건(replace_all, 한글·이모지, CRLF, 끝 개행 없음, 2만 줄 파일, 생성·덮어쓰기, 셸 `sed -i`)을 재적용했고, 파일 10개 모두 해시가 일치했다.
+- **범위는 잘게 나눈다.** 전후 스냅샷의 공통 앞뒤만 빼면, 한 번에 여러 곳을 바꾼 편집(replace_all 등)이 바뀌지 않은 부분까지 포함한 큰 덩어리가 된다. 그 안의 앵커(§3.5)는 위치를 잃는다. 줄 단위 → 글자 단위 diff로 나누거나, 페이로드의 바뀐 문자열 위치를 디스크 내용에서 다시 찾는다.
+- **출처 오염 방지**: `tool.before`~`tool.after` 사이에 조종수가 에디터로 같은 파일을 고치면 그 변경까지 에이전트 편집으로 잡힌다. 긴 셸 명령(빌드·코드 생성) 동안 생길 수 있다. 확장은 같은 구간의 에디터 편집(`onDidChangeTextDocument`)을 빼고 기록한다.
 - **전송**: 생기는 즉시 WebSocket으로 보낸다. 끊겨 있으면 로컬에 쌓았다가 재접속 시 보낸다. 서버는 `base_hash`로 순서를 검증한다.
 - **제공하는 조회**
   - 줄 단위 출처: 이 줄은 누가, 어느 실행·Step에서, 어떤 대화 때문에 만들었나
@@ -895,6 +954,8 @@ XP 페어 프로그래밍에서는 드라이버가 작성하고 내비게이터�
          → 새 창으로 열기 → 백그라운드 claude -p로 분석 초안 작성 (자동 초안, §6.1)
   → 초안 완료 알림 → [이어서 작업]: Claude Code에서 그 세션을 이어서 대화형으로 계속
 ```
+
+- 제품 레포를 Claude Code에서 아직 신뢰하지 않았다면, 첫 [이어서 작업] 전에 "Claude Code가 이 레포를 신뢰해야 Flightdeck 훅이 동작합니다"를 안내한다. 신뢰 확인 창의 기본 선택이 "No, exit"이기 때문이다(§6.1). 한 번 신뢰하면 이후 에픽은 다시 묻지 않는다.
 
 ### 9.2 화면
 
@@ -1115,7 +1176,7 @@ flightdeck/
 
 | 단계 | 내용 | 완료 기준 |
 |---|---|---|
-| **M0 스파이크** | ① Comments API를 markdown에 적용 ② 대화형 Claude Code + worktree의 `settings.local.json` 훅(권한 차단·trace·사용자 설정과 병합, `.mcp.json` 최초 승인 흐름) ③ 훅 추가 컨텍스트로 **실행 중** 의견 전달(PostToolUse)과 단계 룰 갱신(UserPromptSubmit)이 되는지 ③-1 headless 초안 세션을 대화형으로 이어가기(resume) ③-2 `transcript_path` 세션 기록 파일 실시간 읽기 ④ Meet 회의록·전사 조회 ⑤ 메타 브랜치 동시 push ⑥ 체크포인트 숨은 커밋 push/fetch ⑦ 에디터·에이전트·셸 편집을 오프셋 편집 기록으로 빠짐없이 잡을 수 있는지(재적용 시 파일 해시 일치) | 각 항목 가능/불가 판정 |
+| **M0 스파이크** | ① Comments API를 markdown에 적용 ② 대화형 Claude Code + worktree의 `settings.local.json` 훅(권한 차단·trace·사용자 설정과 병합, `.mcp.json` 최초 승인 흐름) ③ 훅 추가 컨텍스트로 **실행 중** 의견 전달(PostToolUse)과 단계 룰 갱신(UserPromptSubmit)이 되는지 ③-1 headless 초안 세션을 대화형으로 이어가기(resume) ③-2 `transcript_path` 세션 기록 파일 실시간 읽기 ④ Meet 회의록·전사 조회 ⑤ 메타 브랜치 동시 push ⑥ 체크포인트 숨은 커밋 push/fetch ⑦ 에디터·에이전트·셸 편집을 오프셋 편집 기록으로 빠짐없이 잡을 수 있는지(재적용 시 파일 해시 일치)<br>**진행 현황(2026-10-01)**: ②의 훅 부분, ③, ③-1, ③-2, ⑤, ⑥, ⑦의 에이전트·셸 부분 **가능** ([m0-results.md](m0-results.md)). 남은 것: ①, ②의 `.mcp.json` 승인과 VS Code 공식 확장, ③의 급한 의견(PreToolUse deny) 경로, ④, ⑦의 에디터 부분, GitHub에서의 ⑤·⑥ | 각 항목 가능/불가 판정 |
 | **M1 로컬 단일 사용자** | core reducer·렌더러, **문단 ID + 편집 추적**, GitEngine 기초, **AgentAdapter 인터페이스 + claude-code 어댑터**, ANALYSIS 에이전트, handoff | 혼자 분석 → 설계 초안 |
 | **M2 원격 협업** | 서명 이벤트, 메타 브랜치 EventStore, 알림, ClickUp 일감 수신, **설정 레포 + 서버의 설정 배포**, 멤버 키 등록 | 2인이 원격으로 분석 Q&A |
 | **M3 설계 티어** | 티어 승인(서명), reapproval, 수정 요청 반영 | 설계가 2티어 통과 |
@@ -1134,7 +1195,7 @@ flightdeck/
 2. **저장소 크기**: 체크포인트와 세션 원본의 retention 기본값(14일/30일)이 적절한지 시범 운영 후 조정한다.
 3. **서버 배치와 봇 계정** (M5 전까지)
    - 서버 배치: flightdeck-server(컨테이너 + PostgreSQL + 레포 미러 디스크)를 둘 환경, DB 방식, 팀원 접속 경로(사내망/VPN, 도메인·TLS), 비밀값 보관 위치
-   - git 호스트 종류와 봇 방식: GitHub App / deploy key / 프로젝트 토큰 / 봇 사용자. 계정 생성·키 교체 담당
+   - git 호스트: **GitHub** (2026-10-01 확정). 봇 방식(GitHub App / deploy key / 봇 사용자)과 계정 생성·키 교체 담당은 미정
    - main 보호 설정: 봇만 쓰기, force push 금지. 커미터 이름·이메일
    - TeamCity의 main push 여부: 버전 올림 커밋·태그 등이 있으면 허용 목록 추가 또는 반영 서버로 이전
    - 설정 레포 관리자 지정
@@ -1154,7 +1215,7 @@ flightdeck/
 - 편집 출처 정확도 → 서버 편집 기록 (D18, §8.6)
 - 직접 수정 설명 → 메모 필수, 외부 도구 변경도 감지해 메모 필수 (§7.4)
 - Claude Code 내부 형식 의존 → **버전 업 시 즉시 대응**. 운영 방식:
-  - 확장이 설치된 Claude Code 버전을 확인한다.
+  - 확장이 Claude Code 버전을 **세션마다** 확인한다. 세션 기록 파일의 각 줄에 있는 `version`을 쓴다. Claude Code는 자동 업데이트되므로 확장 시작 시 한 번 확인하는 것으로는 부족하다(M0 중 2.1.285 → 2.1.286 업데이트를 실제로 겪음).
   - 검증된 버전 목록에 없으면 관찰 뷰를 **훅 이벤트만 쓰는 최소 모드**로 자동 전환하고, 관리자에게 알린다.
   - 세션 기록 파일 파서는 실제 세션 기록 샘플로 회귀 테스트한다.
 - 특정 에이전트 의존 → AgentAdapter + 지원 등급, 관문은 에이전트 무관 (D20, §6.5)
