@@ -16,6 +16,7 @@
 | 7 | VS Code 확장: Comments API(markdown), 에디터 편집 기록 재적용, 외부 변경 구별 | **가능**: 쓰레드 화면 위치는 VS Code가 따라가지만 API 값은 갱신 안 됨. 편집 재적용 해시 일치(한글 IME 포함) |
 | 8 | 공식 Claude Code VS Code 확장에서 worktree 훅·MCP | **가능**: 훅 4종·MCP 동작. 신뢰는 CLI와 별개로 VS Code 작업 영역 신뢰를 따름 |
 | 9 | GitHub에서 체크포인트 ref, 메타 동시 push | **가능**: 단, 삭제한 ref의 커밋을 SHA로 계속 받을 수 있음. 경합 시 반영 지연 최대 75초 |
+| 10 | Meet 회의록·전사 조회 (M0 ④) | **가능**: 회의 기록 → 회의록 Docs → 본문, 전사 항목까지 조회됨. 회의록과 전사는 한 문서의 두 탭 |
 
 ---
 
@@ -530,6 +531,43 @@ push 시도 합계 55 (이벤트당 평균 2.20, 최대 13), rebase 30, rebase �
 
 ---
 
+## 10. Meet 회의록·전사 조회 (§10.1 ⑤, M0 ④) — **가능**
+
+방법: 이미 설치된 Google Workspace CLI(`gws` 0.22.5)로 사용자 계정의 **지난 회의**를 읽기 전용으로 조회했다. 범위는 `meetings.space.readonly`를 추가했다. 회의 내용은 출력하지 않고 개수·상태·구조만 봤다. Flightdeck 자체 OAuth 앱이 아니라 gws의 OAuth 앱을 썼으므로, 확인한 것은 **API 경로와 데이터 형태**다.
+
+### 결과 (실제 출력)
+
+회의 기록 10건별 회의록·전사:
+```
+aEB_NPgAh5  smartNotes=[{"state":"FILE_GENERATED","doc":true,"keys":["document","exportUri"]}]  transcripts=[{"state":"FILE_GENERATED","doc":true}]
+wpamtpkV41  smartNotes=[]  transcripts=[]
+… (10건 중 5건에 회의록·전사 있음, 모두 FILE_GENERATED)
+```
+
+가장 최근 회의(25분, 참가자 3명):
+```
+== 회의록 Docs 본문 (구조만, documents.get 기본)
+{"title_len":60,"paragraphs":41,"headings":{"HEADING_2":1,"HEADING_3":4},"text_chars":2758,"has_hangul":true,"links":2}
+== 전사 항목 (transcripts.entries.list, pageSize 100)
+{"entries":100,"more_pages":true,"fields":["endTime","languageCode","name","participant","startTime","text"],
+ "languages":["ko-KR"],"speakers":3,"first":"2026-10-01T05:56:56.482Z","last":"2026-10-01T06:14:51.641Z"}
+== 참가자
+{"participants":3,"kinds":{"signedinUser":3}}
+== 회의록 문서와 전사 문서가 같은 문서인가: 같음
+== documents.get(includeTabsContent=true)
+[{"tab_title_len":3,"chars":2758,"children":0},{"tab_title_len":4,"chars":6914,"children":0}]
+```
+
+### 발견 사항
+1. **설계 §10.1 ⑤의 경로가 그대로 동작한다.** `conferenceRecords.list → smartNotes.list → docsDestination.document → Docs API`. 한국어 회의록(제목 구조 있음)이 읽힌다.
+2. **회의록과 전사가 한 Docs 문서의 두 탭이다.** `documents.get` 기본 호출은 첫 탭(회의록)만 돌려준다. 전사 탭까지 읽으려면 `includeTabsContent: true`가 필요하다. 다만 전사는 탭 텍스트보다 `transcripts.entries`가 낫다. 항목마다 `participant`, `startTime`, `endTime`, `languageCode`가 붙어 있어서, §10.2 앵커링 1순위(전사 문장 시각 ↔ 포커스 위치)에 바로 쓸 수 있다.
+3. **전사 항목은 페이지로 나뉜다.** 18분 구간에서 100건 이상이 나왔다(`nextPageToken` 있음). 1시간 회의면 수백 건이므로 페이지 처리가 필요하다.
+4. 회의록이 없는 회의도 많다(10건 중 5건). 회의록이 켜지지 않은 회의는 §10.1의 ⑤에서 "회의록 없음"으로 처리하고, 포커스 이벤트만으로 에픽 단위 기록을 남기는 경로가 필요하다. 회의록 자동 켜기(①)는 이번에 확인하지 않았다.
+5. **범위에 관한 주의**: 이번에는 `meetings.space.readonly`(내가 참여한 모든 회의)를 썼다. 설계의 `meetings.space.created`는 **그 앱이 만든 회의 공간만** 볼 수 있다. Flightdeck이 `spaces.create`로 만든 회의만 다루므로 설계 의도에는 맞는다. 하지만 사용자가 일반 Meet 링크로 연 회의는 가져올 수 없다. 이 제약은 B 방식(실제 회의)으로 확인해야 한다.
+6. gws 재로그인 후에도 이전 액세스 토큰 캐시 때문에 403이 계속됐다. 캐시를 치우자 해결됐다. Flightdeck이 범위를 추가할 때도 토큰을 새로 받아야 한다.
+
+---
+
 ## 설계 변경 제안 (design.md v0.9에 반영, P4(c)는 권장안인 "디스크 바이트 그대로"로 결정)
 
 판정이 "불가"인 항목은 없다. 다만 아래는 설계 문서의 서술과 실제 동작이 다르거나, 설계에 없던 처리가 필요한 부분이다.
@@ -561,6 +599,7 @@ push 시도 합계 55 (이벤트당 평균 2.20, 최대 13), rebase 30, rebase �
 | Q6 | §6.1 MCP 도구 표 | 도구 목록 | 추가: Claude Code는 MCP 도구를 지연 로딩해 처음에 `ToolSearch`로 찾는다. 도구 이름·설명에 에이전트가 검색할 단어(쓰레드, 인수인계, 단계 등)를 넣는다 | 8번 |
 | Q7 | §14 M0 | 진행 현황 | ①, ②의 `.mcp.json`·VS Code 확장, ⑦의 에디터 부분, GitHub에서의 ⑤·⑥을 **가능**으로 옮긴다 | 6~9번 |
 | Q8 | §2.1 ref 구성 | ref를 지우면 원격 저장소에서 실제로 공간이 회수된다(gc) | GitHub에서는 ref를 지워도 커밋이 SHA로 계속 받아진다. 회수 시점은 GitHub가 정한다고 고친다. 체크포인트·세션 원본에 들어간 비밀값은 ref 삭제로 지워지지 않으므로, **체크포인트 대상에서 `.env` 등 비밀 파일 패턴을 제외**하는 규칙을 §8.1에 추가한다(세션 원본은 §6.4의 비밀값 제거가 이미 있음) | 9번 |
+| Q10 | §10.1 ⑤·⑥, §10.3 | 회의록 조회: `conferenceRecords.list → smartNotes.list → docsDestination → Docs API`, 전사 사용 시 `transcripts.entries` | 추가: (a) 회의록과 전사는 한 Docs 문서의 두 탭이다. 회의록은 첫 탭, 전사 탭은 `includeTabsContent: true`로만 받아진다 (b) 앵커링 입력의 전사는 탭 텍스트가 아니라 `transcripts.entries`(화자·시각·언어 포함, 페이지 처리)를 쓴다 (c) 회의록이 생성되지 않은 회의의 처리 경로를 둔다 (d) `meetings.space.created` 범위는 Flightdeck이 만든 회의만 보이므로, "회의 시작" 버튼으로 연 회의만 대상이라고 명시한다 | 10번 |
 | Q9 | §3.7 알림, §3.1 | 20초 `ls-remote` 폴링 | GitHub 왕복이 push·fetch 각 약 4초이고 경합 시 메타 반영이 수십 초까지 밀린다는 점을 적는다. 메타 브랜치는 "수 초~수십 초 안에 반영"되는 경로이고, 실시간 경로는 서버 ④임을 명시한다 | 9번 |
 
 ### 이번에 확인하지 못한 것 (M0 남은 항목)
@@ -571,4 +610,5 @@ push 시도 합계 55 (이벤트당 평균 2.20, 최대 13), rebase 30, rebase �
 - ~~실제 git 호스트(GitHub)에서의 커스텀 ref push 허용 여부, 동시 push 거동~~ → 9번 가능. GitHub의 도달 불가 객체 정리 시점은 알 수 없음
 - PreToolUse deny로 급한 의견을 같은 턴 안에 전달하는 우회책 (P8)
 - 대형 레포에서 Bash마다 `write-tree`를 하는 비용 (P3)
-- Meet 회의록·전사 조회 (M0 ④)
+- ~~Meet 회의록·전사 조회 (M0 ④)~~ → 10번 가능(지난 회의 읽기)
+- Meet: Flightdeck 자체 OAuth 앱 + `meetings.space.created` 범위로 만든 회의에서의 조회, 회의록 자동 켜기, 회의 종료 후 회의록 생성까지 걸리는 시간 (B 방식, 실제 회의 필요)
