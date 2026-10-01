@@ -587,7 +587,7 @@ wpamtpkV41  smartNotes=[]  transcripts=[]
 | P11 | §6.1 마지막 문단 | 정확한 훅 입출력(추가 컨텍스트 필드, 실행 중 전달 가능 여부), resume 동작은 M0에서 확정 | 확정된 내용으로 바꾼다. `hookSpecificOutput.additionalContext`(SessionStart·UserPromptSubmit·PostToolUse), `permissionDecision: "deny"` + `permissionDecisionReason`, 실행 중 전달 가능(P8), `--resume`은 같은 session_id·같은 transcript를 이어 쓰고 SessionStart `source: "resume"`. 편집 기록의 `source.message`에는 모든 훅 입력에 있는 `prompt_id` + `tool_use_id`를 쓴다. `.mcp.json` 최초 승인 흐름은 아직 미확인 | 1~3번 |
 | P12 | §15 해결됨 "Claude Code 내부 형식 의존" | 확장이 설치된 Claude Code 버전을 확인 | 버전 확인을 **세션마다** 한다(transcript 각 줄의 `version`). 검증 도중 2.1.285 → 2.1.286 자동 업데이트를 실제로 겪었다 | 3번 |
 
-## 설계 변경 제안 2차 (6~8번 결과, design.md 미반영, 검토 후 반영)
+## 설계 변경 제안 2차 (6~10번 결과, design.md v0.10에 반영)
 
 | # | 절 | 현재 서술 | 제안 | 근거 |
 |---|---|---|---|---|
