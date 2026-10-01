@@ -17,6 +17,7 @@
 | 8 | 공식 Claude Code VS Code 확장에서 worktree 훅·MCP | **가능**: 훅 4종·MCP 동작. 신뢰는 CLI와 별개로 VS Code 작업 영역 신뢰를 따름 |
 | 9 | GitHub에서 체크포인트 ref, 메타 동시 push | **가능**: 단, 삭제한 ref의 커밋을 SHA로 계속 받을 수 있음. 경합 시 반영 지연 최대 75초 |
 | 10 | Meet 회의록·전사 조회 (M0 ④) | **가능**: 회의 기록 → 회의록 Docs → 본문, 전사 항목까지 조회됨. 회의록과 전사는 한 문서의 두 탭 |
+| 11 | 급한 의견: PreToolUse deny로 같은 턴의 남은 도구 호출까지 차단 (M0 ③) | **가능 (우회책)**: transcript로는 같은 메시지를 판별할 수 없어 시간 간격 규칙 사용. 훅이 죽으면 차단이 뚫림 |
 
 ---
 
@@ -568,6 +569,60 @@ wpamtpkV41  smartNotes=[]  transcripts=[]
 
 ---
 
+## 11. 급한 의견: PreToolUse deny로 같은 턴의 남은 도구 호출까지 차단 (§8.4, M0 ③) — **가능 (우회책)**
+
+코드: `spikes/10-urgent-opinion/run.sh`, `spikes/01-hooks/hook.mjs`의 `urgentReason()`
+
+### 방법
+- 관찰자가 `urgent/` 대기열에 의견을 넣으면, 훅은 다음 PreToolUse에서 그 도구 호출을 `deny`하고 의견을 거부 사유로 돌려준다.
+- 같은 assistant 메시지에서 이미 요청된 나머지 도구 호출도 거부하고, 다음 모델 턴의 호출부터 해제한다.
+- "같은 메시지"인지는 두 규칙으로 판정한다.
+  - **메시지 ID 규칙**: `transcript_path`에서 현재 `tool_use_id`가 든 assistant 메시지의 `message.id`를 찾아 비교한다.
+  - **시간 간격 규칙**: transcript에서 찾지 못하면, 직전 거부로부터 1초 안에 온 호출을 같은 메시지로 본다.
+- 두 조건으로 실행했다.
+  - **sleep**: 한 메시지에 `Bash(sleep 6)` + Write a·b·c를 요청하고, sleep 중에 의견을 투입한다.
+  - **tight**: 한 메시지에 Write a·b·c만 요청하고, 의견은 실행 전에 미리 넣는다.
+- 의견 내용: "파일을 만들지 말고 멈추세요. 대신 STOP.txt에 'stopped' 한 줄만 쓰세요."
+
+### 결과 (실제 출력)
+
+sleep 조건 (1회차, 메시지 ID 규칙만 있던 버전):
+```
+== files   a.txt: (없음)  b.txt: (없음)  c.txt: (없음)  STOP.txt: stopped
+== urgent-log
+{"action":"deliver","tool":"Write","id":"vFPJfm","msgId":"LJmGqard"}
+{"action":"deny_same_message","tool":"Write","id":"mHcCU2","msgId":"LJmGqard"}
+{"action":"deny_same_message","tool":"Write","id":"9MPqiB","msgId":"LJmGqard"}
+{"action":"clear","tool":"Write","id":"QeXgj6","msgId":"null","prev":"LJmGqard"}   ← 새 턴 호출은 transcript에서 못 찾음
+```
+
+tight 조건 (시간 간격 규칙 추가 후):
+```
+== files   a.txt: (없음)  b.txt: (없음)  c.txt: (없음)  STOP.txt: stopped
+== urgent-log
+{"action":"deliver","tool":"Write","id":"rWA8T6","msgId":"null"}
+{"action":"deny_same_message","rule":"time_gap","gapMs":272,"tool":"Write","id":"VqrwRm","msgId":"null"}
+{"action":"deny_same_message","rule":"time_gap","gapMs":280,"tool":"Write","id":"UuwnEm","msgId":"null"}
+{"action":"clear","rule":"time_gap","gapMs":4534,"tool":"Write","id":"R9r72N","msgId":"null"}
+== assistant 메시지별 도구 호출
+{"msg":"khPLVZZk","tools":["Write:a.txt"]}  {"msg":"khPLVZZk","tools":["Write:b.txt"]}  {"msg":"khPLVZZk","tools":["Write:c.txt"]}
+{"msg":"cutNLnGo","tools":["Write:STOP.txt"]}
+== 거부 사유로 모델에 전달된 내용
+PreToolUse:Write hook error: [관찰자 @park 긴급 의견 · 조종수 전달] 파일을 만들지 말고 멈추세요. …
+PreToolUse:Write hook error: Flightdeck: 앞선 긴급 의견 때문에 이번 메시지의 나머지 도구 호출은 실행하지 않았습니다.
+```
+
+### 발견 사항
+1. **급한 의견은 같은 턴 안에서 효과를 낸다.** 이미 요청된 호출(b·c)까지 막았고, 모델은 다음 턴에 의견대로 다시 계획했다(STOP.txt만 작성). 일반 의견(2번, PostToolUse 주입)이 "다음 턴부터"인 것과 다르다.
+2. **transcript로는 "같은 메시지"를 판별할 수 없다.**
+   - Claude Code는 assistant 메시지가 다 오기 전에 도구 실행을 시작한다. sleep 조건에서 `Bash` PreToolUse(25.895)가 a·b·c의 tool_use 블록 기록(26.3~27.2)보다 먼저 일어났다.
+   - transcript 파일은 늦게 기록된다. STOP.txt의 tool_use 줄은 타임스탬프가 37.395인데, 37.445의 PreToolUse 시점에는 아직 파일에 없었다. tight 조건에서는 조회가 한 번도 성공하지 않았다(모두 `null`).
+   - sleep 조건에서 b·c를 찾은 것은 sleep 6초 동안 기록이 끝났기 때문이다.
+3. **시간 간격 규칙이 실제로 판정했다.** 같은 메시지 안의 호출 간격은 272·280ms, 새 턴 첫 호출까지는 4534ms(모델 응답 대기)였다. 1초 기준으로 깔끔하게 갈렸다. 판정이 틀리는 쪽은 "모델이 1초 안에 다음 턴을 낸 경우"다. 그때는 새 턴 첫 호출이 한 번 더 거부되고(안전한 쪽), 모델이 사유를 보고 다시 시도한다.
+4. **훅이 죽으면 긴급 차단이 그대로 뚫린다.** 첫 tight 실행에서 훅 버그(`ReferenceError`, exit 1)로 a만 거부되고 b·c는 실행됐다. 4번 발견(훅 오류는 실행을 막지 않음)과 같은 성질이다. 긴급 차단처럼 "막는 쪽이 안전한" 경로는 훅 내부 예외를 잡아 **deny로 응답(fail-closed)**해야 한다.
+
+---
+
 ## 설계 변경 제안 (design.md v0.9에 반영, P4(c)는 권장안인 "디스크 바이트 그대로"로 결정)
 
 판정이 "불가"인 항목은 없다. 다만 아래는 설계 문서의 서술과 실제 동작이 다르거나, 설계에 없던 처리가 필요한 부분이다.
@@ -602,13 +657,21 @@ wpamtpkV41  smartNotes=[]  transcripts=[]
 | Q10 | §10.1 ⑤·⑥, §10.3 | 회의록 조회: `conferenceRecords.list → smartNotes.list → docsDestination → Docs API`, 전사 사용 시 `transcripts.entries` | 추가: (a) 회의록과 전사는 한 Docs 문서의 두 탭이다. 회의록은 첫 탭, 전사 탭은 `includeTabsContent: true`로만 받아진다 (b) 앵커링 입력의 전사는 탭 텍스트가 아니라 `transcripts.entries`(화자·시각·언어 포함, 페이지 처리)를 쓴다 (c) 회의록이 생성되지 않은 회의의 처리 경로를 둔다 (d) `meetings.space.created` 범위는 Flightdeck이 만든 회의만 보이므로, "회의 시작" 버튼으로 연 회의만 대상이라고 명시한다 | 10번 |
 | Q9 | §3.7 알림, §3.1 | 20초 `ls-remote` 폴링 | GitHub 왕복이 push·fetch 각 약 4초이고 경합 시 메타 반영이 수십 초까지 밀린다는 점을 적는다. 메타 브랜치는 "수 초~수십 초 안에 반영"되는 경로이고, 실시간 경로는 서버 ④임을 명시한다 | 9번 |
 
+## 설계 변경 제안 3차 (11번 결과, design.md 미반영, 검토 후 반영)
+
+| # | 절 | 현재 서술 (v0.10) | 제안 | 근거 |
+|---|---|---|---|---|
+| R1 | §8.4 급한 의견 | PreToolUse에서 대기열을 확인해 거부 + 의견을 사유로 돌려주는 경로를 둔다. 이 경로는 M0에서 확인한다 | "M0 확인"으로 바꾸고 방식을 적는다: (a) 급한 의견은 다음 PreToolUse를 deny하고 의견을 사유로 돌려준다 (b) 같은 메시지에서 이미 요청된 나머지 호출도 deny한다 (c) 같은 메시지 판정은 **직전 거부로부터의 시간 간격(1초)**으로 한다. transcript는 PreToolUse 시점에 아직 기록되지 않아 쓸 수 없다. 틀리면 새 턴 첫 호출이 한 번 더 거부된다(안전한 쪽) (d) 조종수가 "급한 의견으로 전달"을 고를 때만 쓴다(실행 중인 계획을 끊으므로) | 11번 |
+| R2 | §6.1 강제의 위치(훅 오류) | 훅 오류는 실행을 막지 않는다. 훅은 오류를 확장에 보고한다 | 추가: 경로마다 실패 시 기본값을 정한다. **차단 경로(단계별 권한 §6.2, 보호 경로, 급한 의견)는 훅 내부 예외를 잡아 deny로 응답한다(fail-closed).** 기록 경로(편집 기록, trace)는 실행을 막지 않는다(fail-open + 외부 변경 감지로 보완) | 11번 4, 4번 2 |
+| R3 | §6.1 훅 입출력 표 | — | 추가: "Claude Code는 assistant 메시지가 다 오기 전에 도구 실행을 시작한다. 한 메시지의 도구 호출 전체를 PreToolUse 시점에 알 수 없다" | 11번 2 |
+
 ### 이번에 확인하지 못한 것 (M0 남은 항목)
 - ~~`.mcp.json` 최초 승인 흐름~~ → 6번 가능
 - ~~VS Code 공식 Claude Code 확장에서의 신뢰 확인 창·훅 동작~~ → 8번 가능
 - ~~에디터 편집(`onDidChangeTextDocument`) 경로~~ → 7번 가능
 - VS Code 제한 모드(신뢰 전)에서 Claude Code가 worktree 훅을 적용하는지
 - ~~실제 git 호스트(GitHub)에서의 커스텀 ref push 허용 여부, 동시 push 거동~~ → 9번 가능. GitHub의 도달 불가 객체 정리 시점은 알 수 없음
-- PreToolUse deny로 급한 의견을 같은 턴 안에 전달하는 우회책 (P8)
+- ~~PreToolUse deny로 급한 의견을 같은 턴 안에 전달하는 우회책 (P8)~~ → 11번 가능(시간 간격 규칙)
 - 대형 레포에서 Bash마다 `write-tree`를 하는 비용 (P3)
 - ~~Meet 회의록·전사 조회 (M0 ④)~~ → 10번 가능(지난 회의 읽기)
 - Meet: Flightdeck 자체 OAuth 앱 + `meetings.space.created` 범위로 만든 회의에서의 조회, 회의록 자동 켜기, 회의 종료 후 회의록 생성까지 걸리는 시간 (B 방식, 실제 회의 필요)

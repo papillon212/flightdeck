@@ -36,6 +36,8 @@ switch (ev.hook_event_name) {
   }
 
   case "PreToolUse": {
+    const urgent = urgentReason();
+    if (urgent) respond("PreToolUse", { permissionDecision: "deny", permissionDecisionReason: urgent });
     if (FILE_TOOLS.has(ev.tool_name)) snapshot("pre");
     if (ev.tool_name === "Bash" && cfg.shellSnapshot) fs.writeFileSync(snapPath("pre-tree"), worktreeTree());
     const reason = denyReason();
@@ -103,6 +105,54 @@ function readSnap(kind) {
 
 function snapPath(kind) {
   return path.join(STATE, "snap", `${ev.tool_use_id}.${kind}`);
+}
+
+// 급한 의견(설계 §8.4): urgent/ 대기열에 의견이 있으면 이 도구 호출을 거부하고 의견을 사유로 돌려준다.
+// 같은 assistant 메시지에서 이미 요청된 나머지 도구 호출도 거부한다. 다음 모델 턴(다른 메시지)이 되면 해제한다.
+// 메시지 구분은 transcript_path에서 tool_use_id가 들어 있는 assistant 메시지의 message.id로 한다.
+// transcript는 PreToolUse 시점에 아직 기록되지 않았을 수 있다. 그때는 직전 거부로부터 SAME_BATCH_MS 안에 온 호출을
+// 같은 메시지로 본다(새 턴은 모델 응답을 기다려야 하므로 보통 그보다 늦다). 틀리면 새 턴 첫 호출이 한 번 거부된다(안전한 쪽).
+function urgentReason() {
+  const SAME_BATCH_MS = 1000;
+  const dir = path.join(STATE, "urgent");
+  const activeFile = path.join(STATE, "urgent-active.json");
+  fs.mkdirSync(dir, { recursive: true });
+  const msgId = assistantMessageId(ev.tool_use_id);
+  const queued = fs.readdirSync(dir).filter((f) => f.endsWith(".txt")).sort();
+  if (queued.length) {
+    const body = queued.map((f) => fs.readFileSync(path.join(dir, f), "utf8").trim()).join("\n");
+    for (const f of queued) fs.renameSync(path.join(dir, f), path.join(STATE, "opinions-delivered", f));
+    fs.writeFileSync(activeFile, JSON.stringify({ msgId, body, lastDenyAt: Date.now() }));
+    append("urgent-log.jsonl", { at: now(), action: "deliver", tool: ev.tool_name, tool_use_id: ev.tool_use_id, msgId });
+    return `${body}\n(Flightdeck: 긴급 의견 때문에 이 도구 호출을 실행하지 않았습니다. 이번 메시지에서 요청한 나머지 도구 호출도 실행되지 않습니다. 의견을 반영해 다시 계획하세요.)`;
+  }
+  const active = readJson(activeFile);
+  if (!active) return null;
+  const gapMs = Date.now() - active.lastDenyAt;
+  // 판정: transcript에서 메시지를 찾았으면 메시지 ID로, 못 찾았으면 시간 간격으로
+  const rule = msgId && active.msgId ? "message_id" : "time_gap";
+  const same = rule === "message_id" ? msgId === active.msgId : gapMs < SAME_BATCH_MS;
+  if (same) {
+    fs.writeFileSync(activeFile, JSON.stringify({ ...active, msgId: active.msgId ?? msgId, lastDenyAt: Date.now() }));
+    append("urgent-log.jsonl", { at: now(), action: "deny_same_message", rule, gapMs, tool: ev.tool_name, tool_use_id: ev.tool_use_id, msgId });
+    return "Flightdeck: 앞선 긴급 의견 때문에 이번 메시지의 나머지 도구 호출은 실행하지 않았습니다.";
+  }
+  fs.rmSync(activeFile);
+  append("urgent-log.jsonl", { at: now(), action: "clear", rule, gapMs, tool: ev.tool_name, tool_use_id: ev.tool_use_id, msgId, prevMsgId: active.msgId });
+  return null;
+}
+
+function assistantMessageId(toolUseId) {
+  if (!ev.transcript_path || !toolUseId || !fs.existsSync(ev.transcript_path)) return null;
+  const lines = fs.readFileSync(ev.transcript_path, "utf8").split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].includes(toolUseId)) continue;
+    try {
+      const o = JSON.parse(lines[i]);
+      if (o.type === "assistant" && (o.message?.content ?? []).some((b) => b.type === "tool_use" && b.id === toolUseId)) return o.message.id;
+    } catch {}
+  }
+  return null;
 }
 
 // 브랜치·index·작업 트리를 건드리지 않고 현재 작업 트리 전체를 tree 객체로 만든다 (.gitignore 대상 제외)
