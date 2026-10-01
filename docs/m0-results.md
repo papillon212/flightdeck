@@ -15,6 +15,7 @@
 | 6 | worktree `.mcp.json` 최초 승인 흐름 (CLI) | **가능**: `settings.local.json`에 서버 허용과 도구 권한을 미리 넣으면 승인 창 없이 연결 |
 | 7 | VS Code 확장: Comments API(markdown), 에디터 편집 기록 재적용, 외부 변경 구별 | **가능**: 쓰레드 화면 위치는 VS Code가 따라가지만 API 값은 갱신 안 됨. 편집 재적용 해시 일치(한글 IME 포함) |
 | 8 | 공식 Claude Code VS Code 확장에서 worktree 훅·MCP | **가능**: 훅 4종·MCP 동작. 신뢰는 CLI와 별개로 VS Code 작업 영역 신뢰를 따름 |
+| 9 | GitHub에서 체크포인트 ref, 메타 동시 push | **가능**: 단, 삭제한 ref의 커밋을 SHA로 계속 받을 수 있음. 경합 시 반영 지연 최대 75초 |
 
 ---
 
@@ -485,6 +486,50 @@ MCP 서버: started → initialize(client "claude-code") → call flightdeck_pin
 
 ---
 
+## 9. GitHub에서 체크포인트 ref, 메타 동시 push (§2.1, §3.1, §8.1, M0 ⑤·⑥) — **가능 (주의점 있음)**
+
+코드: `spikes/09-github/checkpoint.sh`, `spikes/05-git-refs/meta-concurrency.sh`(원격·ref를 받도록 일반화). 원격은 `git@github.papillon212:papillon212/flightdeck.git`. 검증은 `refs/flightdeck-spike/*` 이름공간에서만 했고, 끝난 뒤 모두 삭제했다(`ls-remote`에 `main`만 남음).
+
+### 9-1. 체크포인트 ref (실제 출력)
+```
+== A → GitHub push (커스텀 ref)
+   * [new reference]   refs/flightdeck-spike/ckpt/CU-1/dh.lee -> refs/flightdeck-spike/ckpt/CU-1/dh.lee
+  push 4308ms
+== B: 기본 클론에는 안 보임 → refspec fetch
+  기본 클론 후 refs/flightdeck-spike: [0개]
+  --mirror 아닌 'fetch --all' 후: [0개]
+  refspec fetch 3588ms
+  A 작업 트리 == B 체크아웃(ckpt1): 일치 (CRLF·바이너리 포함)
+== 체인 갱신
+     5f4c8f6..e9f602c  refs/flightdeck-spike/ckpt/CU-1/dh.lee -> …          ← fast-forward 갱신
+     ! [rejected]  a1a5249… -> refs/flightdeck-spike/ckpt/CU-1/dh.lee (fetch first)   ← 오래된 값 기준 push 거절
+== 삭제
+   - [deleted]         refs/flightdeck-spike/ckpt/CU-1/dh.lee
+  ls-remote 후: [0개]
+  삭제된 커밋을 SHA로 직접 fetch:
+     * branch            e9f602c31389d0ee138c41a21afa203e953b11a7 -> FETCH_HEAD   ← 여전히 받아짐
+```
+
+### 9-2. 메타 동시 push (클라이언트 5개 × 이벤트 5개, `refs/flightdeck-spike/meta`)
+```
+== 클라이언트 5개 × 이벤트 5개 (동시 실행), 94.3s, 실패 클라이언트 0
+원격 이벤트 파일: 25 / 기대 25 (중복 제거 25)
+원격 커밋: 26 (머지 커밋 0 → 선형 이력 예)
+push 시도 합계 55 (이벤트당 평균 2.20, 최대 13), rebase 30, rebase 충돌 0, lock 실패 10, non-ff 30
+이벤트당 반영 시간(ms): 평균 10184, 최대 75098
+== push 오류 종류
+  20 ! [rejected]        HEAD -> refs/flightdeck-spike/meta (fetch first)
+  10 ! [remote rejected] HEAD -> refs/flightdeck-spike/meta (cannot lock ref 'refs/flightdeck-spike/meta': is at … but expected …)
+```
+
+### 발견 사항
+1. **GitHub도 커스텀 ref(`refs/flightdeck-*/…`)의 push·fetch·fast-forward 갱신·삭제를 허용한다.** 기본 clone·`fetch --all`에는 포함되지 않아 일반 사용자 화면(브랜치 목록 등)에 드러나지 않는다. 브랜치가 아니므로 브랜치 보호 규칙·Actions 트리거 대상도 아니다(설계상 바람직).
+2. **ref를 지워도 커밋 내용은 GitHub에 남는다.** 삭제 직후에도 SHA를 알면 누구나(레포 읽기 권한자) fetch할 수 있었다. GitHub가 도달 불가 객체를 언제 정리하는지는 GitHub가 정한다. §2.1의 "ref를 지우면 원격에서 공간이 회수된다"는 GitHub에서는 즉시 성립하지 않는다. 특히 **체크포인트·세션 원본에 비밀값이 한 번 들어가면 ref 삭제로는 지워지지 않는다**(GitHub 지원 요청 필요). 저장 전 비밀값 제거(§6.4)와 체크포인트 대상 제외 규칙이 더 중요해진다.
+3. **GitHub 왕복은 push·fetch 각 약 4초다**(SSH 연결 포함). 경합이 없으면 메타 이벤트 반영은 수 초지만, 5명이 쉬지 않고 동시에 push하면 평균 10초, 최대 75초까지 밀렸다. 알림 주기(20초, §3.7)에는 문제없지만, "승인 직후 다른 사람 화면에 바로 반영"을 기대하면 안 된다. 실시간이 필요한 것은 서버 ④로 보낸다(설계 그대로). 대기 중 이벤트 묶음 push(§3.1 v0.9)가 지연을 줄인다.
+4. 거절 형태는 로컬과 같은 두 가지(`fetch first`, `cannot lock ref`)였다. 재시도 정책(§3.1 v0.9)이 그대로 적용된다.
+
+---
+
 ## 설계 변경 제안 (design.md v0.9에 반영, P4(c)는 권장안인 "디스크 바이트 그대로"로 결정)
 
 판정이 "불가"인 항목은 없다. 다만 아래는 설계 문서의 서술과 실제 동작이 다르거나, 설계에 없던 처리가 필요한 부분이다.
@@ -514,14 +559,16 @@ MCP 서버: started → initialize(client "claude-code") → call flightdeck_pin
 | Q4 | §8.6 전송, §8.3 편집 스트림 | 생기는 즉시 전송 | 추가: 한글 IME는 조합 단계마다 이벤트가 온다(한 글자에 2~4건). 같은 위치의 연속 변경을 짧은 간격(예: 300ms)으로 묶어 전송·저장한다. 묶은 결과도 재적용 해시가 같아야 한다 | 7번 수동 테스트 |
 | Q5 | §3.3 코드 쓰레드, §3.5 위치 고정 | 앵커는 편집 기록 위치 | 추가: VS Code는 쓰레드를 **화면에서는** 줄을 따라 옮기지만 확장의 `thread.range` 값은 갱신하지 않는다. 앵커를 저장·전송할 때 `thread.range`를 읽지 말고 편집 기록으로 계산한 위치를 쓴다. 다시 열 때는 그 위치로 쓰레드를 만든다 | 7번 |
 | Q6 | §6.1 MCP 도구 표 | 도구 목록 | 추가: Claude Code는 MCP 도구를 지연 로딩해 처음에 `ToolSearch`로 찾는다. 도구 이름·설명에 에이전트가 검색할 단어(쓰레드, 인수인계, 단계 등)를 넣는다 | 8번 |
-| Q7 | §14 M0 | 진행 현황 | ①, ②의 `.mcp.json`·VS Code 확장, ⑦의 에디터 부분을 **가능**으로 옮긴다 | 6~8번 |
+| Q7 | §14 M0 | 진행 현황 | ①, ②의 `.mcp.json`·VS Code 확장, ⑦의 에디터 부분, GitHub에서의 ⑤·⑥을 **가능**으로 옮긴다 | 6~9번 |
+| Q8 | §2.1 ref 구성 | ref를 지우면 원격 저장소에서 실제로 공간이 회수된다(gc) | GitHub에서는 ref를 지워도 커밋이 SHA로 계속 받아진다. 회수 시점은 GitHub가 정한다고 고친다. 체크포인트·세션 원본에 들어간 비밀값은 ref 삭제로 지워지지 않으므로, **체크포인트 대상에서 `.env` 등 비밀 파일 패턴을 제외**하는 규칙을 §8.1에 추가한다(세션 원본은 §6.4의 비밀값 제거가 이미 있음) | 9번 |
+| Q9 | §3.7 알림, §3.1 | 20초 `ls-remote` 폴링 | GitHub 왕복이 push·fetch 각 약 4초이고 경합 시 메타 반영이 수십 초까지 밀린다는 점을 적는다. 메타 브랜치는 "수 초~수십 초 안에 반영"되는 경로이고, 실시간 경로는 서버 ④임을 명시한다 | 9번 |
 
 ### 이번에 확인하지 못한 것 (M0 남은 항목)
 - ~~`.mcp.json` 최초 승인 흐름~~ → 6번 가능
 - ~~VS Code 공식 Claude Code 확장에서의 신뢰 확인 창·훅 동작~~ → 8번 가능
 - ~~에디터 편집(`onDidChangeTextDocument`) 경로~~ → 7번 가능
 - VS Code 제한 모드(신뢰 전)에서 Claude Code가 worktree 훅을 적용하는지
-- 실제 git 호스트(GitHub)에서의 커스텀 ref push 허용 여부, gc 시점, 동시 push 거동
+- ~~실제 git 호스트(GitHub)에서의 커스텀 ref push 허용 여부, 동시 push 거동~~ → 9번 가능. GitHub의 도달 불가 객체 정리 시점은 알 수 없음
 - PreToolUse deny로 급한 의견을 같은 턴 안에 전달하는 우회책 (P8)
 - 대형 레포에서 Bash마다 `write-tree`를 하는 비용 (P3)
 - Meet 회의록·전사 조회 (M0 ④)
