@@ -12,6 +12,9 @@
 | 3 | `claude -p` 세션 resume, `transcript_path` 실시간 읽기 | **가능** (단, 대화형 첫 실행 시 신뢰 확인 창, transcript에 개인 맥락 포함) |
 | 4 | 훅으로 잡은 편집을 재적용했을 때 해시 일치 | **가능 (우회책 필요)**: 훅 페이로드만으로는 CRLF 파일에서 불일치. 훅에서 디스크 전후 스냅샷을 뜨면 전부 일치 |
 | 5 | 숨은 커밋 체크포인트 push/fetch, 메타 브랜치 동시 push 재시도 | **가능** (로컬 bare 레포 기준) |
+| 6 | worktree `.mcp.json` 최초 승인 흐름 (CLI) | **가능**: `settings.local.json`에 서버 허용과 도구 권한을 미리 넣으면 승인 창 없이 연결 |
+| 7 | VS Code 확장: Comments API(markdown), 에디터 편집 기록 재적용, 외부 변경 구별 | **가능**: 쓰레드 화면 위치는 VS Code가 따라가지만 API 값은 갱신 안 됨. 편집 재적용 해시 일치(한글 IME 포함) |
+| 8 | 공식 Claude Code VS Code 확장에서 worktree 훅·MCP | **가능**: 훅 4종·MCP 동작. 신뢰는 CLI와 별개로 VS Code 작업 영역 신뢰를 따름 |
 
 ---
 
@@ -336,6 +339,152 @@ push 시도 합계 250 (이벤트당 평균 2.50, 최대 28), rebase 150, rebase
 
 ---
 
+## 6. worktree `.mcp.json` 최초 승인 흐름 (§6.1, M0 ②) — **가능**
+
+코드: `spikes/06-mcp/` (`server.mjs`: 의존성 없는 최소 MCP 서버, 도구 `flightdeck_ping`), `spikes/lib/screen.py`(대화형 화면 캡처, 프롬프트 없음)
+
+### 방법
+1번과 같은 worktree에 `.mcp.json`(서버 `flightdeck`)을 두고 두 경우를 비교한다.
+- **plain**: `.mcp.json`만 둔다.
+- **enabled**: `settings.local.json`에 `"enabledMcpjsonServers": ["flightdeck"]`(서버 승인)와 `"permissions": {"allow": ["mcp__flightdeck"]}`(도구 호출 권한)를 함께 넣는다.
+
+각 경우에 `claude mcp list`, 대화형 시작 화면(8초 캡처), `claude -p "Call the flightdeck_ping tool…"`를 확인했다. `.mcp.json`도 `.git/info/exclude`로 `git status`에 보이지 않았다.
+
+### 결과 (실제 출력)
+
+| | plain | enabled |
+|---|---|---|
+| `claude mcp list` | `flightdeck: … - ⏸ Pending approval (run claude to approve)` | `flightdeck: … - ✔ Connected` |
+| 대화형 시작 화면 | 승인 창이 뜸 (아래) | 창 없음. 서버 기동·`initialize`(client `claude-code`) 기록됨 |
+| `claude -p` 도구 호출 | 서버는 기동·초기화됐지만 호출 실패: `"The tool flightdeck_ping is available but requires permission to use. Since this is a non-interactive session…"` | 성공: `"pong: epic CU-test, phase ANALYSIS"` |
+
+plain의 대화형 승인 창:
+```
+New MCP server found in this project: flightdeck
+MCP servers may execute code or access system resources. All tool calls require approval. …
+  Use this MCP server
+  Use this and all future MCP servers in this project
+❯ Continue without using this MCP server        ← 기본 선택
+```
+
+### 발견 사항
+1. **서버 승인과 도구 호출 권한은 별개다.** `-p`에서는 승인 창 없이 서버가 기동되지만, 도구 호출 권한이 없으면 호출이 거절된다. 자동 초안(§6.1)에서 Flightdeck 도구를 쓰려면 `permissions.allow`에 `mcp__flightdeck`이 있어야 한다.
+2. 대화형 승인 창의 기본 선택은 신뢰 확인 창과 마찬가지로 **"사용하지 않음"**이다. 설계 §6.1의 방식(`settings.local.json`에서 서버 활성화)을 쓰면 이 창 자체가 뜨지 않는다.
+3. 두 설정 모두 에이전트가 고칠 수 없어야 한다. `settings.local.json`·`.mcp.json`은 이미 §6.2 보호 경로에 있다.
+4. 대화형에서 도구 호출 시 권한 창이 뜨는지는 프롬프트가 필요해 확인하지 않았다. `permissions.allow`가 대화형에도 똑같이 적용되는 것은 Claude Code 문서상 동작이다. → 8번에서 VS Code 확장으로 확인: 권한 창 없이 호출됨.
+
+---
+
+## 7. VS Code 확장: Comments API, 에디터 편집 기록, 외부 변경 구별 (§3.2·§3.3, §7.4, §8.6, M0 ①·⑦) — **가능**
+
+코드: `spikes/07-vscode-ext/` (빌드 없는 JS 확장. `run.sh auto`: 별도 사용자 프로필로 VS Code를 띄워 자동 테스트 후 스스로 종료). VS Code 1.128.0.
+
+### 방법
+- 확장은 시작할 때 작업 폴더 파일을 디스크 바이트 그대로 `base/`에 보관한다.
+- `onDidChangeTextDocument`의 `contentChanges`를 shadow 문서에 적용하며, 이벤트마다 결과가 `document.getText()`와 같은지 확인하고 기록한다. 한 이벤트 안의 변경은 모두 이벤트 전 문서 기준 오프셋이므로 뒤에서부터 적용한다.
+- "편집 기록 검증": `base/` + 기록을 순서대로 재적용해 디스크 바이트와 sha256을 비교한다.
+- 자동 테스트:
+  - Comments 쓰레드 생성 → 위에 3줄 삽입 → 쓰레드 줄 삭제
+  - 한글·이모지 삽입, 두 위치를 한 번에 편집, undo/redo
+  - CRLF 파일에 `\n` 삽입
+  - 저장 시 자동 수정(`trimTrailingWhitespace`, `insertFinalNewline`)
+  - 외부 `sed -i`로 **열린** 파일과 **닫힌** 파일 변경
+- 수동 테스트(사용자 직접): 거터 **+**로 댓글 작성, 맨 위 3줄 삽입, 한글 IME 입력(조합 중 백스페이스), 붙여넣기, undo, 저장, 검증 명령.
+
+### 결과 (실제 출력)
+
+자동 테스트 편집 기록 검증:
+```
+이벤트 11건, 이벤트마다 shadow=문서 불일치 0건, base_hash 순서 불일치 0건
+  MATCH    a.ts         MATCH    analysis.md   MATCH    crlf.txt   MATCH    ko.txt
+  MISMATCH notes.txt    replay=66663af9c7 disk=7b66fafdcd     ← 닫힌 파일 외부 변경 (예상대로)
+```
+
+주요 이벤트:
+```
+seq4  ko.txt   changes [{offset 15, "끝>"}, {offset 10, len 2, "두번째"}]   ← 한 번의 편집에 변경 2개 (내림차순)
+seq5  ko.txt   reason "undo"   /  seq6 reason "redo"
+seq7  crlf.txt changes [{offset 5, "NEW\r\n"}]                          ← API로 넣은 "\n"이 문서 EOL로 바뀌어 기록됨
+seq9  a.ts     changes [{offset 19, len 3, ""}]                          ← 저장 시 trimTrailingWhitespace
+seq10 a.ts     changes [{offset 19, "\n"}]                               ← 저장 시 insertFinalNewline
+seq11 ko.txt   changes [{offset 16, len 7, "끝>EXTERNAL 줄\n"}]           ← 외부 sed (열린 파일): VS Code가 다시 읽으며 편집 이벤트로 옴
+외부 변경(닫힌 파일 notes.txt): 변경 이벤트 0건
+```
+
+수동 테스트(한글 IME) 검증:
+```
+이벤트 36건, shadow=문서 불일치 0건, base_hash 순서 불일치 0건, 파일 5개 전부 MATCH
+seq4  "ㅊ" → seq5 "추" → seq6 "축" → seq7 "추"(조합 중 백스페이스) → seq8 "가" …
+```
+
+외부 변경 구별 (자동 테스트 2회차, `이벤트 직후 문서 == 디스크` 기록 추가):
+```
+seq  file         dirty_after  equals_disk_after
+1    analysis.md  false        false
+2    analysis.md  true         false
+3    ko.txt       false        false
+…    (사람 편집 10건 모두 equals_disk_after=false)
+11   ko.txt       false        true        ← 외부 변경만 true
+```
+
+Comments:
+```
+자동: 쓰레드 줄 3 → 위에 3줄 삽입 후 thread.range.start.line = 3 (기대 6)
+수동: 화면의 댓글 상자는 "액세스 토큰은…" 줄을 따라 내려감 (사용자 확인)
+```
+
+### 발견 사항
+1. **에디터 편집은 빠짐없이 잡히고, 재적용하면 디스크와 바이트 단위로 같다.** 다중 위치 편집, undo/redo, CRLF, 저장 시 자동 수정, 한글 IME 조합이 모두 포함된다. M0 ⑦의 에디터 경로는 **가능**이다.
+2. **한글 IME는 조합 단계마다 이벤트가 온다**(한 글자에 2~4건). 편집 기록·중계량이 글자 수의 몇 배가 된다. 전송 전에 짧은 간격(예: 같은 위치의 연속 변경)으로 묶는 압축이 필요하다.
+3. **외부 도구가 열린 파일을 바꾸면 에디터 편집 이벤트로 들어온다.** 그대로 두면 `human:<member>`로 잘못 기록된다. `isDirty`로는 구별할 수 없다(파일을 연 뒤 첫 편집도 `false`). **"이벤트 직후 문서 == 디스크"**이면 외부 변경(디스크 재로드)으로 보면 정확히 갈렸다. 에이전트 편집(훅 기록과 내용이 같음)인지, 그 외 `external:unknown`인지는 그다음에 가린다.
+4. **열리지 않은 파일의 외부 변경은 에디터 이벤트가 없다.** §7.4의 파일 감시가 꼭 필요하다(설계 그대로).
+5. **Comments 쓰레드는 화면에서는 VS Code가 줄을 따라 옮기지만, 확장의 `thread.range` 값은 갱신되지 않는다.** 따라서 쓰레드 앵커를 저장할 때 `thread.range`를 믿으면 안 되고, 편집 기록으로 계산한 위치(§3.5)를 써야 한다. 다시 표시할 때도 그 위치로 쓰레드를 만든다.
+6. markdown 문서의 텍스트 에디터에서 Comments API(거터 +, 댓글 입력, 답글 명령)가 동작한다. markdown **미리보기 화면**에서는 Comments API가 동작하지 않는다(VS Code 제약, 이번엔 확인하지 않음).
+
+---
+
+## 8. 공식 Claude Code VS Code 확장에서 worktree 훅·MCP (§6.1, D19) — **가능**
+
+코드: `spikes/08-vscode-claude/setup.sh`. 아직 신뢰한 적 없는 새 레포 `/tmp/fd-spike8`에 worktree를 만들고, 훅·`.mcp.json`(미리 허용)·7번 확장을 사용자의 평소 VS Code에 띄웠다. 사용자가 Claude Code 패널에서 haiku로 프롬프트 1개를 보냈다.
+
+### 결과 (실제 출력)
+
+Claude 답변 (사용자 전달):
+```
+flightdeck_ping 결과: pong: epic CU-test, phase ANALYSIS
+확인 코드: KIWI-77 (세션 시작 훅이 알려준 값)
+git status: 실행하지 못했어요. Flightdeck PreToolUse 훅이 막았습니다: Flightdeck: git 등 금지된 명령입니다 (git status). …
+[fd-ok]
+```
+
+훅 로그:
+```
+15:31:32  SessionStart  startup
+15:31:56  UserPromptSubmit                                permission_mode=auto
+15:32:00  PreToolUse    ToolSearch
+15:32:03  PreToolUse    mcp__flightdeck__flightdeck_ping
+15:32:03  PreToolUse    Bash  git status                  ← deny
+15:32:09  Stop
+transcript: entrypoint "claude-vscode", version 2.1.286
+MCP 서버: started → initialize(client "claude-code") → call flightdeck_ping
+```
+
+| 확인 사항 | 결과 |
+|---|---|
+| SessionStart·UserPromptSubmit 컨텍스트 | 됨 (`KIWI-77`, `[fd-ok]`) |
+| PreToolUse 차단 | 됨. 사용자 설정의 권한 모드가 `auto`인데도 deny가 적용됨 |
+| `.mcp.json` + `enabledMcpjsonServers` + `permissions.allow` | 승인 창·권한 창 없이 도구 호출됨 |
+| Claude Code 자체 신뢰 창 | **안 뜸.** `~/.claude.json`에도 신뢰 기록이 생기지 않음 |
+| VS Code 작업 영역 신뢰 | Extension Development Host 창: 아무 표시 없음. 일반 창: 모달 창이 아니라 **상단 배너(제한 모드, Manage 버튼)**로 표시. 사용자가 Manage로 신뢰한 뒤 Claude Code에서도 훅이 동작함 |
+
+### 발견 사항
+1. **VS Code 확장은 CLI와 신뢰 체계가 다르다.** VS Code 안의 Claude Code는 자체 신뢰 창을 띄우지 않고 CLI 신뢰 기록도 쓰지 않는다. VS Code 작업 영역 신뢰를 따르는 것으로 보인다. 그래서 같은 worktree라도 터미널에서 `claude`를 처음 열면 CLI 신뢰 창이 따로 뜬다(3번).
+2. **VS Code 작업 영역 신뢰는 폴더 단위다.** 에픽 worktree는 `../<repo>.flightdeck/<epic-id>`처럼 에픽마다 다른 폴더이므로, 에픽마다 제한 모드 배너가 뜰 수 있다. 상위 폴더 `../<repo>.flightdeck/`을 한 번 신뢰하면 하위 폴더도 신뢰된다(VS Code 동작). Flightdeck 확장 자체도 제한 모드에서는 동작이 제한되므로, 첫 에픽 때 상위 폴더 신뢰를 안내하는 게 맞다.
+3. 신뢰하기 **전**(제한 모드)에 Claude Code가 worktree 훅을 적용하는지는 확인하지 못했다(사용자가 먼저 신뢰함). Flightdeck 확장이 제한 모드에서 동작하지 않도록 두면(`untrustedWorkspaces: false`) 실무상 문제가 되지 않는다.
+4. MCP 도구는 처음에 `ToolSearch`를 거쳐 불러왔다(지연 로딩되는 도구). 도구 이름·설명을 에이전트가 찾기 쉽게 지어야 한다.
+
+---
+
 ## 설계 변경 제안 (design.md v0.9에 반영, P4(c)는 권장안인 "디스크 바이트 그대로"로 결정)
 
 판정이 "불가"인 항목은 없다. 다만 아래는 설계 문서의 서술과 실제 동작이 다르거나, 설계에 없던 처리가 필요한 부분이다.
@@ -355,10 +504,24 @@ push 시도 합계 250 (이벤트당 평균 2.50, 최대 28), rebase 150, rebase
 | P11 | §6.1 마지막 문단 | 정확한 훅 입출력(추가 컨텍스트 필드, 실행 중 전달 가능 여부), resume 동작은 M0에서 확정 | 확정된 내용으로 바꾼다. `hookSpecificOutput.additionalContext`(SessionStart·UserPromptSubmit·PostToolUse), `permissionDecision: "deny"` + `permissionDecisionReason`, 실행 중 전달 가능(P8), `--resume`은 같은 session_id·같은 transcript를 이어 쓰고 SessionStart `source: "resume"`. 편집 기록의 `source.message`에는 모든 훅 입력에 있는 `prompt_id` + `tool_use_id`를 쓴다. `.mcp.json` 최초 승인 흐름은 아직 미확인 | 1~3번 |
 | P12 | §15 해결됨 "Claude Code 내부 형식 의존" | 확장이 설치된 Claude Code 버전을 확인 | 버전 확인을 **세션마다** 한다(transcript 각 줄의 `version`). 검증 도중 2.1.285 → 2.1.286 자동 업데이트를 실제로 겪었다 | 3번 |
 
+## 설계 변경 제안 2차 (6~8번 결과, design.md 미반영, 검토 후 반영)
+
+| # | 절 | 현재 서술 | 제안 | 근거 |
+|---|---|---|---|---|
+| Q1 | §6.1 설정 배치 | `settings.local.json`: 훅 등록, Flightdeck MCP 서버 활성화, 권장 기본 모델 | 구체화: `"enabledMcpjsonServers": ["flightdeck"]`(서버 승인)와 `"permissions": {"allow": ["mcp__flightdeck"]}`(도구 호출 권한)를 **둘 다** 넣는다. 서버 승인과 도구 권한은 별개다. 도구 권한이 없으면 자동 초안(`-p`)에서 Flightdeck 도구 호출이 거절된다 | 6번 |
+| Q2 | §6.1 신뢰 확인 창, §9.1 | 신뢰는 원본 레포 경로 기준. 첫 에픽 때 Claude Code에서 레포 신뢰를 안내 | **진입점마다 신뢰 체계가 다르다**로 고친다. (a) 터미널 `claude`: Claude Code 자체 신뢰 창, 원본 레포 경로 기준 (b) VS Code 안의 Claude Code: 자체 창 없음, VS Code 작업 영역 신뢰(폴더 단위, 상단 제한 모드 배너)를 따름. 안내는 둘로 나눈다. VS Code는 **worktree 상위 폴더 `../<repo>.flightdeck/`을 한 번 신뢰**하도록 안내한다. Flightdeck 확장은 `capabilities.untrustedWorkspaces: false`로 둔다 | 3·8번 |
+| Q3 | §7.4 외부 변경 감지, §8.6 "조종수의 에디터 편집" | 파일 감시에서 세 경로에 해당하지 않으면 `external:unknown`. 에디터 편집은 `onDidChangeTextDocument` | 추가: **열린 파일을 외부 도구가 바꾸면 `onDidChangeTextDocument`로 들어온다.** "이벤트 직후 문서 == 디스크"이면 사람 편집이 아니라 디스크 재로드로 분류한다. 이어서 훅 기록과 내용이 같으면 에이전트 편집(이미 기록됨, 중복 제외), 아니면 `external:unknown`으로 기록한다. `isDirty`는 판별에 쓸 수 없다 | 7번 |
+| Q4 | §8.6 전송, §8.3 편집 스트림 | 생기는 즉시 전송 | 추가: 한글 IME는 조합 단계마다 이벤트가 온다(한 글자에 2~4건). 같은 위치의 연속 변경을 짧은 간격(예: 300ms)으로 묶어 전송·저장한다. 묶은 결과도 재적용 해시가 같아야 한다 | 7번 수동 테스트 |
+| Q5 | §3.3 코드 쓰레드, §3.5 위치 고정 | 앵커는 편집 기록 위치 | 추가: VS Code는 쓰레드를 **화면에서는** 줄을 따라 옮기지만 확장의 `thread.range` 값은 갱신하지 않는다. 앵커를 저장·전송할 때 `thread.range`를 읽지 말고 편집 기록으로 계산한 위치를 쓴다. 다시 열 때는 그 위치로 쓰레드를 만든다 | 7번 |
+| Q6 | §6.1 MCP 도구 표 | 도구 목록 | 추가: Claude Code는 MCP 도구를 지연 로딩해 처음에 `ToolSearch`로 찾는다. 도구 이름·설명에 에이전트가 검색할 단어(쓰레드, 인수인계, 단계 등)를 넣는다 | 8번 |
+| Q7 | §14 M0 | 진행 현황 | ①, ②의 `.mcp.json`·VS Code 확장, ⑦의 에디터 부분을 **가능**으로 옮긴다 | 6~8번 |
+
 ### 이번에 확인하지 못한 것 (M0 남은 항목)
-- `.mcp.json` 최초 승인 흐름 (M0 ②의 일부)
-- VS Code 공식 Claude Code 확장에서의 신뢰 확인 창·훅 동작 (이번엔 터미널 TUI만 확인)
-- 에디터 편집(`onDidChangeTextDocument`) 경로 (M0 ⑦의 일부)
-- 실제 git 호스트에서의 커스텀 ref push 허용 여부, gc 시점, 동시 push 거동
+- ~~`.mcp.json` 최초 승인 흐름~~ → 6번 가능
+- ~~VS Code 공식 Claude Code 확장에서의 신뢰 확인 창·훅 동작~~ → 8번 가능
+- ~~에디터 편집(`onDidChangeTextDocument`) 경로~~ → 7번 가능
+- VS Code 제한 모드(신뢰 전)에서 Claude Code가 worktree 훅을 적용하는지
+- 실제 git 호스트(GitHub)에서의 커스텀 ref push 허용 여부, gc 시점, 동시 push 거동
 - PreToolUse deny로 급한 의견을 같은 턴 안에 전달하는 우회책 (P8)
 - 대형 레포에서 Bash마다 `write-tree`를 하는 비용 (P3)
+- Meet 회의록·전사 조회 (M0 ④)

@@ -1,0 +1,22 @@
+{
+  "name": "flightdeck-spike",
+  "displayName": "Flightdeck M0 Spike",
+  "publisher": "flightdeck",
+  "version": "0.0.1",
+  "private": true,
+  "engines": { "vscode": "^1.90.0" },
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "commands": [
+      { "command": "flightdeckSpike.verify", "title": "Flightdeck Spike: 편집 기록 검증" },
+      { "command": "flightdeckSpike.autoTest", "title": "Flightdeck Spike: 자동 테스트 실행" },
+      { "command": "flightdeckSpike.reply", "title": "답글", "enablement": "!commentIsEmpty" }
+    ],
+    "menus": {
+      "comments/commentThread/context": [
+        { "command": "flightdeckSpike.reply", "group": "inline", "when": "commentController == flightdeck-spike" }
+      ]
+    }
+  }
+}

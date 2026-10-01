@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# /tmp/fd-spike1 아래에 레포 + 에픽 worktree를 만들고, worktree의 .claude/settings.local.json에 훅을 등록한다.
+# /tmp/fd-spike1(또는 FD_ROOT) 아래에 레포 + 에픽 worktree를 만들고, worktree의 .claude/settings.local.json에 훅을 등록한다.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOT=/tmp/fd-spike1
+ROOT=${FD_ROOT:-/tmp/fd-spike1}
 rm -rf "$ROOT"
 mkdir -p "$ROOT/state"
 
