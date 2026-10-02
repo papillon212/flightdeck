@@ -2,12 +2,13 @@ import { describe, expect, it } from "vitest";
 import type { Thread } from "../src/index.ts";
 import { checkParagraphIds, checkSections, ensureParagraphIds, listThreadBlocks, parseBlocks, renderThreads, stripThreads, threadIdFrom, ulid } from "../src/index.ts";
 
-const doc = ["# 분석", "", "## 요구사항 요약", "토큰은 Redis에 저장하고", "만료 시 갱신한다.", "", "```ts", "## 코드 안 제목은 블록이 아님", "```", "", "- 목록 1", "- 목록 2", ""].join("\n");
+const doc = ["# 분석", "", "## 요구사항 요약", "토큰은 Redis에 저장하고", "만료 시 갱신한다.", "", "```ts", "## 코드 안 제목은 블록이 아님", "```", "", "- 목록 1", "  - 하위 항목", "- 목록 2", "1. 번호 목록", ""].join("\n");
 
 describe("문단 ID (설계 §3.2)", () => {
   it("모든 블록에 ID를 붙이고, 다시 해도 바뀌지 않는다", () => {
     const { text, added } = ensureParagraphIds(doc);
-    expect(added).toHaveLength(5); // 제목 2, 문단 1, 코드 블록 1, 목록 1
+    expect(added).toHaveLength(7); // 제목 2, 문단 1, 코드 블록 1, 최상위 목록 항목 3
+    expect(parseBlocks(text.split("\n")).map((b) => b.text)).toContain("- 목록 1\n  - 하위 항목");
     const blocks = parseBlocks(text.split("\n"));
     expect(blocks.every((b) => b.pid)).toBe(true);
     expect(ensureParagraphIds(text)).toEqual({ text, added: [] });

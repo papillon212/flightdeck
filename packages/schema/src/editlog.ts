@@ -21,6 +21,8 @@ export const EditSource = z.discriminatedUnion("kind", [
     cmd: z.string(),
   }),
   z.object({ kind: z.literal("patch"), member: MemberId, thread: ThreadId }),
+  // Flightdeck 자신의 렌더링: 문단 ID 부여, 쓰레드 블록 그리기 (설계 제안 T4)
+  z.object({ kind: z.literal("flightdeck"), member: MemberId, reason: z.enum(["paragraph_ids", "thread_render"]) }),
   z.object({ kind: z.literal("external"), commit: z.string().optional() }), // commit 없으면 external:unknown
 ]);
 export type EditSource = z.infer<typeof EditSource>;

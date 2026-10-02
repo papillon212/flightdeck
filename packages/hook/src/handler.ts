@@ -6,9 +6,9 @@
 // session.stop   → 바뀐 게 있으면 체크포인트(§8.1)
 // session.end    → 체크포인트 + run.finished
 import { existsSync, realpathSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { reduce, sha256, ulid } from "@flightdeck/core";
+import { checkParagraphIds, reduce, sha256, ulid } from "@flightdeck/core";
 import type { EditRecord, EditSource, Event, LocalEpicState } from "@flightdeck/schema";
 import type { AgentAdapter, HookEvent, HookResponse } from "@flightdeck/agent";
 import { git, GitEngine, isSecret, LocalEventStore, RAW_ARGS, RAW_ENV } from "@flightdeck/git";
@@ -32,8 +32,7 @@ export async function handle(ev: HookEvent, d: HandlerDeps): Promise<HookRespons
     case "tool.before":
       return onToolBefore(ev, d);
     case "tool.after":
-      await onToolAfter(ev, d);
-      return { kind: "allow" };
+      return onToolAfter(ev, d);
     case "session.stop":
       await checkpoint(ev, d, "턴 종료");
       return { kind: "allow" };
@@ -137,14 +136,28 @@ async function onToolBefore(ev: HookEvent, d: HandlerDeps): Promise<HookResponse
   return { kind: "allow" };
 }
 
-async function onToolAfter(ev: HookEvent, d: HandlerDeps): Promise<void> {
+async function onToolAfter(ev: HookEvent, d: HandlerDeps): Promise<HookResponse> {
   const t = ev.tool!;
   const s = d.state;
   const snap = await takeSnapshot(d.dataDir, s.epic, t.useId);
-  if (!snap) return;
+  if (!snap) return { kind: "allow" };
   const worktree = realpathLoose(s.worktree);
   const run = s.runs[ev.sessionId];
-  if (!run) return;
+  if (!run) return { kind: "allow" };
+
+  // 산출물의 문단 ID를 지우거나 바꾸면 되돌린다 (§3.2, §6.2)
+  const reverted: string[] = [];
+  for (const [file, before] of Object.entries(snap.files ?? {})) {
+    if (before === null || !isArtifact(file, s.epic)) continue;
+    const abs = path.join(worktree, file);
+    const after = existsSync(abs) ? await readFile(abs, "utf8") : null;
+    const violations = after === null ? [{ kind: "deleted" }] : checkParagraphIds(before, after);
+    if (!violations.length) continue;
+    await writeFile(abs, before);
+    delete snap.files![file];
+    reverted.push(file);
+    await hookLog(d.dataDir, s.epic, { kind: "pid_revert", tool: t.name, file, violations });
+  }
   const records: Omit<EditRecord, "seq">[] = [];
   const push = (file: string, before: string | null, after: string | null, source: EditSource) => {
     if (before === after) return;
@@ -182,6 +195,18 @@ async function onToolAfter(ev: HookEvent, d: HandlerDeps): Promise<void> {
   }
   const added = await appendEditRecords(d.dataDir, s.epic, records);
   if (added.length) await hookLog(d.dataDir, s.epic, { kind: "edits", tool: t.name, seq: added.map((r) => r.seq) });
+  if (reverted.length) {
+    return {
+      kind: "context",
+      text: `[Flightdeck] ${reverted.join(", ")}의 이번 편집을 되돌렸습니다. 문단 ID 줄(<!-- p:xxxx -->)을 지우거나 바꾸면 안 됩니다. 파일을 다시 읽고, ID 줄은 그대로 둔 채 내용만 고치세요.`,
+    };
+  }
+  return { kind: "allow" };
+}
+
+/** 문단 ID를 지켜야 하는 산출물 (§3.2: 분석/설계 문서) */
+function isArtifact(file: string, epic: string): boolean {
+  return file === `.flightdeck/epics/${epic}/analysis.md` || file === `.flightdeck/epics/${epic}/design.md`;
 }
 
 async function checkpoint(ev: HookEvent, d: HandlerDeps, why: string): Promise<string | null> {

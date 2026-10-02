@@ -16,5 +16,6 @@ const common = {
 await Promise.all([
   build({ ...common, entryPoints: ["packages/hook/src/main.ts"], outfile: "dist/flightdeck-hook.mjs" }),
   build({ ...common, entryPoints: ["packages/mcp/src/main.ts"], outfile: "dist/flightdeck-mcp.mjs" }),
+  build({ ...common, entryPoints: ["packages/vscode/src/demo.ts"], outfile: "dist/fd-demo.mjs" }),
 ]);
-console.log("built dist/flightdeck-hook.mjs, dist/flightdeck-mcp.mjs");
+console.log("built dist/flightdeck-hook.mjs, dist/flightdeck-mcp.mjs, dist/fd-demo.mjs");

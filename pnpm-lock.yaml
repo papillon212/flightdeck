@@ -84,6 +84,24 @@ importers:
         specifier: ^4.6.5
         version: 4.6.5
 
+  packages/vscode:
+    dependencies:
+      '@flightdeck/agent':
+        specifier: workspace:*
+        version: link:../agent
+      '@flightdeck/core':
+        specifier: workspace:*
+        version: link:../core
+      '@flightdeck/git':
+        specifier: workspace:*
+        version: link:../git
+      '@flightdeck/hook':
+        specifier: workspace:*
+        version: link:../hook
+      '@flightdeck/schema':
+        specifier: workspace:*
+        version: link:../schema
+
 packages:
 
   '@esbuild/aix-ppc64@0.28.2':

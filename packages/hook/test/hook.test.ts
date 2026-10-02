@@ -118,6 +118,24 @@ describe("flightdeck-hook (설계 §6.1)", () => {
     expect(r.files.get(rel)).toBe(await readFile(abs, "utf8"));
   });
 
+  it("tool.after: 산출물의 문단 ID를 지우면 편집을 되돌리고 에이전트에게 알린다 (§3.2, §6.2)", async () => {
+    const abs = path.join(wt, `.flightdeck/epics/${EPIC}/analysis.md`);
+    const withIds = "<!-- p:aaaa -->\n## 요구사항 요약\n<!-- p:bbbb -->\n리프레시 토큰 회전\n";
+    await writeFile(abs, withIds);
+    const t = tool("Edit", { file_path: abs });
+    await fire("PreToolUse", t);
+    await writeFile(abs, withIds.replace("<!-- p:bbbb -->\n", "")); // 에이전트가 ID 줄을 지움
+    const { out } = await fire("PostToolUse", { ...t, tool_response: {} });
+    expect(await readFile(abs, "utf8")).toBe(withIds);
+    expect(JSON.parse(out.stdout).hookSpecificOutput.additionalContext).toContain("되돌렸습니다");
+    // ID를 지키며 내용만 고치면 그대로 둔다
+    const t2 = tool("Edit", { file_path: abs });
+    await fire("PreToolUse", t2);
+    await writeFile(abs, withIds.replace("리프레시 토큰 회전", "리프레시 토큰을 매번 회전"));
+    expect((await fire("PostToolUse", { ...t2, tool_response: {} })).out.stdout).toBe("");
+    expect(await readFile(abs, "utf8")).toContain("매번 회전");
+  });
+
   it("tool.after: 셸 편집은 agent_shell로 기록, 비밀 파일은 내용을 남기지 않는다", async () => {
     await writeState(dataDir, { ...(await readState(dataDir, EPIC)), phase: "IMPLEMENTATION" });
     const before = (await readEditLog(dataDir, EPIC)).length;

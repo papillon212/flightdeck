@@ -1,5 +1,6 @@
 // 문단 고정 ID (설계 §3.2)
-// - 문서의 모든 블록(제목, 문단, 목록, 코드 블록) 바로 앞 줄에 `<!-- p:xxxx -->`를 둔다.
+// - 문서의 모든 블록(제목, 문단, 최상위 목록 항목, 코드 블록) 바로 앞 줄에 `<!-- p:xxxx -->`를 둔다.
+//   들여쓴 하위 항목과 이어지는 줄은 상위 항목 블록에 속한다.
 // - 쓰레드 블록(<!-- flightdeck:thread … --> ~ <!-- /flightdeck:thread -->) 안은 블록으로 보지 않는다.
 // - 에이전트·사람이 ID를 지우거나 바꾸면 저장 시 검사에서 잡아 원복한다(§6.2).
 import { randomBytes } from "node:crypto";
@@ -9,6 +10,8 @@ export const THREAD_START = /^<!-- flightdeck:thread .*-->$/;
 export const THREAD_END = /^<!-- \/flightdeck:thread -->$/;
 const HEADING = /^#{1,6} /;
 const FENCE = /^(```|~~~)/;
+/** 최상위 목록 항목. 항목마다 따로 블록이 된다(불명확한 점 항목별로 쓰레드를 달 수 있게) */
+const LIST_ITEM = /^([-*+]|\d+[.)]) /;
 
 export interface Block {
   pid: string | null;
@@ -49,7 +52,8 @@ export function parseBlocks(lines: string[]): Block[] {
         !PID_LINE.test(lines[i]!) &&
         !HEADING.test(lines[i]!) &&
         !FENCE.test(lines[i]!) &&
-        !THREAD_START.test(lines[i]!)
+        !THREAD_START.test(lines[i]!) &&
+        !(i > start && LIST_ITEM.test(lines[i]!))
       )
         i++;
     }
