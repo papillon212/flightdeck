@@ -259,7 +259,7 @@ flightdeck-config/
   "epic": "CU-86abc123",
   "author": "park",
   "at": "2026-10-01T11:03:00+09:00",
-  "data": { "thread": "t-01JB2X4K", "body": "30분, 슬라이딩 갱신입니다." },
+  "data": { "thread": "t-01JB2X4K", "body": "30분, 슬라이딩 갱신입니다.", "source": "human" },
   "sig": "ed25519:…"
 }
 ```
