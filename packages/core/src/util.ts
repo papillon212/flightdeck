@@ -50,7 +50,10 @@ export function ulid(now: number = Date.now()): string {
   return time + random.map((n) => CROCKFORD[n]).join("");
 }
 
-/** 쓰레드 ID: t-<ULID 앞 8자> (설계 §3.1) */
+/**
+ * 쓰레드 ID: t-<ULID 뒤 8자> (설계 §3.1 v0.11, 제안 T1).
+ * 앞 8자는 시각이라 1초 안에 만든 쓰레드끼리 겹친다. 뒤 8자는 난수 40비트다.
+ */
 export function threadIdFrom(eventUlid: string): string {
-  return `t-${eventUlid.slice(0, 8)}`;
+  return `t-${eventUlid.slice(-8)}`;
 }

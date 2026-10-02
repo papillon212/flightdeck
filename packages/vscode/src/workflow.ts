@@ -3,11 +3,11 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { applyTextEdit, checkSections, diffToEdits, ensureParagraphIds, nowIso, reduce, renderThreads, sha256, stripThreads, threadIdFrom, ulid, type EpicState } from "@flightdeck/core";
+import { applyTextEdit, checkSections, diffToEdits, ensureParagraphIds, nowIso, reduce, renderThreads, replay, restoreParagraphIds, sha256, stripThreads, threadIdFrom, ulid, type EpicState } from "@flightdeck/core";
 import { GitEngine, LocalEventStore } from "@flightdeck/git";
-import { HANDOFF_SECTIONS, PHASE_ARTIFACT, type Anchor, type Event, type EventOf, type EventType, type LocalEpicState, type Phase } from "@flightdeck/schema";
+import { HANDOFF_SECTIONS, PHASE_ARTIFACT, type Anchor, type EditRecord, type EditSource, type Event, type EventOf, type EventType, type LocalEpicState, type Phase } from "@flightdeck/schema";
 import type { AgentAdapter } from "@flightdeck/agent";
-import { appendEditRecords, readState, statePath, writeState } from "@flightdeck/hook";
+import { appendEditRecords, readEditLog, readState, statePath, writeState } from "@flightdeck/hook";
 
 export interface WorkflowConfig {
   /** 제품 레포 main worktree */
@@ -25,6 +25,15 @@ export interface WorkflowConfig {
 }
 
 export const ARTIFACT_FILES = ["analysis.md", "design.md"] as const;
+
+export interface RenderReport {
+  file: string;
+  /** 편집 기록에 없던 변경이 있었다 (셸·다른 에디터 등, §7.4) */
+  external: boolean;
+  /** 복원한 문단 ID 수 */
+  restoredIds: number;
+  changed: boolean;
+}
 
 export class EpicWorkflow {
   readonly eng: GitEngine;
@@ -112,35 +121,62 @@ export class EpicWorkflow {
     return s;
   }
 
+  /** 마지막 renderDocs 결과 (확장이 "Flightdeck 밖에서 수정됨" 알림에 쓴다, §7.4) */
+  lastRender: RenderReport[] = [];
+
   /**
-   * 산출물에 문단 ID를 붙이고 쓰레드 블록을 다시 그린다 (§3.2). 바뀐 파일 목록을 돌려준다.
-   * 이 변경도 편집 기록에 남긴다(출처 flightdeck, 설계 제안 T4). 그래야 편집 기록 재적용 = 디스크가 유지된다.
+   * 산출물을 점검하고 다시 그린다 (§3.2, §7.4). 바뀐 파일 목록을 돌려준다.
+   * 1. 편집 기록 재적용 결과 ≠ 디스크면, 그 차이는 기록되지 않은 변경(셸·다른 에디터·git 등)이다 → external로 기록 (설계 제안 T8)
+   * 2. 재적용 결과(마지막으로 확인된 내용)와 비교해 지워지거나 바뀐 문단 ID를 원래 ID로 복원한다. 새 ID로 덮지 않는다
+   * 3. 새 블록에 ID를 붙이고 쓰레드 블록을 그린다
+   * 2·3의 변경도 편집 기록에 남긴다(출처 flightdeck, 설계 제안 T4). 그래서 편집 기록 재적용 = 디스크가 항상 유지된다.
    */
   async renderDocs(epic: string, s?: EpicState): Promise<string[]> {
     const state = s ?? (await this.epicState(epic));
     const wt = await this.worktree(epic);
     const dataDir = await this.eng.dataDir();
-    const changed: string[] = [];
+    const log = await readEditLog(dataDir, epic);
+    const report: RenderReport[] = [];
     for (const name of ARTIFACT_FILES) {
       const file = path.join(this.epicDir(wt, epic), name);
       if (!existsSync(file)) continue;
-      const cur = await readFile(file, "utf8");
-      const withIds = ensureParagraphIds(stripThreads(cur)).text;
-      const next = renderThreads(withIds, name, state.threads.values());
-      if (next === cur) continue;
-      await writeFile(file, next);
-      changed.push(name);
       const rel = path.relative(wt, file).split(path.sep).join("/");
-      const reason: "thread_render" | "paragraph_ids" = withIds === stripThreads(cur) ? "thread_render" : "paragraph_ids";
-      let base = cur;
-      const records = diffToEdits(cur, next).map((e) => {
-        const r = { epic, file: rel, base_hash: sha256(base), range: e.range, insert: e.insert, ts: nowIso(), source: { kind: "flightdeck" as const, member: this.cfg.member, reason } };
-        base = applyTextEdit(base, e);
+      const disk = await readFile(file, "utf8");
+      const fileLog = log.filter((r) => r.file === rel);
+      const expected = fileLog.length ? (replay(new Map([[rel, null]]), fileLog).files.get(rel) ?? null) : null;
+      const external = expected !== disk;
+      if (external) await this.recordDiff(epic, rel, expected, disk, { kind: "external" });
+
+      const restored = expected === null ? { text: stripThreads(disk), restored: [] } : restoreParagraphIds(stripThreads(expected), stripThreads(disk));
+      const withIds = ensureParagraphIds(restored.text).text;
+      const next = renderThreads(withIds, name, state.threads.values());
+      if (next !== disk) {
+        await writeFile(file, next);
+        const reason = withIds === stripThreads(disk) ? "thread_render" : "paragraph_ids";
+        await this.recordDiff(epic, rel, disk, next, { kind: "flightdeck", member: this.cfg.member, reason });
+      }
+      if (external || next !== disk) report.push({ file: name, external, restoredIds: restored.restored.length, changed: next !== disk });
+    }
+    this.lastRender = report;
+    return report.filter((r) => r.changed).map((r) => r.file);
+  }
+
+  /** 변경 전후를 편집 기록으로 남긴다 (before null = 새 파일, after null = 삭제) */
+  private async recordDiff(epic: string, file: string, before: string | null, after: string | null, source: EditSource): Promise<void> {
+    if (before === after) return;
+    const ts = nowIso();
+    let records: Omit<EditRecord, "seq">[];
+    if (after === null) {
+      records = [{ epic, file, base_hash: sha256(before), range: [0, 0], insert: "", delete_file: true, source, ts }];
+    } else {
+      let base: string | null = before;
+      records = diffToEdits(before ?? "", after).map((e) => {
+        const r = { epic, file, base_hash: sha256(base), range: e.range, insert: e.insert, source, ts };
+        base = applyTextEdit(base ?? "", e);
         return r;
       });
-      await appendEditRecords(dataDir, epic, records);
     }
-    return changed;
+    await appendEditRecords(await this.eng.dataDir(), epic, records);
   }
 
   // ---- 쓰레드 (§3.4) ----

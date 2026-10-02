@@ -85,6 +85,17 @@ describe("문단 ID (설계 §3.2)", () => {
     expect(r.text).toContain(`${pidLine}\n만료 시 갱신한다.`);
   });
 
+  it("ID 줄을 지우고 그 블록 문구도 고치면(제자리 수정) 고친 블록 앞에 원래 ID를 복원", () => {
+    const { text } = ensureParagraphIds(doc);
+    const lines = text.split("\n");
+    const item = lines.indexOf("- 목록 2");
+    const pidLine = lines[item - 1]!;
+    const edited = lines.filter((_, i) => i !== item - 1).map((l) => (l === "- 목록 2" ? "- 목록 둘 (고침)" : l)).join("\n");
+    const r = restoreParagraphIds(text, edited);
+    expect(r.text).toBe(text.replace("- 목록 2", "- 목록 둘 (고침)"));
+    expect(r.text).toContain(`${pidLine}\n- 목록 둘 (고침)`);
+  });
+
   it("목록 항목 사이의 ID를 지우면 그 항목 앞에 복원, 블록을 통째로 지우면 복원하지 않음", () => {
     const { text } = ensureParagraphIds(doc);
     const lines = text.split("\n");
@@ -177,9 +188,9 @@ describe("ULID·쓰레드 ID", () => {
     expect(new Set(ids).size).toBe(50);
   });
 
-  it("설계의 t-<ULID 앞 8자>는 약 1초 안에 만든 쓰레드끼리 겹친다 (설계 제안 대상)", () => {
-    const a = threadIdFrom(ulid(1_790_000_000_000));
-    const b = threadIdFrom(ulid(1_790_000_000_500));
-    expect(a).toBe(b);
+  it("쓰레드 ID는 ULID 뒤 8자: 같은 밀리초에 만든 것끼리도 겹치지 않는다 (T1)", () => {
+    const ids = Array.from({ length: 200 }, (_, i) => threadIdFrom(ulid(1_790_000_000_000 + (i % 3))));
+    expect(new Set(ids).size).toBe(200);
+    expect(ids.every((t) => /^t-[0-9A-HJKMNP-TV-Z]{8}$/.test(t))).toBe(true);
   });
 });

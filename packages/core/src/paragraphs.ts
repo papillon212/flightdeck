@@ -102,26 +102,39 @@ export type PidViolation =
   | { kind: "removed"; pid: string; line: number; replaceBlank: boolean } // 블록 일부라도 남았는데 ID가 사라짐
   | { kind: "changed"; from: string; to: string; line: number }; // ID 줄이 다른 새 ID로 바뀜 (line = 그 ID 줄)
 
-/** 줄 단위 diff로 이전 문서의 각 줄이 새 문서의 몇 번째 줄로 남았는지(없으면 null), 새 문서의 각 줄이 새로 생긴 줄인지 */
-function lineMap(prev: string[], next: string[]): { toNext: (number | null)[]; added: boolean[] } {
+/**
+ * 줄 단위 diff로 이전 문서의 각 줄이 새 문서의 몇 번째 줄로 남았는지(없으면 null), 새 문서의 각 줄이 새로 생긴 줄인지,
+ * 그리고 제자리 수정(지운 줄들 바로 그 자리에 새 줄들이 들어옴)이면 이전 줄 → 대신 들어온 새 줄 범위를 구한다.
+ */
+function lineMap(prev: string[], next: string[]): { toNext: (number | null)[]; added: boolean[]; replacedBy: ([number, number] | null)[] } {
   const toNext: (number | null)[] = new Array(prev.length).fill(null);
   const added: boolean[] = new Array(next.length).fill(false);
+  const replacedBy: ([number, number] | null)[] = new Array(prev.length).fill(null);
   let i = 0;
   let j = 0;
+  let removedRun: [number, number] | null = null; // 직전 removed 묶음의 이전 줄 범위
+  let addedRun: [number, number] | null = null; // 직전 added 묶음의 새 줄 범위
   for (const part of diffArrays(prev, next)) {
     const n = part.count ?? part.value.length;
     if (part.added) {
       for (let k = 0; k < n; k++) added[j + k] = true;
+      if (removedRun) for (let k = removedRun[0]; k < removedRun[1]; k++) replacedBy[k] = [j, j + n];
+      addedRun = removedRun ? null : [j, j + n];
+      removedRun = null;
       j += n;
     } else if (part.removed) {
+      if (addedRun) for (let k = i; k < i + n; k++) replacedBy[k] = addedRun;
+      removedRun = addedRun ? null : [i, i + n];
+      addedRun = null;
       i += n;
     } else {
       for (let k = 0; k < n; k++) toNext[i + k] = j + k;
+      removedRun = addedRun = null;
       i += n;
       j += n;
     }
   }
-  return { toNext, added };
+  return { toNext, added, replacedBy };
 }
 
 /**
@@ -143,7 +156,8 @@ export function checkParagraphIds(prev: string, next: string): PidViolation[] {
   for (const b of after) if (b.pid) seen.set(b.pid, (seen.get(b.pid) ?? 0) + 1);
   for (const [pid, n] of seen) if (n > 1) out.push({ kind: "duplicate", pid });
 
-  const { toNext, added } = lineMap(pl, nl);
+  const { toNext, added, replacedBy } = lineMap(pl, nl);
+  const claimed = new Set<number>(); // 이미 다른 ID 복원 위치로 쓴 새 블록 시작 줄
   for (const b of before) {
     if (seen.has(b.pid!)) continue;
     const surviving: number[] = [];
@@ -151,7 +165,14 @@ export function checkParagraphIds(prev: string, next: string): PidViolation[] {
       const j = toNext[k];
       if (j !== null && j !== undefined) surviving.push(j);
     }
-    if (!surviving.length) continue; // 블록을 통째로 지움
+    if (!surviving.length) {
+      // 제자리 수정: 블록 줄들이 지워진 바로 그 자리에 새 줄이 들어왔으면, 그중 ID 없는 첫 블록이 이 블록의 새 모습이다
+      const range = replacedBy[b.start];
+      const host = range && after.find((a) => a.start >= range[0] && a.start < range[1] && a.pid === null && !claimed.has(a.start));
+      if (!host) continue; // 블록을 통째로 지움 (그 자리에 들어온 내용이 없음)
+      claimed.add(host.start);
+      surviving.push(host.start);
+    }
     const first = surviving[0]!;
     const host = after.find((a) => first >= a.start && first <= a.end);
     if (host && host.start === first && host.pid && !beforePids.has(host.pid)) {

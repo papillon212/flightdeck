@@ -298,6 +298,12 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       return;
     }
     const s = await ctx.wf.sync(ctx.epic);
+    for (const r of ctx.wf.lastRender.filter((x) => x.external)) {
+      // §7.4 외부 변경 감지: 편집 기록에 없던 변경(셸·다른 에디터 등)
+      vscode.window.showWarningMessage(
+        `Flightdeck 밖에서 ${r.file}이(가) 수정됐습니다. 출처 external로 기록했습니다${r.restoredIds ? `. 지워지거나 바뀐 문단 ID ${r.restoredIds}개를 복원했습니다` : ""}.`,
+      );
+    }
     const open = [...s.threads.values()].filter((t) => t.status === "open").length;
     status.text = `$(rocket) Flightdeck · ${ctx.epic} · ${s.phase}${open ? ` · 열린 쓰레드 ${open}` : ""}`;
     status.tooltip = "Flightdeck: 단계 완료 / 초안 / 이어서 작업";
