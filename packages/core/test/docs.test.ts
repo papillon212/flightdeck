@@ -64,6 +64,36 @@ describe("문단 ID (설계 §3.2)", () => {
     // 훼손이 없으면 그대로
     expect(restoreParagraphIds(text, text + "새 문단\n")).toEqual({ text: text + "새 문단\n", restored: [] });
   });
+
+  it("M1 수동 시나리오 보고: ID 줄 내용만 지우면 빈 줄이 남지 않게 그 자리에 복원", () => {
+    const { text } = ensureParagraphIds(doc);
+    const lines = text.split("\n");
+    const idLine = lines.findIndex((l, i) => l.startsWith("<!-- p:") && lines[i + 1] === "토큰은 Redis에 저장하고");
+    const cleared = lines.map((l, i) => (i === idLine ? "" : l)).join("\n");
+    expect(restoreParagraphIds(text, cleared).text).toBe(text);
+  });
+
+  it("M1 수동 시나리오 보고: ID 줄과 블록 첫 줄을 함께 지워도 남은 줄 앞에 복원", () => {
+    const { text } = ensureParagraphIds(doc);
+    const lines = text.split("\n");
+    const idLine = lines.findIndex((l, i) => l.startsWith("<!-- p:") && lines[i + 1] === "토큰은 Redis에 저장하고");
+    const pidLine = lines[idLine]!;
+    const cut = lines.filter((_, i) => i !== idLine && i !== idLine + 1).join("\n"); // ID 줄 + "토큰은 Redis에 저장하고"
+    const r = restoreParagraphIds(text, cut);
+    expect(r.restored).toEqual([expect.objectContaining({ kind: "removed" })]);
+    expect(r.text.split("\n")).toContain(pidLine);
+    expect(r.text).toContain(`${pidLine}\n만료 시 갱신한다.`);
+  });
+
+  it("목록 항목 사이의 ID를 지우면 그 항목 앞에 복원, 블록을 통째로 지우면 복원하지 않음", () => {
+    const { text } = ensureParagraphIds(doc);
+    const lines = text.split("\n");
+    const item2 = lines.indexOf("- 목록 2");
+    const withoutId = lines.filter((_, i) => i !== item2 - 1).join("\n");
+    expect(restoreParagraphIds(text, withoutId).text).toBe(text);
+    const withoutBlock = lines.filter((_, i) => i !== item2 - 1 && i !== item2).join("\n");
+    expect(restoreParagraphIds(text, withoutBlock).restored).toEqual([]);
+  });
 });
 
 const thread = (over: Partial<Thread> = {}): Thread => ({

@@ -4,6 +4,7 @@
 // - 쓰레드 블록(<!-- flightdeck:thread … --> ~ <!-- /flightdeck:thread -->) 안은 블록으로 보지 않는다.
 // - 에이전트·사람이 ID를 지우거나 바꾸면 저장 시 검사에서 잡아 원복한다(§6.2).
 import { randomBytes } from "node:crypto";
+import { diffArrays } from "diff";
 
 export const PID_LINE = /^<!-- (p:[0-9a-f]{4}) -->$/;
 export const THREAD_START = /^<!-- flightdeck:thread .*-->$/;
@@ -93,39 +94,96 @@ function newPid(used: Set<string>): string {
   }
 }
 
+/**
+ * 문단 ID 훼손. line은 새 문서에서 ID 줄을 되살릴 위치(그 줄 앞), replaceBlank면 그 앞 빈 줄을 ID 줄로 바꾼다.
+ */
 export type PidViolation =
   | { kind: "duplicate"; pid: string }
-  | { kind: "removed"; pid: string; text: string } // 내용은 남았는데 ID만 사라짐
-  | { kind: "changed"; from: string; to: string; text: string }; // 같은 내용인데 ID가 바뀜
+  | { kind: "removed"; pid: string; line: number; replaceBlank: boolean } // 블록 일부라도 남았는데 ID가 사라짐
+  | { kind: "changed"; from: string; to: string; line: number }; // ID 줄이 다른 새 ID로 바뀜 (line = 그 ID 줄)
+
+/** 줄 단위 diff로 이전 문서의 각 줄이 새 문서의 몇 번째 줄로 남았는지(없으면 null), 새 문서의 각 줄이 새로 생긴 줄인지 */
+function lineMap(prev: string[], next: string[]): { toNext: (number | null)[]; added: boolean[] } {
+  const toNext: (number | null)[] = new Array(prev.length).fill(null);
+  const added: boolean[] = new Array(next.length).fill(false);
+  let i = 0;
+  let j = 0;
+  for (const part of diffArrays(prev, next)) {
+    const n = part.count ?? part.value.length;
+    if (part.added) {
+      for (let k = 0; k < n; k++) added[j + k] = true;
+      j += n;
+    } else if (part.removed) {
+      i += n;
+    } else {
+      for (let k = 0; k < n; k++) toNext[i + k] = j + k;
+      i += n;
+      j += n;
+    }
+  }
+  return { toNext, added };
+}
+
+/**
+ * 저장 전후 문서를 비교해 문단 ID 훼손을 찾는다 (설계 §3.2, §6.2).
+ * 줄 단위 diff로 이전 블록의 줄이 새 문서에 남았는지 본다.
+ * - ID가 사라졌는데 그 블록의 줄이 하나라도 남았으면 훼손(removed). 남은 첫 줄 앞에 되살린다.
+ * - 블록의 줄이 하나도 남지 않았으면 블록을 통째로 지운 것이라 훼손이 아니다(그 ID의 쓰레드는 위치를 잃는다).
+ * - ID 줄이 이전에 없던 ID로 바뀌었으면 changed.
+ */
+export function checkParagraphIds(prev: string, next: string): PidViolation[] {
+  const pl = splitLines(prev).lines;
+  const nl = splitLines(next).lines;
+  const before = parseBlocks(pl).filter((b) => b.pid);
+  const after = parseBlocks(nl);
+  const beforePids = new Set(before.map((b) => b.pid!));
+  const out: PidViolation[] = [];
+
+  const seen = new Map<string, number>();
+  for (const b of after) if (b.pid) seen.set(b.pid, (seen.get(b.pid) ?? 0) + 1);
+  for (const [pid, n] of seen) if (n > 1) out.push({ kind: "duplicate", pid });
+
+  const { toNext, added } = lineMap(pl, nl);
+  for (const b of before) {
+    if (seen.has(b.pid!)) continue;
+    const surviving: number[] = [];
+    for (let k = b.start; k <= b.end; k++) {
+      const j = toNext[k];
+      if (j !== null && j !== undefined) surviving.push(j);
+    }
+    if (!surviving.length) continue; // 블록을 통째로 지움
+    const first = surviving[0]!;
+    const host = after.find((a) => first >= a.start && first <= a.end);
+    if (host && host.start === first && host.pid && !beforePids.has(host.pid)) {
+      out.push({ kind: "changed", from: b.pid!, to: host.pid, line: first - 1 });
+      continue;
+    }
+    // ID 줄 내용만 지워 빈 줄이 남았으면 그 빈 줄을 ID 줄로 바꾼다 (빈 줄이 하나 더 생기지 않게)
+    const replaceBlank = first > 0 && nl[first - 1] === "" && added[first - 1] === true;
+    out.push({ kind: "removed", pid: b.pid!, line: first, replaceBlank });
+  }
+  return out;
+}
 
 /**
  * 문단 ID 훼손을 고친다 (설계 §3.2 "저장할 때 확장이 검사해 복원한다").
- * 사라진 ID는 그 블록 앞에 다시 넣고, 바뀐 ID는 원래 ID로 되돌리고, 중복 ID는 뒤쪽 것을 지운다(새 ID는 렌더링 때 붙는다).
- * 같은 저장에 들어 있던 다른 편집은 그대로 둔다.
+ * 사라진 ID는 그 블록의 남은 첫 줄 앞에 되살리고, 바뀐 ID는 원래 ID로 되돌리고,
+ * 중복 ID는 원래 블록 쪽만 남긴다(복사해 붙인 쪽은 렌더링 때 새 ID를 받는다). 같은 저장의 다른 편집은 그대로 둔다.
  */
 export function restoreParagraphIds(prev: string, next: string): { text: string; restored: PidViolation[] } {
   const violations = checkParagraphIds(prev, next);
   if (!violations.length) return { text: next, restored: [] };
   const { lines, eol } = splitLines(next);
   const blocks = parseBlocks(lines);
-  const used = new Set<Block>();
   const ops: { line: number; kind: "insert" | "replace" | "delete"; text?: string }[] = [];
   for (const v of violations) {
     if (v.kind === "removed") {
-      const b = blocks.find((x) => !used.has(x) && x.pid === null && x.text.trim() === v.text.trim());
-      if (b) {
-        used.add(b);
-        ops.push({ line: b.start, kind: "insert", text: `<!-- ${v.pid} -->` });
-      }
+      if (v.replaceBlank) ops.push({ line: v.line - 1, kind: "replace", text: `<!-- ${v.pid} -->` });
+      else ops.push({ line: v.line, kind: "insert", text: `<!-- ${v.pid} -->` });
     } else if (v.kind === "changed") {
-      const b = blocks.find((x) => !used.has(x) && x.pid === v.to && x.text.trim() === v.text.trim());
-      if (b) {
-        used.add(b);
-        ops.push({ line: b.start - 1, kind: "replace", text: `<!-- ${v.from} -->` });
-      }
+      ops.push({ line: v.line, kind: "replace", text: `<!-- ${v.from} -->` });
     } else {
       const dup = blocks.filter((x) => x.pid === v.pid);
-      // 원래 내용과 같은 블록의 ID는 남기고 나머지(복사해 붙인 쪽)의 ID 줄을 지운다
       const orig = parseBlocks(splitLines(prev).lines).find((x) => x.pid === v.pid);
       const keep = dup.find((x) => orig && x.text.trim() === orig.text.trim()) ?? dup[0];
       for (const b of dup) if (b !== keep) ops.push({ line: b.start - 1, kind: "delete" });
@@ -139,26 +197,3 @@ export function restoreParagraphIds(prev: string, next: string): { text: string;
   return { text: lines.join(eol), restored: violations };
 }
 
-/**
- * 저장 전후 문서를 비교해 문단 ID 훼손을 찾는다 (설계 §6.2).
- * 블록을 통째로 지운 것은 위반이 아니다(그 ID를 가리키던 쓰레드는 고아가 된다).
- */
-export function checkParagraphIds(prev: string, next: string): PidViolation[] {
-  const before = parseBlocks(splitLines(prev).lines).filter((b) => b.pid);
-  const after = parseBlocks(splitLines(next).lines);
-  const out: PidViolation[] = [];
-
-  const seen = new Map<string, number>();
-  for (const b of after) if (b.pid) seen.set(b.pid, (seen.get(b.pid) ?? 0) + 1);
-  for (const [pid, n] of seen) if (n > 1) out.push({ kind: "duplicate", pid });
-
-  const afterByPid = new Map(after.filter((b) => b.pid).map((b) => [b.pid!, b]));
-  for (const b of before) {
-    if (afterByPid.has(b.pid!)) continue;
-    const same = after.find((a) => a.text.trim() === b.text.trim());
-    if (!same) continue; // 블록이 지워졌거나 내용이 바뀜: 위반 아님
-    if (same.pid) out.push({ kind: "changed", from: b.pid!, to: same.pid, text: b.text });
-    else out.push({ kind: "removed", pid: b.pid!, text: b.text });
-  }
-  return out;
-}

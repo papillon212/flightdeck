@@ -437,17 +437,39 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       if (existsSync(file)) {
         const doc = await vscode.workspace.openTextDocument(file);
         await vscode.window.showTextDocument(doc);
-        const lines = doc.getText().split(/\r?\n/);
+        const settle = () => new Promise((r) => setTimeout(r, 1500));
+        // A: 첫 ID 줄의 내용만 지우고(빈 줄 남김) 다른 줄도 고친 뒤 저장
+        const original = doc.getText();
+        let lines = original.split(/\r?\n/);
         const idLine = lines.findIndex((l) => PID_LINE.test(l));
         const pidLine = lines[idLine]!;
-        const edit = new vscode.WorkspaceEdit();
-        edit.delete(doc.uri, new vscode.Range(idLine, 0, idLine + 1, 0));
+        let edit = new vscode.WorkspaceEdit();
+        edit.delete(doc.uri, new vscode.Range(idLine, 0, idLine, pidLine.length));
         edit.insert(doc.uri, new vscode.Position(doc.lineCount, 0), "\n스모크 점검 문장\n");
         await vscode.workspace.applyEdit(edit);
         await doc.save();
-        await new Promise((r) => setTimeout(r, 1500));
-        const after = doc.getText();
-        pidTest = { pidLine, restored: after.split(/\r?\n/).includes(pidLine), otherEditKept: after.includes("스모크 점검 문장"), dirty: doc.isDirty };
+        await settle();
+        const a = doc.getText();
+        const blanks = (t: string) => t.split(/\r?\n/).filter((l) => l === "").length;
+        // 새 문장을 붙이며 생긴 빈 줄 1개 말고는 빈 줄이 늘지 않아야 한다
+        const caseA = { pidLine, restored: a.split(/\r?\n/)[idLine] === pidLine, noExtraBlank: blanks(a) === blanks(original) + 1, otherEditKept: a.includes("스모크 점검 문장") };
+        // B: 두 줄 이상인 블록의 ID 줄과 첫 줄을 함께 지우고 저장
+        lines = doc.getText().split(/\r?\n/);
+        const blocks = parseBlocks(lines);
+        const multi = blocks.find((b) => b.pid && b.end > b.start);
+        let caseB: unknown = "두 줄 블록 없음";
+        if (multi) {
+          const pidB = lines[multi.start - 1]!;
+          const rest = lines[multi.start + 1]!;
+          edit = new vscode.WorkspaceEdit();
+          edit.delete(doc.uri, new vscode.Range(multi.start - 1, 0, multi.start + 1, 0));
+          await vscode.workspace.applyEdit(edit);
+          await doc.save();
+          await settle();
+          const b = doc.getText().split(/\r?\n/);
+          caseB = { pidLine: pidB, restoredBeforeRest: b[b.indexOf(rest) - 1] === pidB };
+        }
+        pidTest = { caseA, caseB, dirty: doc.isDirty };
       }
     }
     await writeFile(
