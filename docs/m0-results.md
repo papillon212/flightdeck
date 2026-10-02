@@ -657,7 +657,7 @@ PreToolUse:Write hook error: Flightdeck: 앞선 긴급 의견 때문에 이번 �
 | Q10 | §10.1 ⑤·⑥, §10.3 | 회의록 조회: `conferenceRecords.list → smartNotes.list → docsDestination → Docs API`, 전사 사용 시 `transcripts.entries` | 추가: (a) 회의록과 전사는 한 Docs 문서의 두 탭이다. 회의록은 첫 탭, 전사 탭은 `includeTabsContent: true`로만 받아진다 (b) 앵커링 입력의 전사는 탭 텍스트가 아니라 `transcripts.entries`(화자·시각·언어 포함, 페이지 처리)를 쓴다 (c) 회의록이 생성되지 않은 회의의 처리 경로를 둔다 (d) `meetings.space.created` 범위는 Flightdeck이 만든 회의만 보이므로, "회의 시작" 버튼으로 연 회의만 대상이라고 명시한다 | 10번 |
 | Q9 | §3.7 알림, §3.1 | 20초 `ls-remote` 폴링 | GitHub 왕복이 push·fetch 각 약 4초이고 경합 시 메타 반영이 수십 초까지 밀린다는 점을 적는다. 메타 브랜치는 "수 초~수십 초 안에 반영"되는 경로이고, 실시간 경로는 서버 ④임을 명시한다 | 9번 |
 
-## 설계 변경 제안 3차 (11번 결과, design.md 미반영, 검토 후 반영)
+## 설계 변경 제안 3차 (11번 결과, design.md v0.10에 반영, 2026-10-02)
 
 | # | 절 | 현재 서술 (v0.10) | 제안 | 근거 |
 |---|---|---|---|---|
