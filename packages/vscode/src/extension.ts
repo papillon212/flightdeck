@@ -323,7 +323,9 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       const { worktree } = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Flightdeck: ${epic} 시작` }, () => ctx.wf.start(epic, title, body));
       const pick = await vscode.window.showInformationMessage(`${epic} 작업 폴더를 만들었습니다. 분석 초안을 에이전트에게 맡길까요?`, "초안 작성 후 열기", "바로 열기");
       if (pick === "초안 작성 후 열기") await draftWithProgress(ctx.wf, epic, out);
-      if (pick) await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(worktree), { forceNewWindow: true });
+      // 설계 §9.1은 새 창. 단 개발 모드(Extension Development Host)의 새 창에는 개발 중인 확장이 실리지 않아 같은 창에서 연다
+      const newWindow = ext.extensionMode !== vscode.ExtensionMode.Development;
+      if (pick) await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(worktree), { forceNewWindow: newWindow });
     }),
 
     run("flightdeck.draft", async () => {
