@@ -99,6 +99,47 @@ export type PidViolation =
   | { kind: "changed"; from: string; to: string; text: string }; // 같은 내용인데 ID가 바뀜
 
 /**
+ * 문단 ID 훼손을 고친다 (설계 §3.2 "저장할 때 확장이 검사해 복원한다").
+ * 사라진 ID는 그 블록 앞에 다시 넣고, 바뀐 ID는 원래 ID로 되돌리고, 중복 ID는 뒤쪽 것을 지운다(새 ID는 렌더링 때 붙는다).
+ * 같은 저장에 들어 있던 다른 편집은 그대로 둔다.
+ */
+export function restoreParagraphIds(prev: string, next: string): { text: string; restored: PidViolation[] } {
+  const violations = checkParagraphIds(prev, next);
+  if (!violations.length) return { text: next, restored: [] };
+  const { lines, eol } = splitLines(next);
+  const blocks = parseBlocks(lines);
+  const used = new Set<Block>();
+  const ops: { line: number; kind: "insert" | "replace" | "delete"; text?: string }[] = [];
+  for (const v of violations) {
+    if (v.kind === "removed") {
+      const b = blocks.find((x) => !used.has(x) && x.pid === null && x.text.trim() === v.text.trim());
+      if (b) {
+        used.add(b);
+        ops.push({ line: b.start, kind: "insert", text: `<!-- ${v.pid} -->` });
+      }
+    } else if (v.kind === "changed") {
+      const b = blocks.find((x) => !used.has(x) && x.pid === v.to && x.text.trim() === v.text.trim());
+      if (b) {
+        used.add(b);
+        ops.push({ line: b.start - 1, kind: "replace", text: `<!-- ${v.from} -->` });
+      }
+    } else {
+      const dup = blocks.filter((x) => x.pid === v.pid);
+      // 원래 내용과 같은 블록의 ID는 남기고 나머지(복사해 붙인 쪽)의 ID 줄을 지운다
+      const orig = parseBlocks(splitLines(prev).lines).find((x) => x.pid === v.pid);
+      const keep = dup.find((x) => orig && x.text.trim() === orig.text.trim()) ?? dup[0];
+      for (const b of dup) if (b !== keep) ops.push({ line: b.start - 1, kind: "delete" });
+    }
+  }
+  for (const op of ops.sort((a, b) => b.line - a.line)) {
+    if (op.kind === "insert") lines.splice(op.line, 0, op.text!);
+    else if (op.kind === "replace") lines[op.line] = op.text!;
+    else lines.splice(op.line, 1);
+  }
+  return { text: lines.join(eol), restored: violations };
+}
+
+/**
  * 저장 전후 문서를 비교해 문단 ID 훼손을 찾는다 (설계 §6.2).
  * 블록을 통째로 지운 것은 위반이 아니다(그 ID를 가리키던 쓰레드는 고아가 된다).
  */

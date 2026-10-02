@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Thread } from "../src/index.ts";
-import { checkParagraphIds, checkSections, ensureParagraphIds, listThreadBlocks, nowIso, parseBlocks, renderThreads, stripThreads, threadIdFrom, ulid } from "../src/index.ts";
+import { checkParagraphIds, checkSections, ensureParagraphIds, listThreadBlocks, nowIso, parseBlocks, renderThreads, restoreParagraphIds, stripThreads, threadIdFrom, ulid } from "../src/index.ts";
 
 const doc = ["# 분석", "", "## 요구사항 요약", "토큰은 Redis에 저장하고", "만료 시 갱신한다.", "", "```ts", "## 코드 안 제목은 블록이 아님", "```", "", "- 목록 1", "  - 하위 항목", "- 목록 2", "1. 번호 목록", ""].join("\n");
 
@@ -37,6 +37,32 @@ describe("문단 ID (설계 §3.2)", () => {
 
     const dup = text + "\n<!-- " + pid + " -->\n새 문단\n";
     expect(checkParagraphIds(text, dup)).toContainEqual({ kind: "duplicate", pid });
+  });
+
+  it("restoreParagraphIds: ID 줄만 되살리고 같은 저장의 다른 편집은 남긴다 (§3.2)", () => {
+    const { text } = ensureParagraphIds(doc);
+    const lines = text.split("\n");
+    const idLine = lines.findIndex((l, i) => l.startsWith("<!-- p:") && lines[i + 1] === "토큰은 Redis에 저장하고");
+    const pid = lines[idLine]!.slice(5, 11);
+
+    // ID 줄을 지우고, 다른 곳에 정상 편집도 함께
+    const edited = lines.filter((_, i) => i !== idLine).join("\n").replace("- 목록 2", "- 목록 2 (수정)");
+    const r = restoreParagraphIds(text, edited);
+    expect(r.restored).toEqual([expect.objectContaining({ kind: "removed", pid })]);
+    expect(r.text).toBe(text.replace("- 목록 2", "- 목록 2 (수정)"));
+    expect(checkParagraphIds(text, r.text)).toEqual([]);
+
+    // ID를 바꾸면 원래 ID로
+    const changed = lines.map((l, i) => (i === idLine ? "<!-- p:ffff -->" : l)).join("\n");
+    expect(restoreParagraphIds(text, changed).text).toBe(text);
+
+    // 문단을 ID째 복사해 붙이면 붙인 쪽의 ID 줄만 지운다
+    const pasted = text + `<!-- ${pid} -->\n복사한 문단\n`;
+    const p = restoreParagraphIds(text, pasted);
+    expect(p.text).toBe(text + "복사한 문단\n");
+
+    // 훼손이 없으면 그대로
+    expect(restoreParagraphIds(text, text + "새 문단\n")).toEqual({ text: text + "새 문단\n", restored: [] });
   });
 });
 

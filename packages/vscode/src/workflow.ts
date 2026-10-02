@@ -134,7 +134,7 @@ export class EpicWorkflow {
       const reason: "thread_render" | "paragraph_ids" = withIds === stripThreads(cur) ? "thread_render" : "paragraph_ids";
       let base = cur;
       const records = diffToEdits(cur, next).map((e) => {
-        const r = { epic, file: rel, base_hash: sha256(base), range: e.range, insert: e.insert, ts: new Date().toISOString(), source: { kind: "flightdeck" as const, member: this.cfg.member, reason } };
+        const r = { epic, file: rel, base_hash: sha256(base), range: e.range, insert: e.insert, ts: nowIso(), source: { kind: "flightdeck" as const, member: this.cfg.member, reason } };
         base = applyTextEdit(base, e);
         return r;
       });

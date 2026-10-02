@@ -78,6 +78,7 @@ if (cmd === "thread") {
   // "불명확한 점" 섹션의 첫 목록 항목에 질문 쓰레드를 단다
   const { parseBlocks } = await import("@flightdeck/core");
   const file = path.join(await wf.worktree(EPIC), ".flightdeck/epics", EPIC, "analysis.md");
+  await wf.renderDocs(EPIC); // 문단 ID부터 붙인다
   const blocks = parseBlocks((await readFile(file, "utf8")).split("\n"));
   const sec = blocks.findIndex((b) => b.text.startsWith("## 불명확한 점"));
   const item = blocks.slice(sec + 1).find((b) => b.text.startsWith("- "));

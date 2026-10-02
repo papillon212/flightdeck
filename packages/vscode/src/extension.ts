@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import * as vscode from "vscode";
 import { ClaudeCodeAdapter, cleanEnv } from "@flightdeck/agent";
-import { checkParagraphIds, coalesce, parseBlocks, sha256, type EpicState, type Thread } from "@flightdeck/core";
+import { coalesce, nowIso, parseBlocks, PID_LINE, restoreParagraphIds, sha256, type EpicState, type Thread } from "@flightdeck/core";
 import { git } from "@flightdeck/git";
 import { appendEditRecords, readState } from "@flightdeck/hook";
 import type { EditRecord, LocalEpicState } from "@flightdeck/schema";
@@ -149,6 +149,8 @@ class HumanEdits implements vscode.Disposable {
   private timer: NodeJS.Timeout | null = null;
   /** 저장이 확인된 마지막 내용 (문단 ID 검사 기준) */
   private lastGood = new Map<string, string>();
+  /** 저장 직전 ID 복원 편집이 들어갈 문서. 그 변경은 사람 편집이 아니라 flightdeck 출처로 기록한다 */
+  private restoring = new Set<string>();
   private subs: vscode.Disposable[] = [];
 
   constructor(
@@ -161,6 +163,7 @@ class HumanEdits implements vscode.Disposable {
     this.subs.push(
       vscode.workspace.onDidOpenTextDocument((d) => this.track(d)),
       vscode.workspace.onDidChangeTextDocument((e) => this.change(e)),
+      vscode.workspace.onWillSaveTextDocument((e) => this.willSave(e)),
       vscode.workspace.onDidSaveTextDocument((d) => this.saved(d)),
     );
   }
@@ -202,8 +205,10 @@ class HumanEdits implements vscode.Disposable {
     // 한 이벤트 안의 변경은 모두 이벤트 전 기준 오프셋 → 뒤에서부터 하나씩 기록 (base_hash 사슬)
     let base = prev;
     const list = this.pending.get(rel) ?? [];
+    const restoring = this.restoring.delete(key);
+    const source = restoring ? { kind: "flightdeck" as const, member: this.member, reason: "paragraph_ids" as const } : { kind: "human" as const, member: this.member };
     for (const c of [...e.contentChanges].sort((a, b) => b.rangeOffset - a.rangeOffset)) {
-      list.push({ epic: this.ctx.epic!, file: rel, base_hash: sha256(base), range: [c.rangeOffset, c.rangeOffset + c.rangeLength], insert: c.text, source: { kind: "human", member: this.member }, ts: new Date().toISOString() });
+      list.push({ epic: this.ctx.epic!, file: rel, base_hash: sha256(base), range: [c.rangeOffset, c.rangeOffset + c.rangeLength], insert: c.text, source, ts: nowIso() });
       base = base.slice(0, c.rangeOffset) + c.text + base.slice(c.rangeOffset + c.rangeLength);
     }
     this.pending.set(rel, list);
@@ -223,26 +228,33 @@ class HumanEdits implements vscode.Disposable {
     await appendEditRecords(this.dataDir, this.ctx.epic!, merged);
   }
 
+  private isArtifact(rel: string | null): boolean {
+    return !!rel && ARTIFACT_FILES.some((n) => rel === `.flightdeck/epics/${this.ctx.epic}/${n}`);
+  }
+
+  /**
+   * 저장 직전: 지워지거나 바뀐 문단 ID 줄만 되살린다 (§3.2 "저장할 때 검사해 복원").
+   * 저장 자체에 편집을 끼워 넣으므로 디스크 쓰기와 경쟁하지 않고, 같은 저장의 다른 편집은 그대로 남는다.
+   */
+  private willSave(e: vscode.TextDocumentWillSaveEvent) {
+    const d = e.document;
+    if (!this.isArtifact(this.inWorktree(d.uri))) return;
+    const before = this.lastGood.get(d.uri.fsPath);
+    if (before === undefined) return;
+    const fixed = restoreParagraphIds(before, d.getText());
+    if (!fixed.restored.length) return;
+    this.restoring.add(d.uri.fsPath);
+    e.waitUntil(Promise.resolve([vscode.TextEdit.replace(d.validateRange(new vscode.Range(0, 0, d.lineCount, 0)), fixed.text)]));
+    const what = fixed.restored.map((v) => (v.kind === "changed" ? `${v.to}→${v.from}` : v.pid)).join(", ");
+    vscode.window.showWarningMessage(`Flightdeck: 지우거나 바꾼 문단 ID를 복원했습니다 (${what}). <!-- p:… --> 줄은 쓰레드 위치의 기준이라 그대로 두세요. 다른 수정은 저장됐습니다.`);
+  }
+
   private async saved(d: vscode.TextDocument) {
     const rel = this.inWorktree(d.uri);
     if (!rel) return;
     await this.flush();
-    const isArtifact = ARTIFACT_FILES.some((n) => rel === `.flightdeck/epics/${this.ctx.epic}/${n}`);
-    if (!isArtifact) return;
-    const before = this.lastGood.get(d.uri.fsPath);
-    const now = d.getText();
-    if (before !== undefined) {
-      const v = checkParagraphIds(before, now);
-      if (v.length) {
-        const edit = new vscode.WorkspaceEdit();
-        edit.replace(d.uri, new vscode.Range(0, 0, d.lineCount, 0), before);
-        await vscode.workspace.applyEdit(edit);
-        await d.save();
-        vscode.window.showWarningMessage(`Flightdeck: 문단 ID(<!-- p:… -->)를 지우거나 바꿔서 저장을 되돌렸습니다 (${v.map((x) => x.kind).join(", ")}). ID 줄은 그대로 두고 내용만 고치세요.`);
-        return;
-      }
-    }
-    this.lastGood.set(d.uri.fsPath, now);
+    if (!this.isArtifact(rel)) return;
+    this.lastGood.set(d.uri.fsPath, d.getText());
     await this.onArtifactSaved();
   }
 
@@ -418,9 +430,29 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
   if (smoke) {
     const s = ctx?.epic ? await ctx.wf.epicState(ctx.epic) : null;
     const { writeFile } = await import("node:fs/promises");
+    // 문단 ID 보호 점검: analysis.md에서 ID 줄 하나를 지우고 다른 줄도 고친 뒤 저장 → ID만 복원되고 다른 수정은 남는가
+    let pidTest: unknown = null;
+    if (ctx?.epic && ctx.worktree) {
+      const file = path.join(ctx.worktree, ".flightdeck", "epics", ctx.epic, "analysis.md");
+      if (existsSync(file)) {
+        const doc = await vscode.workspace.openTextDocument(file);
+        await vscode.window.showTextDocument(doc);
+        const lines = doc.getText().split(/\r?\n/);
+        const idLine = lines.findIndex((l) => PID_LINE.test(l));
+        const pidLine = lines[idLine]!;
+        const edit = new vscode.WorkspaceEdit();
+        edit.delete(doc.uri, new vscode.Range(idLine, 0, idLine + 1, 0));
+        edit.insert(doc.uri, new vscode.Position(doc.lineCount, 0), "\n스모크 점검 문장\n");
+        await vscode.workspace.applyEdit(edit);
+        await doc.save();
+        await new Promise((r) => setTimeout(r, 1500));
+        const after = doc.getText();
+        pidTest = { pidLine, restored: after.split(/\r?\n/).includes(pidLine), otherEditKept: after.includes("스모크 점검 문장"), dirty: doc.isDirty };
+      }
+    }
     await writeFile(
       smoke,
-      JSON.stringify({ epic: ctx?.epic ?? null, repo: ctx?.repo ?? null, member: ctx?.wf.cfg.member ?? null, phase: s?.phase ?? null, status: status.text, threads: s ? s.threads.size : 0, commentThreads: (view as any)?.threads?.size ?? 0 }, null, 2),
+      JSON.stringify({ epic: ctx?.epic ?? null, repo: ctx?.repo ?? null, member: ctx?.wf.cfg.member ?? null, phase: s?.phase ?? null, status: status.text, threads: s ? s.threads.size : 0, commentThreads: (view as any)?.threads?.size ?? 0, pidTest }, null, 2),
     );
     await vscode.commands.executeCommand("workbench.action.quit");
   }
