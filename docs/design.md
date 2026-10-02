@@ -40,6 +40,7 @@
 >   - 에디터 이벤트로 들어오는 **외부 변경을 구별**하는 규칙, IME 이벤트 묶음, 쓰레드 위치는 `thread.range`가 아니라 편집 기록으로 계산(§3.3, §7.4, §8.6).
 >   - GitHub에서는 ref를 지워도 커밋이 남는다: 체크포인트에서 비밀 파일 제외(§2.1, §8.1). 메타 브랜치 반영 지연을 명시(§3.7).
 >   - Meet 회의록·전사는 한 문서의 두 탭, 전사는 `transcripts.entries` 사용(§10.1).
+>   - (2026-10-02, M0 12 반영) 회의록 대기: 1분 폴링, 보통 수 분, 30분 타임아웃(§10.1). M0 완료 표시(§14).
 >   - (2026-10-02, M0 11 반영) **급한 의견**: PreToolUse 거부로 같은 턴 안에서 전달, 같은 메시지는 1초 시간 간격으로 판정(§8.4). **훅 실패 시 기본 동작**을 경로별로 정함: 차단은 fail-closed, 기록은 fail-open(§6.1). 도구 실행·transcript 기록 시점을 §6.1에 기록.
 
 ---
@@ -1069,7 +1070,9 @@ XP 페어 프로그래밍에서는 드라이버가 작성하고 내비게이터�
   ③ 회의 중: 각자의 확장이 포커스 이벤트 기록 {ts, file, line_range}
 [회의 종료]
   ④ 포커스 파일을 메타 브랜치 sessions/<sid>/에 push
-  ⑤ 주최자 확장이 회의록 생성 대기 (smartNotes.state == FILE_GENERATED)
+  ⑤ 주최자 확장이 회의록 생성 대기 (smartNotes.state == FILE_GENERATED, 1분 간격 폴링)
+     주최자에게 "회의록 준비 중(보통 수 분)" 표시. M0: 29분 회의 종료 후 전사 3분, 회의록 4분 안에 생성
+     30분이 지나도 생성되지 않으면 아래 "회의록 없음" 경로로 간다. 전사는 있으면 쓴다
      conferenceRecords.list → smartNotes.list → docsDestination.document → Docs API로 본문 조회
      (transcript 사용 시 transcripts.entries도 조회. 페이지 처리)
      회의록이 생성되지 않으면(회의록 꺼짐 등) 포커스 이벤트만으로 에픽 단위 기록을 남긴다
@@ -1241,13 +1244,13 @@ flightdeck/
 
 | 단계 | 내용 | 완료 기준 |
 |---|---|---|
-| **M0 스파이크** | ① Comments API를 markdown에 적용 ② 대화형 Claude Code + worktree의 `settings.local.json` 훅(권한 차단·trace·사용자 설정과 병합, `.mcp.json` 최초 승인 흐름) ③ 훅 추가 컨텍스트로 **실행 중** 의견 전달(PostToolUse)과 단계 룰 갱신(UserPromptSubmit)이 되는지 ③-1 headless 초안 세션을 대화형으로 이어가기(resume) ③-2 `transcript_path` 세션 기록 파일 실시간 읽기 ④ Meet 회의록·전사 조회 ⑤ 메타 브랜치 동시 push ⑥ 체크포인트 숨은 커밋 push/fetch ⑦ 에디터·에이전트·셸 편집을 오프셋 편집 기록으로 빠짐없이 잡을 수 있는지(재적용 시 파일 해시 일치)<br>**진행 현황(2026-10-02)**: ①, ②(VS Code 공식 확장·`.mcp.json` 포함), ③(급한 의견 포함), ③-1, ③-2, ④(지난 회의 조회), ⑤·⑥(로컬·GitHub), ⑦(에디터·에이전트·셸) **가능** ([m0-results.md](m0-results.md)). 남은 것: ④의 회의 종료 후 회의록 생성 시간(진행 중), Flightdeck 자체 OAuth 앱 + `meetings.space.created`로 연 회의의 회의록 자동 켜기(M6에서 확인) | 각 항목 가능/불가 판정 |
+| **M0 스파이크** | ① Comments API를 markdown에 적용 ② 대화형 Claude Code + worktree의 `settings.local.json` 훅(권한 차단·trace·사용자 설정과 병합, `.mcp.json` 최초 승인 흐름) ③ 훅 추가 컨텍스트로 **실행 중** 의견 전달(PostToolUse)과 단계 룰 갱신(UserPromptSubmit)이 되는지 ③-1 headless 초안 세션을 대화형으로 이어가기(resume) ③-2 `transcript_path` 세션 기록 파일 실시간 읽기 ④ Meet 회의록·전사 조회 ⑤ 메타 브랜치 동시 push ⑥ 체크포인트 숨은 커밋 push/fetch ⑦ 에디터·에이전트·셸 편집을 오프셋 편집 기록으로 빠짐없이 잡을 수 있는지(재적용 시 파일 해시 일치)<br>**결과(2026-10-02, 완료)**: ①~⑦ 모두 **가능**. "불가" 없음 ([m0-results.md](m0-results.md)). ④는 지난 회의 조회와 실제 회의의 회의록 생성 시간(4분 이내)까지 확인했다. Flightdeck 자체 OAuth 앱 + `meetings.space.created`로 연 회의의 회의록 자동 켜기는 M6에서 확인한다 | 각 항목 가능/불가 판정 |
 | **M1 로컬 단일 사용자** | core reducer·렌더러, **문단 ID + 편집 추적**, GitEngine 기초, **AgentAdapter 인터페이스 + claude-code 어댑터**, ANALYSIS 에이전트, handoff | 혼자 분석 → 설계 초안 |
 | **M2 원격 협업** | 서명 이벤트, 메타 브랜치 EventStore, 알림, ClickUp 일감 수신, **설정 레포 + 서버의 설정 배포**, 멤버 키 등록 | 2인이 원격으로 분석 Q&A |
 | **M3 설계 티어** | 티어 승인(서명), reapproval, 수정 요청 반영 | 설계가 2티어 통과 |
 | **M4 구현·기록** | 구현 에이전트, **체크포인트**, impl-log·trace, Step별 coverage, **세션 원본 저장·검색** | 설명 없는 hunk 차단 확인 |
 | **M5 검증·반영** | 코드 쓰레드, **리뷰 사본 + 수정 제안**, 테스트 결과 보고, **반영 서버 검증·rebase·main push**, main 보호 설정, 감사 | 실제 에픽 1개가 서버를 통해 main까지 |
-| **M6 회의** | Meet 연동, 포커스 이벤트, 회의록 앵커링 | 회의 요약이 올바른 쓰레드에 게시 |
+| **M6 회의** | Meet 연동, 포커스 이벤트, 회의록 앵커링. Flightdeck OAuth 앱으로 만든 회의 공간의 회의록 자동 켜기·`meetings.space.created` 범위 확인(M0에서 넘어옴) | 회의 요약이 올바른 쓰레드에 게시 |
 | **M7 편집 기록** | 서버 ③, 편집 경로 4종 수집, 줄 단위 출처 조회, 앵커·coverage를 편집 기록 기반으로 전환, impl-log `changes` 자동 생성 | 모든 hunk의 출처가 조회되고, 쓰레드가 대규모 수정 후에도 위치 유지 |
 | **M8 조종수 모델** | 서버 ④, 대화·편집 실시간 스트림, 관찰자 읽기 전용 창, 의견 보내기·처리, 조종 요청·넘기기·강제 인수 | 관찰자가 1초 안에 조종수 작업을 보고, 의견이 에이전트까지 전달됨 |
 | **M9 에이전트 확장** | codex 어댑터 → gemini-cli 어댑터 → jcode 등 (훅 세부 확인 후 등급 결정), 지원 등급 표시, 에이전트 혼용 조종 넘기기 | Claude Code → Codex로 조종을 넘겨 같은 에픽을 main까지 반영 |
