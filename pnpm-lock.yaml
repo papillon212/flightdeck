@@ -27,6 +27,15 @@ importers:
         specifier: ^9.0.0
         version: 9.0.0
 
+  packages/git:
+    dependencies:
+      '@flightdeck/core':
+        specifier: workspace:*
+        version: link:../core
+      '@flightdeck/schema':
+        specifier: workspace:*
+        version: link:../schema
+
   packages/schema:
     dependencies:
       yaml:

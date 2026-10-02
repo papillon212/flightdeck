@@ -1,0 +1,206 @@
+// GitEngine (설계 §1.2, §2, §8.1). 사용자는 git을 보지 않는다. 확장만 이 모듈로 git을 다룬다.
+import { mkdtemp, mkdir, readFile, rm, writeFile, copyFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { git, RAW_ARGS, RAW_ENV } from "./exec.ts";
+
+const ZERO = "0000000000000000000000000000000000000000";
+
+/** worktree에서 git 추적을 빼는 경로 (설계 §6.1 설정 배치, §2.2 .runtime) */
+export const EXCLUDE_ENTRIES = [".claude/settings.local.json", ".mcp.json", ".flightdeck/.runtime/"];
+
+export interface CheckpointInfo {
+  sha: string;
+  parent: string;
+  message: string;
+  trailers: Record<string, string>;
+}
+
+/** 체크포인트에 넣지 않는 비밀 파일 기본 패턴 (설계 §5 checkpoint.exclude_secrets) */
+export const DEFAULT_EXCLUDE_SECRETS = [".env", ".env.*", "*.pem", "*.key"];
+
+export class GitEngine {
+  /** 체크포인트·복원이 항상 같은 패턴을 쓰도록 엔진에 한 번만 정한다 */
+  readonly excludeSecrets: string[];
+
+  /**
+   * @param repo 제품 레포의 main worktree 경로
+   * @param opts.excludeSecrets pipeline.yaml checkpoint.exclude_secrets
+   */
+  constructor(
+    readonly repo: string,
+    opts: { excludeSecrets?: string[] } = {},
+  ) {
+    this.excludeSecrets = opts.excludeSecrets ?? DEFAULT_EXCLUDE_SECRETS;
+  }
+
+  private g(args: string[], cwd = this.repo, extra: { env?: Record<string, string>; input?: string } = {}) {
+    return git(args, { cwd, ...extra });
+  }
+
+  async commonDir(): Promise<string> {
+    return path.resolve(this.repo, (await this.g(["rev-parse", "--git-common-dir"])).trim());
+  }
+
+  /** Flightdeck 로컬 데이터(편집 기록·상태). 모든 worktree가 공유한다 */
+  async dataDir(): Promise<string> {
+    const d = path.join(await this.commonDir(), "flightdeck");
+    await mkdir(d, { recursive: true });
+    return d;
+  }
+
+  /** ../<repo>.flightdeck/<name> (설계 §2.4) */
+  worktreePath(name: string): string {
+    return path.join(path.dirname(this.repo), `${path.basename(this.repo)}.flightdeck`, name);
+  }
+
+  static epicBranch(epic: string): string {
+    return `flightdeck/${epic}`;
+  }
+
+  async revParse(rev: string, cwd = this.repo): Promise<string> {
+    return (await this.g(["rev-parse", "--verify", rev], cwd)).trim();
+  }
+
+  async tryRevParse(rev: string, cwd = this.repo): Promise<string | null> {
+    try {
+      return (await this.g(["rev-parse", "-q", "--verify", rev], cwd)).trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 에픽 브랜치와 작업 폴더를 만든다. 이미 있으면 그대로 돌려준다 */
+  async createEpicWorktree(epic: string, base = "HEAD"): Promise<{ path: string; branch: string; baseSha: string }> {
+    const wt = this.worktreePath(epic);
+    const branch = GitEngine.epicBranch(epic);
+    const baseSha = await this.revParse(base);
+    await this.ensureExcludes();
+    if (existsSync(wt)) return { path: wt, branch, baseSha: (await this.g(["merge-base", branch, baseSha])).trim() };
+    await mkdir(path.dirname(wt), { recursive: true });
+    const exists = await this.tryRevParse(`refs/heads/${branch}`);
+    if (exists) await this.g(["worktree", "add", "-q", wt, branch]);
+    else await this.g(["worktree", "add", "-q", "-b", branch, wt, baseSha]);
+    return { path: wt, branch, baseSha };
+  }
+
+  async removeWorktree(name: string, force = false): Promise<void> {
+    await this.g(["worktree", "remove", ...(force ? ["--force"] : []), this.worktreePath(name)]);
+  }
+
+  /** 모든 worktree가 공유하는 info/exclude에 Flightdeck 설정 파일을 추가한다 */
+  async ensureExcludes(): Promise<void> {
+    const file = path.join(await this.commonDir(), "info", "exclude");
+    await mkdir(path.dirname(file), { recursive: true });
+    const cur = existsSync(file) ? await readFile(file, "utf8") : "";
+    const have = new Set(cur.split(/\r?\n/));
+    const missing = EXCLUDE_ENTRIES.filter((e) => !have.has(e));
+    if (!missing.length) return;
+    await writeFile(file, cur + (cur && !cur.endsWith("\n") ? "\n" : "") + "# flightdeck\n" + missing.join("\n") + "\n");
+  }
+
+  /** 에픽 브랜치에 지정한 파일만 커밋한다 (단계 전환·제출 시, §1.2). 바뀐 것이 없으면 null */
+  async commit(wt: string, paths: string[], message: string, trailers: Record<string, string> = {}): Promise<string | null> {
+    await this.g(["add", "--", ...paths], wt);
+    const staged = (await this.g(["diff", "--cached", "--name-only", "--", ...paths], wt)).trim();
+    if (!staged) return null;
+    const msg = withTrailers(message, trailers);
+    await this.g(["commit", "-q", "-F", "-", "--", ...paths], wt, { input: msg });
+    return this.revParse("HEAD", wt);
+  }
+
+  static checkpointRef(epic: string, member: string): string {
+    return `refs/flightdeck/ckpt/${epic}/${member}`;
+  }
+
+  /**
+   * 체크포인트 (설계 §8.1): 브랜치·index·작업 트리를 건드리지 않는 숨은 커밋.
+   * - 사용자 index를 복사한 임시 index에 작업 트리 전체를 디스크 바이트 그대로 담는다.
+   * - 비밀 파일 패턴(this.excludeSecrets)의 파일은 넣지 않는다.
+   * - update-ref는 이전 값을 지정한다(CAS). 다른 쪽이 먼저 바꿨으면 GitError.
+   */
+  async checkpoint(wt: string, opts: { epic: string; member: string; message: string; trailers?: Record<string, string> }): Promise<string> {
+    const ref = GitEngine.checkpointRef(opts.epic, opts.member);
+    const tree = await this.snapshotTree(wt);
+    const old = await this.tryRevParse(ref, wt);
+    const parent = old ?? (await this.revParse("HEAD", wt));
+    const msg = withTrailers(opts.message, opts.trailers ?? {});
+    const sha = (await this.g(["commit-tree", tree, "-p", parent], wt, { input: msg })).trim();
+    await this.g(["update-ref", "-m", "flightdeck checkpoint", ref, sha, old ?? ZERO], wt);
+    return sha;
+  }
+
+  /** 작업 트리 전체를 tree 객체로 (디스크 바이트 그대로, 비밀 파일 제외) */
+  async snapshotTree(wt: string): Promise<string> {
+    const excludeSecrets = this.excludeSecrets;
+    const dir = await mkdtemp(path.join(tmpdir(), "fd-idx-"));
+    const idx = path.join(dir, "index");
+    try {
+      const userIndex = path.resolve(wt, (await this.g(["rev-parse", "--git-path", "index"], wt)).trim());
+      if (existsSync(userIndex)) await copyFile(userIndex, idx);
+      const env = { GIT_INDEX_FILE: idx, ...RAW_ENV };
+      await this.g([...RAW_ARGS, "add", "-A", "."], wt, { env });
+      if (excludeSecrets.length) {
+        const files = (await this.g(["ls-files", "-z", "--cached"], wt, { env })).split("\0").filter(Boolean);
+        const secret = files.filter((f) => isSecret(f, excludeSecrets));
+        if (secret.length) await this.g(["rm", "-q", "--cached", "--", ...secret], wt, { env });
+      }
+      return (await this.g(["write-tree"], wt, { env })).trim();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * 이 시점으로 복원 (설계 §8.1). 복원 직전 상태를 먼저 체크포인트로 남긴다.
+   * 임시 index로 두 트리 병합(read-tree -m -u)을 해서 작업 트리만 바꾼다. 사용자 index·HEAD는 그대로다.
+   * 비밀 파일은 현재 트리·대상 트리 모두에서 빠져 있으므로 병합 대상이 아니다. 그래서 복원해도 지워지지 않는다.
+   */
+  async restoreCheckpoint(wt: string, target: string, opts: { epic: string; member: string }): Promise<{ before: string }> {
+    const before = await this.checkpoint(wt, { ...opts, message: `복원 직전 (→ ${target.slice(0, 7)})`, trailers: { "Flightdeck-Source": "restore" } });
+    const curTree = (await this.g(["rev-parse", `${before}^{tree}`], wt)).trim();
+    const dir = await mkdtemp(path.join(tmpdir(), "fd-idx-"));
+    const env = { GIT_INDEX_FILE: path.join(dir, "index"), ...RAW_ENV };
+    try {
+      await this.g([...RAW_ARGS, "read-tree", curTree], wt, { env });
+      await this.g([...RAW_ARGS, "update-index", "-q", "--refresh"], wt, { env }).catch(() => "");
+      await this.g([...RAW_ARGS, "read-tree", "-m", "-u", curTree, target], wt, { env });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+    return { before };
+  }
+
+  /** 체크포인트 체인 (최신부터) */
+  async listCheckpoints(epic: string, member: string, limit = 100): Promise<CheckpointInfo[]> {
+    const ref = GitEngine.checkpointRef(epic, member);
+    if (!(await this.tryRevParse(ref))) return [];
+    const out = await this.g(["log", `-${limit}`, "--format=%H%x00%P%x00%B%x01", ref, "--not", "--branches", "--tags"]);
+    return out
+      .split("\x01")
+      .map((s) => s.replace(/^\n/, ""))
+      .filter(Boolean)
+      .map((rec) => {
+        const [sha, parent, message] = rec.split("\0") as [string, string, string];
+        return { sha, parent: parent.split(" ")[0] ?? "", message: message.trim(), trailers: parseTrailers(message) };
+      });
+  }
+}
+
+function withTrailers(message: string, trailers: Record<string, string>): string {
+  const t = Object.entries(trailers).map(([k, v]) => `${k}: ${v}`);
+  return t.length ? `${message.trim()}\n\n${t.join("\n")}\n` : `${message.trim()}\n`;
+}
+
+function parseTrailers(message: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const m of message.matchAll(/^([A-Za-z][A-Za-z0-9-]*): (.+)$/gm)) out[m[1]!] = m[2]!;
+  return out;
+}
+
+/** 비밀 파일 패턴 비교. 슬래시가 없는 패턴은 파일 이름에만 맞춘다 (.gitignore와 같은 감각) */
+export function isSecret(file: string, patterns: string[]): boolean {
+  const base = path.posix.basename(file);
+  return patterns.some((p) => (p.includes("/") ? path.matchesGlob(file, p) : path.matchesGlob(base, p)));
+}
