@@ -131,6 +131,15 @@ export class GitEngine {
     return sha;
   }
 
+  /** 마지막 체크포인트(없으면 HEAD)와 작업 트리가 같으면 만들지 않고 null을 돌려준다 */
+  async checkpointIfChanged(wt: string, opts: { epic: string; member: string; message: string; trailers?: Record<string, string> }): Promise<string | null> {
+    const ref = GitEngine.checkpointRef(opts.epic, opts.member);
+    const last = (await this.tryRevParse(ref, wt)) ?? (await this.revParse("HEAD", wt));
+    const lastTree = (await this.g(["rev-parse", `${last}^{tree}`], wt)).trim();
+    if ((await this.snapshotTree(wt)) === lastTree) return null;
+    return this.checkpoint(wt, opts);
+  }
+
   /** 작업 트리 전체를 tree 객체로 (디스크 바이트 그대로, 비밀 파일 제외) */
   async snapshotTree(wt: string): Promise<string> {
     const excludeSecrets = this.excludeSecrets;

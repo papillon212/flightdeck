@@ -1,0 +1,95 @@
+# 설정 레포 템플릿 (설계 §2.5, §5). design.md §5 예시에서 만든 견본
+version: 1
+product: sample
+repo: git@github.com:example/sample.git
+
+agent:
+  allowed: [claude-code, codex, gemini-cli]   # 이 제품에서 허용하는 에이전트
+  min_support: partial                        # full | partial | minimal. 이보다 낮은 등급은 공식 실행 불가
+  defaults:                                   # 권장 기본 모델 (조종수가 바꿀 수 있음)
+    claude-code: claude-opus-5-5
+  max_turns: 200
+
+members:                           # 공개키는 flightdeck-config/members/
+  groups:
+    leads: [kim]
+    architects: [park, lee]
+    qa: [choi]
+  tracker_ids:
+    dh.lee: 1111111
+    kim: 1234567
+    park: 2345678
+
+tracker:
+  provider: clickup
+  clickup:
+    list_ids: ["901234567"]
+    tag: flightdeck
+    status_map:
+      ANALYSIS: "분석"
+      DESIGN: "설계"
+      IMPLEMENTATION: "구현"
+      VERIFICATION: "검증"
+      DONE: "완료"
+
+phases:
+  analysis:
+    rules: rules/analysis.md
+    gate: { threads_resolved: true, owner_approval: true }
+
+  design:
+    rules: rules/design.md
+    review:
+      reapproval: on_change
+      tiers:
+        - { name: lead,      reviewers: { group: leads },      min_approvals: 1 }
+        - { name: architect, reviewers: { group: architects }, min_approvals: 1 }
+    skip:
+      - when: { tracker_tags: [bugfix], size: [XS, S] }
+        tiers: [architect]
+
+  implementation:
+    rules: rules/implementation.md
+    gate:
+      impl_log_schema: true
+      coverage: 1.0
+      coverage_ignore: ["pnpm-lock.yaml", "**/*.generated.ts"]
+      commands: [pnpm lint, pnpm test]
+
+  verification:
+    rules: rules/verification.md
+    review:
+      reapproval: on_change
+      tiers:
+        - { name: lead, reviewers: { group: leads }, min_approvals: 1 }
+        - { name: qa,   reviewers: { group: qa },    min_approvals: 1 }
+
+checkpoint:
+  agent: per_step_or_idle          # impl-log Step마다 + 편집 후 30초 유휴 시
+  human_on_save: true              # 사람 편집도 저장 시 체크포인트
+  idle_seconds: 30
+  exclude_secrets: [".env", ".env.*", "*.pem", "*.key"]   # 체크포인트에 넣지 않음 (§8.1)
+
+session:
+  provider: google_meet
+  gemini_notes: required
+  transcript: optional
+  notify_mentions_via_tracker: true
+
+landing:
+  target: main
+  strategy: squash                 # squash | merge
+  on_main_moved: recheck           # recheck: 서버 재검증 + 실행자 재보고 통과 시 재승인 불필요
+  test_verification: reported      # reported(A안: 서명된 보고 신뢰) | server_run(B안, 이후)
+  records:
+    keep: [epic.md, analysis.md, design.md, impl-log.md, runs/, threads/, sessions/]
+    drop: [trace.jsonl, state.json]
+
+pilot:
+  takeover_after_minutes: 10       # 조종수 연결 끊김 후 강제 인수 가능 시간
+  takeover_by: [owner]             # owner | 그룹명
+
+retention:
+  ckpt_days: 14
+  runs_days: 30
+  editlog_days: 90                 # 이후 줄 단위 출처 요약만 보관
