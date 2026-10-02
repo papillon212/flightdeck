@@ -19,6 +19,8 @@ export const LocalEpicState = z.object({
   configDir: z.string().min(1),
   /** pipeline.yaml checkpoint.exclude_secrets */
   excludeSecrets: z.array(z.string()).default([".env", ".env.*", "*.pem", "*.key"]),
+  /** 마지막 자동 초안(headless)의 세션 ID. "이어서 작업"이 이 세션을 resume한다 (§6.1) */
+  draft_session: z.string().optional(),
   /** 에이전트 세션 → 실행. 훅이 SessionStart에서 채운다 */
   runs: z
     .record(

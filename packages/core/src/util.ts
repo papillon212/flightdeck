@@ -6,6 +6,16 @@ export function sha256(text: string | null): string | null {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
+/** 이 PC의 시간대를 붙인 ISO 8601 시각 (예: 2026-10-02T16:14:00.123+09:00). 이벤트 at에 쓴다 (설계 §3.1 예시) */
+export function nowIso(d: Date = new Date()): string {
+  const off = -d.getTimezoneOffset();
+  const local = new Date(d.getTime() + off * 60_000).toISOString().slice(0, -1);
+  const sign = off >= 0 ? "+" : "-";
+  const hh = String(Math.floor(Math.abs(off) / 60)).padStart(2, "0");
+  const mm = String(Math.abs(off) % 60).padStart(2, "0");
+  return `${local}${sign}${hh}:${mm}`;
+}
+
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 let lastTime = -1;
 let lastRandom: number[] = [];

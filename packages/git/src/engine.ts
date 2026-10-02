@@ -1,5 +1,5 @@
 // GitEngine (설계 §1.2, §2, §8.1). 사용자는 git을 보지 않는다. 확장만 이 모듈로 git을 다룬다.
-import { mkdtemp, mkdir, readFile, rm, writeFile, copyFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile, copyFile, stat, utimes } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -147,7 +147,13 @@ export class GitEngine {
     const idx = path.join(dir, "index");
     try {
       const userIndex = path.resolve(wt, (await this.g(["rev-parse", "--git-path", "index"], wt)).trim());
-      if (existsSync(userIndex)) await copyFile(userIndex, idx);
+      if (existsSync(userIndex)) {
+        await copyFile(userIndex, idx);
+        // index 파일의 수정 시각을 원본과 같게 둔다. 복사로 시각이 새로 찍히면 git의 racy 검사가 꺼져서,
+        // 같은 1초 안에 같은 크기로 바뀐 파일을 "안 바뀜"으로 보고 예전 내용을 담는다 (설계 제안 T6)
+        const st = await stat(userIndex);
+        await utimes(idx, st.atime, st.mtime);
+      }
       const env = { GIT_INDEX_FILE: idx, ...RAW_ENV };
       await this.g([...RAW_ARGS, "add", "-A", "."], wt, { env });
       if (excludeSecrets.length) {

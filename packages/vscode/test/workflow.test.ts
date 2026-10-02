@@ -77,6 +77,25 @@ describe("EpicWorkflow (설계 §9.1, §4)", () => {
     expect(all.at(-1)!.source).toMatchObject({ kind: "flightdeck", reason: "thread_render" });
   });
 
+  it("권한 없는 동작은 이벤트를 쓰기 전에 막고 이유를 알린다 (메타 브랜치는 append-only)", async () => {
+    const other = new EpicWorkflow({ ...wf.cfg, member: "choi" });
+    const before = (await wf.store.list(EPIC)).length;
+    const [t] = [...(await wf.epicState(EPIC)).threads.keys()];
+    await expect(other.setThreadStatus(EPIC, t!, true)).rejects.toThrow(/thread.resolved 거부: resolve\/reopen 권한 없음 \(나: choi\)/);
+    await new Promise((r) => setTimeout(r, 1100)); // 쓰레드 ID 충돌(T1)을 피해 권한 검사만 본다
+    await expect(other.createThread(EPIC, { file: "analysis.md", pid: "p:0000", kind: "note", to: [], body: "x" })).rejects.toThrow(/쓰레드 생성 권한 없음/);
+    expect((await wf.store.list(EPIC)).length).toBe(before);
+  });
+
+  it("설계 제안 T1 증거: 1초 안에 쓰레드 두 개를 만들면 ID가 겹친다 (쓰기 전에 막힘)", async () => {
+    const before = (await wf.store.list(EPIC)).length;
+    const pid = parseBlocks((await readFile(analysisPath(), "utf8")).split("\n")).find((b) => b.pid)!.pid!;
+    const a = await wf.createThread(EPIC, { file: "analysis.md", pid, kind: "note", to: [], body: "첫째" });
+    await expect(wf.createThread(EPIC, { file: "analysis.md", pid, kind: "note", to: [], body: "둘째" })).rejects.toThrow(/이미 있는 쓰레드 ID/);
+    expect((await wf.store.list(EPIC)).length).toBe(before + 1);
+    await wf.setThreadStatus(EPIC, a, true); // 다음 테스트(관문)에 영향이 없도록
+  });
+
   it("관문: 열린 쓰레드·빈 섹션이 있으면 완료 불가 (§4.1)", async () => {
     const r = await wf.completePhase(EPIC);
     expect(r.ok).toBe(false);

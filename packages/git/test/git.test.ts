@@ -106,6 +106,26 @@ describe("GitEngine: 체크포인트 (설계 §8.1)", () => {
     expect(await sh(["cat-file", "blob", `${c1}:crlf.txt`], wt)).toBe("one\r\ntwo\r\n"); // autocrlf=input인데도 CRLF 유지
   });
 
+  it("같은 1초 안에 같은 크기로 바뀐 파일도 놓치지 않는다 (racy git, 설계 제안 T6)", async () => {
+    const eng = new GitEngine(repo);
+    const wt = eng.worktreePath("CU-1");
+    const f = path.join(wt, "racy.txt");
+    // 재현 조건: 사용자 index에 a를 기록한 같은 초에 같은 크기 b로 바꾸고, 다음 초 이후에 스냅샷을 뜬다.
+    // 수정 전(index 복사로 시각이 새로 찍힘)에는 셸 재현에서 6/6회 예전 내용 a가 담겼다.
+    for (let i = 0; i < 2; i++) {
+      const a = `aaaa${i}\n`;
+      const b = `bbbb${i}\n`;
+      await writeFile(f, a);
+      await sh(["add", "racy.txt"], wt);
+      await writeFile(f, b);
+      await new Promise((r) => setTimeout(r, 1100));
+      const tree = await eng.snapshotTree(wt);
+      expect(await sh(["cat-file", "blob", `${tree}:racy.txt`], wt)).toBe(b);
+    }
+    await sh(["rm", "-q", "-f", "--cached", "racy.txt"], wt);
+    await rm(f);
+  });
+
   it("체인으로 이어지고, CAS가 오래된 값을 거부한다", async () => {
     const eng = new GitEngine(repo);
     const wt = eng.worktreePath("CU-1");

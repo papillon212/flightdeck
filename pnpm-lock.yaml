@@ -101,6 +101,10 @@ importers:
       '@flightdeck/schema':
         specifier: workspace:*
         version: link:../schema
+    devDependencies:
+      '@types/vscode':
+        specifier: 1.90.0
+        version: 1.90.0
 
 packages:
 
@@ -383,6 +387,9 @@ packages:
 
   '@types/node@26.6.3':
     resolution: {integrity: sha512-dsqMQQoeTLqu9wynDD00q573mNzso3IdQOAfHRJqLCcmCFPoGo9A1bDpUcv/9tnKpErQWv9uKeGfl37EIS02Yg==}
+
+  '@types/vscode@1.90.0':
+    resolution: {integrity: sha512-oT+ZJL7qHS9Z8bs0+WKf/kQ27qWYR3trsXpq46YDjFqBsMLG4ygGGjPaJ2tyrH0wJzjOEmDyg9PDJBBhWg9pkQ==}
 
   '@typescript/typescript-aix-ppc64@7.0.2':
     resolution: {integrity: sha512-MTKKkWB7p/0E9xi1d1tHtZ5PiLkGEMIq88pK2CubZjOsLtYTLqhgIgi6zepFa+9GHZ6h05NMCkQxGKiPXMxXtQ==}
@@ -939,6 +946,8 @@ snapshots:
   '@types/node@26.6.3':
     dependencies:
       undici-types: 8.9.0
+
+  '@types/vscode@1.90.0': {}
 
   '@typescript/typescript-aix-ppc64@7.0.2':
     optional: true

@@ -1,0 +1,51 @@
+{
+  "name": "flightdeck",
+  "displayName": "Flightdeck",
+  "description": "코딩 에이전트 시대의 원격 페어 프로그래밍 워크플로우 (M1: 로컬 단일 사용자)",
+  "publisher": "flightdeck",
+  "version": "0.1.0",
+  "private": true,
+  "engines": { "vscode": "^1.90.0" },
+  "main": "./dist/extension.cjs",
+  "activationEvents": ["onStartupFinished"],
+  "capabilities": {
+    "untrustedWorkspaces": { "supported": false, "description": "Flightdeck은 에이전트 훅과 git을 다루므로 신뢰한 폴더에서만 동작합니다 (설계 §6.1)." }
+  },
+  "contributes": {
+    "commands": [
+      { "command": "flightdeck.newEpic", "title": "새 에픽", "category": "Flightdeck" },
+      { "command": "flightdeck.draft", "title": "에이전트 초안 작성", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
+      { "command": "flightdeck.resume", "title": "이어서 작업 (Claude Code)", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
+      { "command": "flightdeck.completePhase", "title": "단계 완료", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
+      { "command": "flightdeck.menu", "title": "메뉴", "category": "Flightdeck" },
+      { "command": "flightdeck.refresh", "title": "새로 고침", "category": "Flightdeck" },
+      { "command": "flightdeck.reply", "title": "올리기", "enablement": "!commentIsEmpty" },
+      { "command": "flightdeck.resolve", "title": "해결", "icon": "$(check)" },
+      { "command": "flightdeck.reopen", "title": "다시 열기", "icon": "$(issue-reopened)" }
+    ],
+    "menus": {
+      "comments/commentThread/context": [
+        { "command": "flightdeck.reply", "group": "inline", "when": "commentController == flightdeck" }
+      ],
+      "comments/commentThread/title": [
+        { "command": "flightdeck.resolve", "group": "navigation", "when": "commentController == flightdeck && commentThread == fd-open" },
+        { "command": "flightdeck.reopen", "group": "navigation", "when": "commentController == flightdeck && commentThread == fd-resolved" }
+      ],
+      "commandPalette": [
+        { "command": "flightdeck.reply", "when": "false" },
+        { "command": "flightdeck.resolve", "when": "false" },
+        { "command": "flightdeck.reopen", "when": "false" }
+      ]
+    },
+    "configuration": {
+      "title": "Flightdeck",
+      "properties": {
+        "flightdeck.member": { "type": "string", "default": "", "description": "멤버 ID (예: dh.lee). 비우면 git user.email의 @ 앞부분" },
+        "flightdeck.configDir": { "type": "string", "default": "", "description": "설정 레포의 제품 폴더 (rules/, pipeline.yaml). 비우면 내장 견본. M2부터는 서버가 배포한다" },
+        "flightdeck.model": { "type": "string", "default": "", "description": "에이전트 권장 모델 (비우면 Claude Code 기본값)" },
+        "flightdeck.maxTurns": { "type": "number", "default": 40, "description": "자동 초안의 최대 턴 수" },
+        "flightdeck.claudePath": { "type": "string", "default": "claude", "description": "Claude Code 실행 파일" }
+      }
+    }
+  }
+}

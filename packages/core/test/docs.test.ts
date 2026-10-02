@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Thread } from "../src/index.ts";
-import { checkParagraphIds, checkSections, ensureParagraphIds, listThreadBlocks, parseBlocks, renderThreads, stripThreads, threadIdFrom, ulid } from "../src/index.ts";
+import { checkParagraphIds, checkSections, ensureParagraphIds, listThreadBlocks, nowIso, parseBlocks, renderThreads, stripThreads, threadIdFrom, ulid } from "../src/index.ts";
 
 const doc = ["# 분석", "", "## 요구사항 요약", "토큰은 Redis에 저장하고", "만료 시 갱신한다.", "", "```ts", "## 코드 안 제목은 블록이 아님", "```", "", "- 목록 1", "  - 하위 항목", "- 목록 2", "1. 번호 목록", ""].join("\n");
 
@@ -101,6 +101,15 @@ describe("산출물 섹션 검사 (설계 §6.3)", () => {
     const md = "## 영향 범위\n내용\n## 요구사항 요약\n<!-- p:1234 -->\n## 가정\n";
     const r = checkSections(md, required);
     expect(r).toMatchObject({ ok: false, missing: ["불명확한 점"], outOfOrder: true, empty: ["요구사항 요약", "가정"] });
+  });
+});
+
+describe("nowIso", () => {
+  it("시간대를 붙이고, 같은 순간을 가리킨다", () => {
+    const d = new Date("2026-10-02T07:14:00.000Z");
+    const s = nowIso(d);
+    expect(s).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d\d:\d\d$/);
+    expect(Date.parse(s)).toBe(d.getTime());
   });
 });
 

@@ -27,9 +27,14 @@ const wf = new EpicWorkflow({
   maxTurns: 30,
 });
 
-if (cmd === "setup") {
+if (cmd === "setup" || cmd === "repo") {
   await mkdir(path.join(repo, "src/auth"), { recursive: true });
-  for (const a of [["init", "-q", "-b", "main"], ["config", "user.name", "demo"], ["config", "user.email", "demo@example.com"]]) await git(a, { cwd: repo });
+  await git(["init", "-q", "-b", "main"], { cwd: repo });
+  // 사용자의 전역 git 신원을 쓴다 (확장이 멤버 ID를 user.email에서 얻는다). 전역 설정이 없을 때만 임시 신원
+  if (!(await git(["config", "user.email"], { cwd: repo }).catch(() => "")).trim()) {
+    await git(["config", "user.name", "dh.lee"], { cwd: repo });
+    await git(["config", "user.email", "dh.lee@example.com"], { cwd: repo });
+  }
   await writeFile(
     path.join(repo, "src/auth/token.ts"),
     [
@@ -51,8 +56,14 @@ if (cmd === "setup") {
     ].join("\n"),
   );
   await writeFile(path.join(repo, "README.md"), "# demo product\n인증 모듈: src/auth/token.ts\n");
+  // 데모에서는 가벼운 모델로 (에픽 작업 폴더에도 그대로 들어간다)
+  await mkdir(path.join(repo, ".vscode"), { recursive: true });
+  await writeFile(path.join(repo, ".vscode/settings.json"), JSON.stringify({ "flightdeck.model": "haiku" }, null, 2) + "\n");
   await git(["add", "."], { cwd: repo });
   await git(["commit", "-q", "-m", "init"], { cwd: repo });
+}
+
+if (cmd === "setup") {
   const r = await wf.start(EPIC, "리프레시 토큰 회전", "리프레시 토큰을 재사용하지 말고, 갱신할 때마다 새 리프레시 토큰을 발급하고 이전 것은 폐기한다. 탈취된 리프레시 토큰의 재사용을 탐지하면 해당 사용자의 모든 세션을 끊는다.");
   console.log(JSON.stringify({ worktree: r.worktree, phase: r.state.phase }, null, 2));
 }
@@ -61,6 +72,18 @@ if (cmd === "draft") {
   const t0 = Date.now();
   const r = await wf.draft(EPIC);
   console.log(JSON.stringify({ sessionId: r.sessionId, seconds: Math.round((Date.now() - t0) / 1000), result: r.result.slice(0, 600) }, null, 2));
+}
+
+if (cmd === "thread") {
+  // "불명확한 점" 섹션의 첫 목록 항목에 질문 쓰레드를 단다
+  const { parseBlocks } = await import("@flightdeck/core");
+  const file = path.join(await wf.worktree(EPIC), ".flightdeck/epics", EPIC, "analysis.md");
+  const blocks = parseBlocks((await readFile(file, "utf8")).split("\n"));
+  const sec = blocks.findIndex((b) => b.text.startsWith("## 불명확한 점"));
+  const item = blocks.slice(sec + 1).find((b) => b.text.startsWith("- "));
+  if (!item?.pid) throw new Error("불명확한 점 항목을 찾지 못함");
+  const id = await wf.createThread(EPIC, { file: "analysis.md", pid: item.pid, kind: "question", to: ["park"], body: process.argv[4] ?? "리프레시 토큰은 메모리 Map에 두나요, DB에 두나요?" });
+  console.log(JSON.stringify({ thread: id, pid: item.pid }));
 }
 
 if (cmd === "check") {

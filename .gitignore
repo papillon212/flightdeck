@@ -2,3 +2,5 @@ node_modules/
 dist/
 *.vsix
 .flightdeck/.runtime/
+packages/vscode/ext/dist/
+packages/vscode/ext/config/

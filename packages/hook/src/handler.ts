@@ -8,7 +8,7 @@
 import { existsSync, realpathSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { checkParagraphIds, reduce, sha256, ulid } from "@flightdeck/core";
+import { checkParagraphIds, nowIso, reduce, sha256, ulid } from "@flightdeck/core";
 import type { EditRecord, EditSource, Event, LocalEpicState } from "@flightdeck/schema";
 import type { AgentAdapter, HookEvent, HookResponse } from "@flightdeck/agent";
 import { git, GitEngine, isSecret, LocalEventStore, RAW_ARGS, RAW_ENV } from "@flightdeck/git";
@@ -42,7 +42,7 @@ export async function handle(ev: HookEvent, d: HandlerDeps): Promise<HookRespons
   }
 }
 
-const iso = (d: HandlerDeps) => (d.now?.() ?? new Date()).toISOString();
+const iso = (d: HandlerDeps) => nowIso(d.now?.() ?? new Date());
 
 async function loadEpicState(d: HandlerDeps) {
   return reduce(d.state.epic, await new LocalEventStore(d.state.repo).list(d.state.epic));

@@ -3,7 +3,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { applyTextEdit, checkSections, diffToEdits, ensureParagraphIds, reduce, renderThreads, sha256, stripThreads, threadIdFrom, ulid, type EpicState } from "@flightdeck/core";
+import { applyTextEdit, checkSections, diffToEdits, ensureParagraphIds, nowIso, reduce, renderThreads, sha256, stripThreads, threadIdFrom, ulid, type EpicState } from "@flightdeck/core";
 import { GitEngine, LocalEventStore } from "@flightdeck/git";
 import { HANDOFF_SECTIONS, PHASE_ARTIFACT, type Anchor, type Event, type EventOf, type EventType, type LocalEpicState, type Phase } from "@flightdeck/schema";
 import type { AgentAdapter } from "@flightdeck/agent";
@@ -45,8 +45,12 @@ export class EpicWorkflow {
     return `node ${q(path.join(this.cfg.distDir, "flightdeck-hook.mjs"))} ${this.cfg.adapter.id} --repo ${q(this.cfg.repo)} --epic ${q(epic)}`;
   }
 
-  private async emit<T extends EventType>(epic: string, type: T, data: EventOf<T>["data"], author = this.cfg.member): Promise<EventOf<T>> {
-    const e = { v: 1, id: ulid(), type, epic, author, at: new Date().toISOString(), data } as EventOf<T>;
+  private async emit<T extends EventType>(epic: string, type: T, data: EventOf<T>["data"], author = this.cfg.member, id = ulid()): Promise<EventOf<T>> {
+    const e = { v: 1, id, type, epic, author, at: nowIso(), data } as EventOf<T>;
+    // 메타 브랜치는 append-only라 한번 쓰면 지울 수 없다. reducer가 무시할 이벤트(권한·관문)는 쓰기 전에 막고 이유를 알린다
+    const events = await this.store.list(epic);
+    const ignored = reduce(epic, [...events, e as Event]).ignored.find((i) => i.event === e.id);
+    if (ignored) throw new Error(`${type} 거부: ${ignored.reason}${ignored.reason.includes("권한") ? ` (나: ${author})` : ""}`);
     await this.store.append(e as Event);
     return e;
   }
@@ -146,7 +150,7 @@ export class EpicWorkflow {
     const id = ulid();
     const thread = threadIdFrom(id);
     const anchor: Anchor = { type: "paragraph", pid: t.pid };
-    await this.store.append({ v: 1, id, type: "thread.created", epic, author: this.cfg.member, at: new Date().toISOString(), data: { thread, phase: s.phase, file: t.file, anchor, kind: t.kind, to: t.to, body: t.body } });
+    await this.emit(epic, "thread.created", { thread, phase: s.phase, file: t.file, anchor, kind: t.kind, to: t.to, body: t.body }, this.cfg.member, id);
     await this.sync(epic);
     return thread;
   }
@@ -167,6 +171,7 @@ export class EpicWorkflow {
   async checkPhase(epic: string): Promise<{ phase: Phase; problems: string[] }> {
     const s = await this.epicState(epic);
     const problems: string[] = [];
+    if (s.owner !== this.cfg.member) problems.push(`담당자(@${s.owner})만 단계를 완료할 수 있습니다 (나: @${this.cfg.member})`);
     const a = PHASE_ARTIFACT[s.phase as keyof typeof PHASE_ARTIFACT];
     if (!a) return { phase: s.phase, problems: [`${s.phase} 단계 완료는 M1 범위 밖입니다`] };
     const wt = await this.worktree(epic);
@@ -223,6 +228,8 @@ export class EpicWorkflow {
       maxTurns: this.cfg.maxTurns ?? 40,
       allowedTools: ["Read", "Grep", "Glob", "Write", "Edit", "Bash", "mcp__flightdeck"],
     });
+    const dataDir = await this.eng.dataDir();
+    await writeState(dataDir, { ...(await readState(dataDir, epic)), draft_session: r.sessionId });
     await this.sync(epic);
     return { sessionId: r.sessionId, result: r.result };
   }

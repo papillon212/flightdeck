@@ -166,6 +166,7 @@ describe("flightdeck-hook (설계 §6.1)", () => {
     expect(first[0]!.trailers).toMatchObject({ "Flightdeck-Run": runId, "Flightdeck-Source": "agent" });
     expect(Number(first[0]!.trailers["Flightdeck-Seq"])).toBe((await readEditLog(dataDir, EPIC)).at(-1)!.seq);
     await fire("Stop");
+    // 수정 전에는 간헐적으로 2개였다: 같은 크기 편집(base→BASE)을 racy git 때문에 예전 내용으로 담음 (T6)
     expect(await eng.listCheckpoints(EPIC, "dh.lee")).toHaveLength(1);
     expect((await git(["ls-tree", "-r", "--name-only", first[0]!.sha], { cwd: wt }))).not.toContain(".env");
   });
