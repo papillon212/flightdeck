@@ -3,7 +3,7 @@
 import { existsSync } from "node:fs";
 import { appendFile, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { EditRecord, LocalEpicState } from "@flightdeck/schema";
+import { EditMemo, EditRecord, LocalEpicState, type LocalEpicStateInput } from "@flightdeck/schema";
 
 export const statePath = (dataDir: string, epic: string) => path.join(dataDir, "state", `${epic}.json`);
 export const editlogPath = (dataDir: string, epic: string) => path.join(dataDir, "editlog", `${epic}.jsonl`);
@@ -12,7 +12,7 @@ export async function readState(dataDir: string, epic: string): Promise<LocalEpi
   return LocalEpicState.parse(JSON.parse(await readFile(statePath(dataDir, epic), "utf8")));
 }
 
-export async function writeState(dataDir: string, s: LocalEpicState): Promise<void> {
+export async function writeState(dataDir: string, s: LocalEpicStateInput): Promise<void> {
   const file = statePath(dataDir, s.epic);
   await mkdir(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
@@ -70,6 +70,24 @@ export async function appendEditRecords(dataDir: string, epic: string, records: 
     await appendFile(file, withSeq.map((r) => JSON.stringify(r)).join("\n") + "\n");
     return withSeq;
   });
+}
+
+export const memosPath = (dataDir: string, epic: string) => path.join(dataDir, "memos", `${epic}.jsonl`);
+
+/** 직접 수정·외부 변경 메모 (§7.4, M4 제안 X4) */
+export async function readMemos(dataDir: string, epic: string): Promise<EditMemo[]> {
+  const file = memosPath(dataDir, epic);
+  if (!existsSync(file)) return [];
+  return (await readFile(file, "utf8"))
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => EditMemo.parse(JSON.parse(l)));
+}
+
+export async function appendMemo(dataDir: string, m: EditMemo): Promise<void> {
+  const file = memosPath(dataDir, m.epic);
+  await mkdir(path.dirname(file), { recursive: true });
+  await appendFile(file, JSON.stringify(EditMemo.parse(m)) + "\n");
 }
 
 export async function lastSeq(dataDir: string, epic: string): Promise<number> {

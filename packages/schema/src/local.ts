@@ -40,6 +40,13 @@ export const LocalEpicState = z.object({
   trust: Trust.default(DEV_TRUST),
   /** pipeline.yaml checkpoint.exclude_secrets */
   excludeSecrets: z.array(z.string()).default([".env", ".env.*", "*.pem", "*.key"]),
+  /** 제품 레포의 git 원격 이름 (서버 모드). 훅이 체크포인트·세션 원본 ref를 올릴 때 쓴다 */
+  gitRemote: z.string().optional(),
+  /**
+   * 마지막으로 기록한 impl-log Step 번호 (에픽 단위, M4 제안 X2). 에이전트 편집은 이 번호 + 1의 Step에 속한다.
+   * flightdeck_log_step이 올린다
+   */
+  impl_step: z.number().int().nonnegative().default(0),
   /** 마지막 자동 초안(headless)의 세션 ID. "이어서 작업"이 이 세션을 resume한다 (§6.1) */
   draft_session: z.string().optional(),
   /** 에이전트 세션 → 실행. 훅이 SessionStart에서 채운다 */
@@ -56,3 +63,5 @@ export const LocalEpicState = z.object({
     .default({}),
 });
 export type LocalEpicState = z.infer<typeof LocalEpicState>;
+/** 기본값이 있는 필드는 생략할 수 있는 입력 형태 */
+export type LocalEpicStateInput = z.input<typeof LocalEpicState>;

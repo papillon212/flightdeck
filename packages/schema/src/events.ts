@@ -34,8 +34,11 @@ const data = {
   "thread.reopened": z.object({ thread: ThreadId }),
   "thread.moved": z.object({ thread: ThreadId, anchor: Anchor }),
   "patch.applied": z.object({ thread: ThreadId, commit: GitSha }),
-  /** artifact_hash는 서버가 서명 전에 확인해 채운다 (§4.2). 개발 모드의 로컬 이벤트에는 없다 */
-  "phase.completed": z.object({ phase: Phase, artifact_hash: z.string().min(1).optional() }),
+  /**
+   * artifact_hash는 서버가 서명 전에 확인해 채운다 (§4.2). 개발 모드의 로컬 이벤트에는 없다.
+   * commit: IMPLEMENTATION 완료가 검사한 에픽 브랜치 커밋. 같은 커밋의 통과 보고(gate.reported)가 있어야 한다 (M4 제안 X5)
+   */
+  "phase.completed": z.object({ phase: Phase, artifact_hash: z.string().min(1).optional(), commit: GitSha.optional() }),
   /** 담당자의 리뷰 요청 (§4.2). 이 해시가 재승인 기준인 "현재 산출물"이다 */
   "review.requested": z.object({ phase: Phase, artifact_hash: z.string().min(1), commit: GitSha }),
   "review.approved": z.object({ phase: Phase, tier: z.string().min(1), artifact_hash: z.string().min(1) }),

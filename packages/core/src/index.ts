@@ -8,3 +8,7 @@ export * from "./serverconfig.ts";
 export * from "./threads.ts";
 export * from "./editlog.ts";
 export * from "./artifacts.ts";
+export * from "./impllog.ts";
+export * from "./coverage.ts";
+export * from "./search.ts";
+export * from "./redact.ts";

@@ -66,7 +66,7 @@ beforeAll(async () => {
     v: 1, id: ulid(), type: "epic.started", epic: EPIC, author: "dh.lee", at: new Date().toISOString(),
     data: { tracker_ref: EPIC, owner: "dh.lee", base_sha: await eng.revParse("HEAD"), config_version: "local" },
   });
-  const state: LocalEpicState = { epic: EPIC, repo, worktree: wt, member: "dh.lee", role: "owner", phase: "ANALYSIS", configDir: CONFIG, trust: { mode: "dev" }, excludeSecrets: [".env", "*.pem"], runs: {} };
+  const state: LocalEpicState = { epic: EPIC, repo, worktree: wt, member: "dh.lee", role: "owner", phase: "ANALYSIS", configDir: CONFIG, trust: { mode: "dev" }, excludeSecrets: [".env", "*.pem"], runs: {}, impl_step: 0 };
   await writeState(dataDir, state);
 });
 

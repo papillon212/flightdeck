@@ -5,7 +5,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { applyTextEdit, artifactHash, checkSections, configVersionOf, diffToEdits, draftText, ensureParagraphIds, insertDrafts, myOpenThreads, needsServerSignature, nowIso, parseDrafts, pipelineFromDir, reduce, removeDrafts, renderThreads, replay, restoreParagraphIds, reviewOf, sha256, stripThreads, threadIdFrom, trustFromConfig, ulid, type ConfigPayload, type Draft, type EpicState, type Thread } from "@flightdeck/core";
 import { git, GitEngine, LocalEventStore, MetaRewriteError, RemoteEventStore } from "@flightdeck/git";
-import { DEV_TRUST, HANDOFF_SECTIONS, parsePipeline, PHASE_ARTIFACT, type Anchor, type EditRecord, type EditSource, type Event, type EventOf, type EventType, type LocalEpicState, type Phase, type Pipeline, type Trust } from "@flightdeck/schema";
+import { DEV_TRUST, HANDOFF_SECTIONS, parsePipeline, PHASE_ARTIFACT, type Anchor, type EditRecord, type EditSource, type Event, type EventOf, type EventType, type LocalEpicStateInput, type Phase, type Pipeline, type Trust } from "@flightdeck/schema";
 import type { AgentAdapter } from "@flightdeck/agent";
 import type { TrackerAdapter, TrackerEpic } from "@flightdeck/tracker";
 import { appendEditRecords, readEditLog, readState, statePath, writeState } from "@flightdeck/hook";
@@ -213,7 +213,7 @@ export class EpicWorkflow {
     }
     const dataDir = await this.eng.dataDir();
     if (!existsSync(statePath(dataDir, epic))) {
-      const s: LocalEpicState = {
+      const s: LocalEpicStateInput = {
         epic,
         repo: this.cfg.repo,
         worktree,

@@ -53,6 +53,8 @@ export interface EpicState {
   review: ReviewState;
   /** 에픽에 고정된 설정 버전의 파이프라인 (호출하는 쪽이 넘긴 것) */
   pipeline: Pipeline | undefined;
+  /** 테스트 결과 보고 (§7.5): 커밋 → 마지막 보고. ok = 모든 명령 종료 코드 0 */
+  gates: Map<string, { ok: boolean; event: string; author: string; at: string }>;
 }
 
 export interface ReduceOptions {
@@ -74,11 +76,14 @@ export function initialState(epic: string): EpicState {
     ignored: [],
     review: { phase: "INTAKE", requested: null, approvals: [] },
     pipeline: undefined,
+    gates: new Map(),
   };
 }
 
-/** 다음 단계 (설계 §4.1). ANALYSIS는 phase.completed로, DESIGN은 마지막 티어 승인으로 넘어간다 */
-const NEXT: Partial<Record<Phase, Phase>> = { ANALYSIS: "DESIGN", DESIGN: "IMPLEMENTATION" };
+/** 다음 단계 (설계 §4.1). ANALYSIS·IMPLEMENTATION은 phase.completed로, DESIGN은 마지막 티어 승인으로 넘어간다 */
+const NEXT: Partial<Record<Phase, Phase>> = { ANALYSIS: "DESIGN", DESIGN: "IMPLEMENTATION", IMPLEMENTATION: "VERIFICATION" };
+/** phase.completed로 넘어가는 단계 */
+const COMPLETABLE: ReadonlySet<Phase> = new Set(["ANALYSIS", "IMPLEMENTATION"]);
 
 export function reduce(epic: string, events: Event[], trust: Trust, opts: ReduceOptions = {}): EpicState {
   const s = initialState(epic);
@@ -202,11 +207,26 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
     case "phase.completed": {
       if (e.data.phase !== s.phase) return ignore(`현재 단계(${s.phase})가 아님`);
       if (e.author !== s.owner) return ignore("담당자만 단계를 완료할 수 있음");
-      if (s.phase !== "ANALYSIS") return ignore(`${s.phase}는 단계 완료가 아니라 티어 리뷰로 넘어간다 (§4.2)`);
+      if (!COMPLETABLE.has(s.phase)) return ignore(`${s.phase}는 단계 완료가 아니라 티어 리뷰로 넘어간다 (§4.2)`);
       // ANALYSIS 관문 (§4.1): 그 단계의 쓰레드 전부 resolved
       const open = openThreads(s);
       if (open.length) return ignore(`열린 쓰레드 ${open.length}개`);
-      move(NEXT.ANALYSIS!);
+      // IMPLEMENTATION 관문 (§4.1, §7.5, M4 제안 X5): 검사한 커밋의 테스트 보고가 모두 통과
+      if (s.phase === "IMPLEMENTATION") {
+        if (!e.data.commit) return ignore("검사한 커밋(commit)이 없음");
+        const g = s.gates.get(e.data.commit);
+        if (!g) return ignore("이 커밋의 테스트 결과 보고(gate.reported)가 없음");
+        if (!g.ok) return ignore("이 커밋의 테스트 결과 보고에 실패한 명령이 있음");
+      }
+      move(NEXT[s.phase]!);
+      return;
+    }
+
+    case "gate.reported": {
+      // 구현 관문의 명령 결과 (§7.5): 담당자의 확장이 실행해 보고한다
+      if (s.phase !== "IMPLEMENTATION") return ignore(`${s.phase} 단계에서는 테스트 결과를 보고하지 않음`);
+      if (e.author !== s.owner) return ignore("담당자만 테스트 결과를 보고할 수 있음");
+      s.gates.set(e.data.commit, { ok: e.data.commands.every((c) => c.exit === 0), event: e.id, author: e.author, at: e.at });
       return;
     }
 

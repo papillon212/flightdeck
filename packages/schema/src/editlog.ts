@@ -23,8 +23,11 @@ export const EditSource = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("patch"), member: MemberId, thread: ThreadId }),
   // Flightdeck 자신의 렌더링: 문단 ID 부여, 쓰레드 블록 그리기 (설계 제안 T4)
   // draft_posted: 올린 쓰레드 초안 블록을 문서에서 지움 (§3.2 v0.13)
-  z.object({ kind: z.literal("flightdeck"), member: MemberId, reason: z.enum(["paragraph_ids", "thread_render", "draft_posted"]) }),
+  // impl_log: flightdeck_log_step이 쓴 구현 기록 Step·직접 수정 메모 (M4 제안 X1·X4)
+  z.object({ kind: z.literal("flightdeck"), member: MemberId, reason: z.enum(["paragraph_ids", "thread_render", "draft_posted", "impl_log"]) }),
   z.object({ kind: z.literal("external"), commit: z.string().optional() }), // commit 없으면 external:unknown
+  // 체크포인트 복원 (M4 제안 X8): 파일 전체 교체. 출처는 그 체크포인트의 편집 기록 위치(seq)에서 되살린다
+  z.object({ kind: z.literal("restore"), member: MemberId, ckpt: z.string().min(1), seq: z.number().int().nonnegative() }),
 ]);
 export type EditSource = z.infer<typeof EditSource>;
 
@@ -46,3 +49,17 @@ export const EditRecord = z.object({
   ts: Timestamp,
 });
 export type EditRecord = z.infer<typeof EditRecord>;
+
+/**
+ * 직접 수정·외부 변경 메모 (설계 §7.4, M4 제안 X4). 수정 묶음(같은 파일의 연속 편집 seqs[0]..seqs[1])에 붙는다.
+ * 로컬 memos/<epic>.jsonl에 쌓고, impl-log.md의 "직접 수정 메모"에도 그린다
+ */
+export const EditMemo = z.object({
+  epic: EpicId,
+  file: z.string().min(1),
+  seqs: z.tuple([z.number().int().positive(), z.number().int().positive()]),
+  memo: z.string().trim().min(1),
+  member: MemberId,
+  at: Timestamp,
+});
+export type EditMemo = z.infer<typeof EditMemo>;
