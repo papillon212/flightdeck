@@ -30,7 +30,8 @@ const data = {
   "thread.reopened": z.object({ thread: ThreadId }),
   "thread.moved": z.object({ thread: ThreadId, anchor: Anchor }),
   "patch.applied": z.object({ thread: ThreadId, commit: GitSha }),
-  "phase.completed": z.object({ phase: Phase }),
+  /** artifact_hash는 서버가 서명 전에 확인해 채운다 (§4.2). 개발 모드의 로컬 이벤트에는 없다 */
+  "phase.completed": z.object({ phase: Phase, artifact_hash: z.string().min(1).optional() }),
   "review.approved": z.object({ phase: Phase, tier: z.string().min(1), artifact_hash: z.string().min(1) }),
   "review.edited": z.object({ phase: Phase, commit: GitSha }),
   "phase.reverted": z.object({ from: Phase, to: Phase, reason: z.string().min(1) }),
@@ -70,13 +71,24 @@ const data = {
 export type EventType = keyof typeof data;
 export const EVENT_TYPES = Object.keys(data) as EventType[];
 
+/** 서버 서명이 있어야 효력이 있는 단계 통과 이벤트 (§3.1 표의 ✅, §12). 나머지는 일반 이벤트로 서명하지 않는다 */
+export const SERVER_SIGNED_TYPES: ReadonlySet<EventType> = new Set<EventType>([
+  "epic.started",
+  "epic.config_upgraded",
+  "phase.completed",
+  "review.approved",
+  "gate.reported",
+  "epic.landed",
+  "land.rejected",
+]);
+
 const base = {
   v: z.literal(1),
   id: Ulid,
   epic: EpicId,
   author: MemberId,
   at: Timestamp,
-  /** ed25519 서명. M2에서 검증한다 (§12). M1에서는 없어도 된다 */
+  /** 서버 서명 `ed25519:<base64>`. 서버 서명 이벤트에만 있다 (§12) */
   sig: z.string().optional(),
 };
 

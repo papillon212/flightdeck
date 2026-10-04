@@ -20,7 +20,7 @@ export interface ToolContext {
 
 async function load(ctx: ToolContext) {
   const state = LocalEpicState.parse(JSON.parse(await readFile(ctx.statePath, "utf8")));
-  const epicState = reduce(state.epic, await new LocalEventStore(state.repo).list(state.epic));
+  const epicState = reduce(state.epic, await new LocalEventStore(state.repo).list(state.epic), state.trust);
   return { state, epicState, epicDir: path.join(state.worktree, ".flightdeck", "epics", state.epic) };
 }
 

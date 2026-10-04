@@ -45,7 +45,7 @@ export async function handle(ev: HookEvent, d: HandlerDeps): Promise<HookRespons
 const iso = (d: HandlerDeps) => nowIso(d.now?.() ?? new Date());
 
 async function loadEpicState(d: HandlerDeps) {
-  return reduce(d.state.epic, await new LocalEventStore(d.state.repo).list(d.state.epic));
+  return reduce(d.state.epic, await new LocalEventStore(d.state.repo).list(d.state.epic), d.state.trust);
 }
 
 async function onSessionStart(ev: HookEvent, d: HandlerDeps): Promise<HookResponse> {

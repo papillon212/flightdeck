@@ -5,7 +5,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { applyTextEdit, checkSections, diffToEdits, ensureParagraphIds, nowIso, reduce, renderThreads, replay, restoreParagraphIds, sha256, stripThreads, threadIdFrom, ulid, type EpicState } from "@flightdeck/core";
 import { GitEngine, LocalEventStore } from "@flightdeck/git";
-import { HANDOFF_SECTIONS, PHASE_ARTIFACT, type Anchor, type EditRecord, type EditSource, type Event, type EventOf, type EventType, type LocalEpicState, type Phase } from "@flightdeck/schema";
+import { DEV_TRUST, HANDOFF_SECTIONS, PHASE_ARTIFACT, type Anchor, type EditRecord, type EditSource, type Event, type EventOf, type EventType, type LocalEpicState, type Phase, type Trust } from "@flightdeck/schema";
 import type { AgentAdapter } from "@flightdeck/agent";
 import { appendEditRecords, readEditLog, readState, statePath, writeState } from "@flightdeck/hook";
 
@@ -22,6 +22,8 @@ export interface WorkflowConfig {
   model?: string;
   maxTurns?: number;
   excludeSecrets?: string[];
+  /** 서버 서명 검증 기준 (§12). 없으면 개발 모드 */
+  trust?: Trust;
 }
 
 export const ARTIFACT_FILES = ["analysis.md", "design.md"] as const;
@@ -44,6 +46,10 @@ export class EpicWorkflow {
     this.store = new LocalEventStore(cfg.repo);
   }
 
+  get trust(): Trust {
+    return this.cfg.trust ?? DEV_TRUST;
+  }
+
   epicDir(worktree: string, epic: string) {
     return path.join(worktree, ".flightdeck", "epics", epic);
   }
@@ -58,7 +64,7 @@ export class EpicWorkflow {
     const e = { v: 1, id, type, epic, author, at: nowIso(), data } as EventOf<T>;
     // 메타 브랜치는 append-only라 한번 쓰면 지울 수 없다. reducer가 무시할 이벤트(권한·관문)는 쓰기 전에 막고 이유를 알린다
     const events = await this.store.list(epic);
-    const ignored = reduce(epic, [...events, e as Event]).ignored.find((i) => i.event === e.id);
+    const ignored = reduce(epic, [...events, e as Event], this.trust).ignored.find((i) => i.event === e.id);
     if (ignored) throw new Error(`${type} 거부: ${ignored.reason}${ignored.reason.includes("권한") ? ` (나: ${author})` : ""}`);
     await this.store.append(e as Event);
     return e;
@@ -89,6 +95,7 @@ export class EpicWorkflow {
         member: this.cfg.member,
         phase: "ANALYSIS",
         configDir: this.cfg.configDir,
+        trust: this.trust,
         excludeSecrets: this.eng.excludeSecrets,
         runs: {},
       };
@@ -108,7 +115,7 @@ export class EpicWorkflow {
   }
 
   async epicState(epic: string): Promise<EpicState> {
-    return reduce(epic, await this.store.list(epic));
+    return reduce(epic, await this.store.list(epic), this.trust);
   }
 
   /** 이벤트로 상태를 다시 계산해 로컬 상태 파일(훅이 읽음)의 단계를 맞추고, 문서를 다시 그린다 */

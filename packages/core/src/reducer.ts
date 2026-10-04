@@ -1,8 +1,9 @@
-// 에픽 상태 계산 (설계 §1.1, §3.4, §4).
+// 에픽 상태 계산 (설계 §1.1, §3.4, §4, §12).
 // 입력: 한 에픽의 메타 이벤트 전부. 순서: ULID(id) 오름차순.
-// 권한이 없거나 관문 조건을 못 채운 이벤트는 무시하고 ignored에 이유를 남긴다.
-// M1 범위: INTAKE → ANALYSIS → DESIGN, 쓰레드, 실행 기록. 서명 검증(§12)과 티어 승인(§4.2)은 M2·M3.
-import type { Anchor, Event, EventOf, Phase } from "@flightdeck/schema";
+// 권한이 없거나, 관문 조건을 못 채웠거나, 서버 서명이 필요한데 없거나 틀린 이벤트는 무시하고 ignored에 이유를 남긴다.
+// 범위: INTAKE → ANALYSIS → DESIGN, 쓰레드, 실행 기록, 서버 서명 검증. 티어 승인(§4.2)은 M3.
+import type { Anchor, Event, EventOf, Phase, Trust } from "@flightdeck/schema";
+import { needsServerSignature, verifyEvent } from "./sign.ts";
 
 export interface Reply {
   id: string;
@@ -67,11 +68,28 @@ export function initialState(epic: string): EpicState {
 /** 다음 단계 (설계 §4.1). M1은 DESIGN까지 */
 const NEXT: Partial<Record<Phase, Phase>> = { ANALYSIS: "DESIGN" };
 
-export function reduce(epic: string, events: Event[]): EpicState {
+export function reduce(epic: string, events: Event[], trust: Trust): EpicState {
   const s = initialState(epic);
   const sorted = [...events].filter((e) => e.epic === epic).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-  for (const e of sorted) apply(s, e);
+  for (const e of sorted) {
+    const reason = trustProblem(e, trust);
+    if (reason) s.ignored.push({ event: e.id, type: e.type, reason });
+    else apply(s, e);
+  }
   return s;
+}
+
+/** 서명·멤버 상태로 보아 받아들일 수 없으면 이유 (§12) */
+export function trustProblem(e: Event, trust: Trust): string | null {
+  if (trust.mode === "dev") return null;
+  if (needsServerSignature(e)) {
+    if (!e.sig) return "서버 서명 없음";
+    if (!verifyEvent(e, trust.serverKey)) return "서버 서명이 맞지 않음";
+    return null; // 서버가 서명할 때 요청자의 활성 여부를 이미 확인했다
+  }
+  const off = trust.deactivated[e.author];
+  if (off !== undefined && Date.parse(e.at) >= Date.parse(off)) return "비활성 멤버의 이벤트";
+  return null;
 }
 
 function apply(s: EpicState, e: Event): void {

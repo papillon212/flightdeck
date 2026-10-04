@@ -2,6 +2,18 @@ import { z } from "zod";
 import { EpicId, MemberId, Phase, Ulid } from "./common.ts";
 
 /**
+ * reducer가 서버 서명을 어떻게 다룰지 (설계 §12, §2.5).
+ * - server: 단계 통과 이벤트는 이 서버 공개키의 서명이 있어야 한다. deactivated(멤버 → 비활성 시각) 이후의 일반 이벤트는 무시한다.
+ * - dev: 개발 모드(로컬 설정 폴더). 서명을 보지 않는다. 이 모드의 에픽은 서버 검증을 통과하지 못한다.
+ */
+export const Trust = z.discriminatedUnion("mode", [
+  z.object({ mode: z.literal("server"), serverKey: z.string().min(1), deactivated: z.record(MemberId, z.string()).default({}) }),
+  z.object({ mode: z.literal("dev") }),
+]);
+export type Trust = z.infer<typeof Trust>;
+export const DEV_TRUST: Trust = { mode: "dev" };
+
+/**
  * 로컬 에픽 상태 (M1, docs/m1-plan.md "훅 ↔ 확장 통신").
  * 위치: <git common dir>/flightdeck/state/<epic>.json. 확장이 쓰고 flightdeck-hook·MCP 서버가 읽는다.
  * phase는 reducer 결과의 사본이다. 원천은 메타 이벤트다.
@@ -17,6 +29,8 @@ export const LocalEpicState = z.object({
   phase: Phase,
   /** 단계 룰 폴더: <configDir>/rules/{common,analysis,…}.md (§2.5) */
   configDir: z.string().min(1),
+  /** 서버 서명 검증 기준. 훅·MCP 서버도 같은 기준으로 상태를 계산한다 */
+  trust: Trust.default(DEV_TRUST),
   /** pipeline.yaml checkpoint.exclude_secrets */
   excludeSecrets: z.array(z.string()).default([".env", ".env.*", "*.pem", "*.key"]),
   /** 마지막 자동 초안(headless)의 세션 ID. "이어서 작업"이 이 세션을 resume한다 (§6.1) */

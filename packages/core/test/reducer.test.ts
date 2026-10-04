@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type { Event } from "@flightdeck/schema";
-import { Event as EventSchema } from "@flightdeck/schema";
-import { myOpenThreads, reduce, ulid } from "../src/index.ts";
+import type { Event, Trust } from "@flightdeck/schema";
+import { DEV_TRUST, Event as EventSchema } from "@flightdeck/schema";
+import { canonicalJson, generateServerKey, keyFingerprint, myOpenThreads, reduce as coreReduce, signEvent, ulid, verifyEvent } from "../src/index.ts";
+
+// 권한·관문 규칙 테스트는 개발 모드(서명을 보지 않음)로 돌린다. 서명 규칙은 아래 "서버 서명"에서
+const reduce = (epic: string, events: Event[]) => coreReduce(epic, events, DEV_TRUST);
 
 let t = 1_790_000_000_000;
 function ev(type: Event["type"], author: string, data: unknown): Event {
@@ -70,5 +73,83 @@ describe("reducer (설계 §4)", () => {
     const s2 = reduce("CU-1", [started(), question("t-AAAAAAAA"), ev("thread.replied", "park", { thread: "t-AAAAAAAA", body: "답", source: "human" })]);
     expect(myOpenThreads(s2, "park")).toEqual([]);
     expect(myOpenThreads(s2, "dh.lee").map((x) => x.id)).toEqual(["t-AAAAAAAA"]);
+  });
+});
+
+describe("정규화 JSON (RFC 8785)", () => {
+  it("키 정렬, 공백 없음, undefined 필드 제외, 문자열·숫자는 JSON.stringify 그대로", () => {
+    expect(canonicalJson({ b: 1, a: [true, null, "x"], c: { z: 1.5, y: undefined, "é": " " } })).toBe('{"a":[true,null,"x"],"b":1,"c":{"z":1.5,"é":" "}}');
+    // 키 순서가 달라도 같은 결과
+    expect(canonicalJson({ x: 1, y: { q: 2, p: 1 } })).toBe(canonicalJson({ y: { p: 1, q: 2 }, x: 1 }));
+    // RFC 8785 부록의 숫자 예
+    expect(canonicalJson([1e21, 1e-7, -0, 333333333.3333333])).toBe("[1e+21,1e-7,0,333333333.3333333]");
+    expect(() => canonicalJson(Number.NaN)).toThrow();
+  });
+});
+
+describe("서버 서명 (설계 §3.1, §12)", () => {
+  const server = generateServerKey();
+  const other = generateServerKey();
+  const trust: Trust = { mode: "server", serverKey: server.publicKey, deactivated: {} };
+  const signed = (e: Event, key = server.privateKeyPem) => signEvent(e, key);
+
+  it("서명·검증, 지문 모양", () => {
+    const e = signed(started());
+    expect(e.sig).toMatch(/^ed25519:[A-Za-z0-9+/]{86}==$/);
+    expect(verifyEvent(e, server.publicKey)).toBe(true);
+    expect(verifyEvent(e, other.publicKey)).toBe(false);
+    expect(keyFingerprint(server.publicKey)).toMatch(/^SHA256:[A-Za-z0-9+/]{43}$/);
+    // 파일에 쓰고 읽어 키 순서가 바뀌어도 검증된다
+    const reordered = JSON.parse(JSON.stringify({ sig: e.sig, data: e.data, at: e.at, author: e.author, epic: e.epic, type: e.type, id: e.id, v: e.v }));
+    expect(verifyEvent(EventSchema.parse(reordered) as Event, server.publicKey)).toBe(true);
+  });
+
+  it("서버 서명 이벤트: 서명이 없거나, 틀리거나, 다른 키거나, 서명 뒤 바뀌면 무시", () => {
+    const start = signed(started());
+    const tampered = { ...signed(ev("phase.completed", "dh.lee", { phase: "ANALYSIS" })) };
+    tampered.data = { ...tampered.data, artifact_hash: "sha256:bad" } as never;
+    const s = coreReduce("CU-1", [
+      start,
+      ev("phase.completed", "dh.lee", { phase: "ANALYSIS" }), // 서명 없음: 확장이 직접 쓴 단계 완료
+      signed(ev("phase.completed", "dh.lee", { phase: "ANALYSIS" }), other.privateKeyPem), // 다른 키
+      tampered, // 서명 뒤 필드 하나 변경
+    ], trust);
+    expect(s.phase).toBe("ANALYSIS");
+    expect(s.ignored.map((i) => i.reason).sort()).toEqual(["서버 서명 없음", "서버 서명이 맞지 않음", "서버 서명이 맞지 않음"]);
+    expect(s.ignored.find((i) => i.event === tampered.id)?.reason).toBe("서버 서명이 맞지 않음");
+  });
+
+  it("서명 없는 epic.started는 무시되어 그 뒤 일반 이벤트도 효력이 없다 (에픽 위조 불가)", () => {
+    const s = coreReduce("CU-1", [started(), question("t-AAAAAAAA")], trust);
+    expect(s.owner).toBeNull();
+    expect(s.ignored.map((i) => i.reason)).toEqual(["서버 서명 없음", "epic.started 이전 이벤트"]);
+  });
+
+  it("일반 이벤트는 서명 없이 받아들이고, 서명된 단계 완료로 단계가 넘어간다", () => {
+    const s = coreReduce("CU-1", [
+      signed(started()),
+      question("t-AAAAAAAA"),
+      ev("thread.replied", "park", { thread: "t-AAAAAAAA", body: "30분", source: "human" }),
+      ev("thread.resolved", "dh.lee", { thread: "t-AAAAAAAA" }),
+      signed(ev("phase.completed", "dh.lee", { phase: "ANALYSIS", artifact_hash: "sha256:abc" })),
+    ], trust);
+    expect(s.ignored).toEqual([]);
+    expect(s.phase).toBe("DESIGN");
+  });
+
+  it("서명이 맞아도 권한·관문은 그대로 본다 (서명은 조건을 대신하지 않는다)", () => {
+    const s = coreReduce("CU-1", [signed(started()), question("t-AAAAAAAA"), signed(ev("phase.completed", "dh.lee", { phase: "ANALYSIS" }))], trust);
+    expect(s.ignored.map((i) => i.reason)).toEqual(["열린 쓰레드 1개"]);
+  });
+
+  it("비활성 멤버: 비활성 시각 이후의 일반 이벤트만 무시", () => {
+    const start = signed(started()); // ev()는 만든 순서대로 ULID가 커진다
+    const before = ev("thread.created", "dh.lee", { thread: "t-AAAAAAAA", phase: "ANALYSIS", file: "analysis.md", anchor: { type: "paragraph", pid: "p:a91c" }, kind: "question", to: ["park"], body: "TTL?" });
+    const replyBefore = ev("thread.replied", "park", { thread: "t-AAAAAAAA", body: "전", source: "human" });
+    const replyAfter = ev("thread.replied", "park", { thread: "t-AAAAAAAA", body: "후", source: "human" });
+    const off: Trust = { mode: "server", serverKey: server.publicKey, deactivated: { park: replyAfter.at } };
+    const s = coreReduce("CU-1", [start, before, replyBefore, replyAfter], off);
+    expect(s.threads.get("t-AAAAAAAA")?.replies.map((r) => r.body)).toEqual(["전"]);
+    expect(s.ignored.map((i) => i.reason)).toEqual(["비활성 멤버의 이벤트"]);
   });
 });
