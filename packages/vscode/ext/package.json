@@ -1,19 +1,23 @@
 {
   "name": "flightdeck",
   "displayName": "Flightdeck",
-  "description": "코딩 에이전트 시대의 원격 페어 프로그래밍 워크플로우 (M1: 로컬 단일 사용자)",
+  "description": "코딩 에이전트 시대의 원격 페어 프로그래밍 워크플로우 (M2: 원격 협업)",
   "publisher": "flightdeck",
   "version": "0.1.0",
   "private": true,
   "engines": { "vscode": "^1.90.0" },
   "main": "./dist/extension.cjs",
-  "activationEvents": ["onStartupFinished"],
+  "activationEvents": ["onStartupFinished", "onUri"],
   "capabilities": {
     "untrustedWorkspaces": { "supported": false, "description": "Flightdeck은 에이전트 훅과 git을 다루므로 신뢰한 폴더에서만 동작합니다 (설계 §6.1)." }
   },
   "contributes": {
     "commands": [
-      { "command": "flightdeck.newEpic", "title": "새 에픽", "category": "Flightdeck" },
+      { "command": "flightdeck.newEpic", "title": "새 에픽 (내 일감에서 시작)", "category": "Flightdeck" },
+      { "command": "flightdeck.inbox", "title": "받은 질문", "category": "Flightdeck" },
+      { "command": "flightdeck.login", "title": "서버 로그인", "category": "Flightdeck" },
+      { "command": "flightdeck.logout", "title": "서버 로그아웃", "category": "Flightdeck" },
+      { "command": "flightdeck.setTrackerToken", "title": "일감 도구(ClickUp) 개인 토큰 설정", "category": "Flightdeck" },
       { "command": "flightdeck.draft", "title": "에이전트 초안 작성", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
       { "command": "flightdeck.resume", "title": "이어서 작업 (Claude Code)", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
       { "command": "flightdeck.completePhase", "title": "단계 완료", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
@@ -40,8 +44,13 @@
     "configuration": {
       "title": "Flightdeck",
       "properties": {
-        "flightdeck.member": { "type": "string", "default": "", "description": "멤버 ID (예: dh.lee). 비우면 git user.email의 @ 앞부분" },
-        "flightdeck.configDir": { "type": "string", "default": "", "description": "설정 레포의 제품 폴더 (rules/, pipeline.yaml). 비우면 내장 견본. M2부터는 서버가 배포한다" },
+        "flightdeck.serverUrl": { "type": "string", "default": "", "description": "flightdeck-server 주소 (예: http://127.0.0.1:8787). 비우면 개발 모드(로컬 설정, 서명 없음)" },
+        "flightdeck.serverKeyFingerprint": { "type": "string", "default": "", "description": "서버 키 지문 (SHA256:…). 관리자가 배포한다. 설정 응답과 단계 통과 이벤트를 이 키로 검증한다" },
+        "flightdeck.product": { "type": "string", "default": "", "description": "이 레포의 제품 ID (서버 어드민의 제품)" },
+        "flightdeck.gitRemote": { "type": "string", "default": "origin", "description": "제품 레포의 git 원격 이름" },
+        "flightdeck.devLoginMember": { "type": "string", "default": "", "description": "개발용 로그인 멤버 ID. 서버가 개발용 로그인을 켰을 때만 (Google 로그인 대신)" },
+        "flightdeck.member": { "type": "string", "default": "", "description": "개발 모드의 멤버 ID (예: dh.lee). 비우면 git user.email의 @ 앞부분. 서버 모드에서는 로그인한 멤버" },
+        "flightdeck.configDir": { "type": "string", "default": "", "description": "개발 모드의 설정 폴더 (rules/, pipeline.yaml). 비우면 내장 견본. 서버 모드에서는 서버가 배포한다" },
         "flightdeck.model": { "type": "string", "default": "", "description": "에이전트 권장 모델 (비우면 Claude Code 기본값)" },
         "flightdeck.maxTurns": { "type": "number", "default": 40, "description": "자동 초안의 최대 턴 수" },
         "flightdeck.claudePath": { "type": "string", "default": "claude", "description": "Claude Code 실행 파일" }

@@ -1,24 +1,86 @@
-// Flightdeck VS Code 확장 (M1: 로컬 단일 사용자). 설계 §9.
+// Flightdeck VS Code 확장 (M2: 원격 협업). 설계 §9.
 // 화면을 workflow(EpicWorkflow)에 연결만 한다. 대화 화면은 만들지 않는다(§6.1): 에이전트는 Claude Code를 그대로 쓴다.
+// 서버 모드(flightdeck.serverUrl 설정): 로그인한 멤버, 서버가 서명한 설정, 원격 메타 브랜치, 일감 도구 연동.
+// 개발 모드(설정 없음): M1과 같이 로컬 설정 폴더·로컬 메타 브랜치, 서명 없음.
+import { createServer } from "node:http";
 import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import * as vscode from "vscode";
 import { ClaudeCodeAdapter, cleanEnv } from "@flightdeck/agent";
-import { coalesce, nowIso, parseBlocks, PID_LINE, restoreParagraphIds, sha256, type EpicState, type Thread } from "@flightdeck/core";
-import { git } from "@flightdeck/git";
+import { coalesce, nowIso, parseBlocks, PID_LINE, restoreParagraphIds, sha256, type ConfigPayload, type EpicState, type Thread } from "@flightdeck/core";
+import { git, RemoteEventStore } from "@flightdeck/git";
 import { appendEditRecords, readState } from "@flightdeck/hook";
-import type { EditRecord, LocalEpicState } from "@flightdeck/schema";
-import { ARTIFACT_FILES, EpicWorkflow } from "./workflow.ts";
+import { parsePipeline, type EditRecord, type LocalEpicState, type Phase } from "@flightdeck/schema";
+import { ClickUpTracker, type TrackerAdapter } from "@flightdeck/tracker";
+import { cacheConfig, loadCachedConfig, ServerClient, ServerRequestError } from "./server-client.ts";
+import { ARTIFACT_FILES, EpicWorkflow, type InboxItem } from "./workflow.ts";
 
 // ---------------------------------------------------------------- 에픽 찾기
 
 interface Ctx {
   wf: EpicWorkflow;
   repo: string;
-  /** 이 창이 에픽 작업 폴더면 그 에픽 */
+  /** 이 창이 에픽 작업 폴더(또는 읽기 전용 창)면 그 에픽 */
   epic: string | null;
   worktree: string | null;
+  role: "owner" | "viewer";
+  mode: "server" | "dev";
+  /** 서버 모드인데 로그인이 안 됐거나 서버에 닿지 못해 쓸 수 없는 이유 */
+  blocked?: string;
+  /** 서버에 닿지 못해 캐시한 설정으로 동작 중 */
+  offline?: boolean;
+}
+
+const EXT_ID = "flightdeck.flightdeck";
+const tokenKey = (url: string) => `flightdeck.session:${url}`;
+const TRACKER_TOKEN_KEY = "flightdeck.trackerToken";
+
+/** 서버 모드: 로그인 → 나 → 설정(지문 검증, 캐시) → 일감 도구. 실패하면 이유를 담아 돌려준다 */
+async function serverSetup(
+  ext: vscode.ExtensionContext,
+  dataDir: string,
+): Promise<{ server: ServerClient; member: string; config: ConfigPayload; product: string; tracker?: TrackerAdapter; offline: boolean } | { blocked: string }> {
+  const cfg = vscode.workspace.getConfiguration("flightdeck");
+  const url = cfg.get<string>("serverUrl")!;
+  const fp = cfg.get<string>("serverKeyFingerprint") ?? "";
+  const product = cfg.get<string>("product") ?? "";
+  if (!fp) return { blocked: "flightdeck.serverKeyFingerprint 설정이 없습니다 (관리자가 배포)" };
+  if (!product) return { blocked: "flightdeck.product 설정이 없습니다" };
+  const server = new ServerClient(url, (await ext.secrets.get(tokenKey(url))) ?? null, fp);
+  let member: string;
+  let config: ConfigPayload;
+  let offline = false;
+  try {
+    // 개발용 로그인 멤버가 정해져 있으면 바로 로그인한다 (서버가 루프백에서 개발용 로그인을 켰을 때만 된다)
+    const dev = cfg.get<string>("devLoginMember");
+    if (!server.loggedIn && dev) await ext.secrets.store(tokenKey(url), await server.devLogin(dev));
+    if (!server.loggedIn) return { blocked: "서버에 로그인하세요 (Flightdeck: 서버 로그인)" };
+    member = (await server.me()).id;
+    config = await server.config(product);
+    await cacheConfig(dataDir, config);
+    await ext.globalState.update(`flightdeck.member:${url}`, member);
+  } catch (e) {
+    if (e instanceof ServerRequestError && e.status === 401) {
+      await ext.secrets.delete(tokenKey(url));
+      return { blocked: `서버 로그인이 필요합니다: ${e.message}` };
+    }
+    if (!(e instanceof ServerRequestError && e.status === 0)) return { blocked: `서버 설정을 받지 못했습니다: ${(e as Error).message}` };
+    // 서버 장애: 캐시한 설정으로 계속한다. 단계 통과(시작·완료)는 서버가 있어야 한다 (§2.5)
+    const cached = await loadCachedConfig(dataDir, product);
+    const last = ext.globalState.get<string>(`flightdeck.member:${url}`);
+    if (!cached || !last) return { blocked: `서버에 닿지 못했고 캐시한 설정도 없습니다: ${(e as Error).message}` };
+    [config, member, offline] = [cached, last, true];
+  }
+  let tracker: TrackerAdapter | undefined;
+  // 개발 모드(Extension Development Host)에서만 환경변수 토큰을 받는다 (자동 점검용)
+  const devTok = ext.extensionMode === vscode.ExtensionMode.Development ? process.env.FLIGHTDECK_TRACKER_TOKEN : undefined;
+  const tok = devTok || (await ext.secrets.get(TRACKER_TOKEN_KEY));
+  const tcfg = parsePipeline(config.pipeline_yaml).tracker as { provider: string; clickup?: { list_ids?: string[]; tag?: string; status_map?: Partial<Record<Phase, string>> } };
+  if (tok && tcfg.provider === "clickup" && tcfg.clickup) {
+    tracker = new ClickUpTracker({ token: tok, list_ids: tcfg.clickup.list_ids ?? [], tag: tcfg.clickup.tag, status_map: tcfg.clickup.status_map ?? {} });
+  }
+  return { server, member, config, product, ...(tracker ? { tracker } : {}), offline };
 }
 
 async function gitOut(args: string[], cwd: string): Promise<string | null> {
@@ -44,32 +106,61 @@ async function resolveCtx(ext: vscode.ExtensionContext): Promise<Ctx | null> {
   const common = await gitOut(["rev-parse", "--path-format=absolute", "--git-common-dir"], top);
   if (!common) return null;
   const repo = path.dirname(common); // 일반 레포: <repo>/.git
+  const dataDir = path.join(common, "flightdeck");
   const cfg = vscode.workspace.getConfiguration("flightdeck");
-  const configDir = cfg.get<string>("configDir") || path.join(ext.extensionPath, "config", "sample");
-  const wf = new EpicWorkflow({
+  const base = {
     repo,
-    member: await member(top),
-    configDir,
     distDir: path.join(ext.extensionPath, "dist"),
     adapter: new ClaudeCodeAdapter(cfg.get<string>("claudePath") || "claude"),
     model: cfg.get<string>("model") || undefined,
     maxTurns: cfg.get<number>("maxTurns") || 40,
-  });
-  // 이 폴더가 어느 에픽의 작업 폴더인가
-  const stateDir = path.join(common, "flightdeck", "state");
+  };
+  let wf: EpicWorkflow;
+  let mode: Ctx["mode"] = "dev";
+  let blocked: string | undefined;
+  let offline = false;
+  if (cfg.get<string>("serverUrl")) {
+    mode = "server";
+    const r = await serverSetup(ext, dataDir);
+    if ("blocked" in r) {
+      blocked = r.blocked;
+      wf = new EpicWorkflow({ ...base, member: "unknown", configDir: path.join(ext.extensionPath, "config", "sample") });
+    } else {
+      offline = r.offline;
+      wf = new EpicWorkflow({
+        ...base,
+        member: r.member,
+        configDir: path.join(dataDir, "config", r.product, r.config.version),
+        excludeSecrets: parsePipeline(r.config.pipeline_yaml).checkpoint.exclude_secrets,
+        remote: {
+          server: r.server,
+          product: r.product,
+          config: r.config,
+          gitRemote: cfg.get<string>("gitRemote") || "origin",
+          ...(r.tracker ? { tracker: r.tracker } : {}),
+          linkFor: (e, t) => `${vscode.env.uriScheme}://${EXT_ID}/open?epic=${encodeURIComponent(e)}${t ? `&thread=${t}` : ""}`,
+        },
+      });
+    }
+  } else {
+    wf = new EpicWorkflow({ ...base, member: await member(top), configDir: cfg.get<string>("configDir") || path.join(ext.extensionPath, "config", "sample") });
+  }
+  // 이 폴더가 어느 에픽의 작업 폴더(또는 읽기 전용 창)인가
+  const stateDir = path.join(dataDir, "state");
   const real = realpathSync(top);
   let epic: string | null = null;
+  let role: Ctx["role"] = "owner";
   if (existsSync(stateDir)) {
     for (const f of readdirSync(stateDir).filter((n) => n.endsWith(".json"))) {
       try {
         const s = JSON.parse(await readFile(path.join(stateDir, f), "utf8")) as LocalEpicState;
-        if (existsSync(s.worktree) && realpathSync(s.worktree) === real) epic = s.epic;
+        if (existsSync(s.worktree) && realpathSync(s.worktree) === real) [epic, role] = [s.epic, s.role ?? "owner"];
       } catch {
         /* 다른 파일 */
       }
     }
   }
-  return { wf, repo, epic, worktree: epic ? top : null };
+  return { wf, repo, epic, worktree: epic ? top : null, role, mode, ...(blocked ? { blocked } : {}), offline };
 }
 
 // ---------------------------------------------------------------- 쓰레드 화면 (Comments API, §3.3·§9.2)
@@ -80,7 +171,8 @@ class ThreadView implements vscode.Disposable {
 
   constructor(private ctx: Ctx) {
     this.controller.commentingRangeProvider = {
-      provideCommentingRanges: (doc) => (this.isArtifact(doc.uri) ? [new vscode.Range(0, 0, Math.max(0, doc.lineCount - 1), 0)] : []),
+      // 읽기 전용 창(질문 대상)은 새 쓰레드를 만들 수 없다. 받은 쓰레드에 답글만 단다 (§3.4)
+      provideCommentingRanges: (doc) => (this.ctx.role === "owner" && this.isArtifact(doc.uri) ? [new vscode.Range(0, 0, Math.max(0, doc.lineCount - 1), 0)] : []),
     };
     this.controller.options = { prompt: "질문·요청을 쓰세요. @멤버로 받는 사람을 지정합니다", placeHolder: "예: @park TTL은 몇 분인가요?" };
   }
@@ -109,7 +201,7 @@ class ThreadView implements vscode.Disposable {
         ct.contextValue = t.status === "open" ? "fd-open" : "fd-resolved";
         ct.state = t.status === "open" ? vscode.CommentThreadState.Unresolved : vscode.CommentThreadState.Resolved;
         ct.collapsibleState = t.status === "open" ? vscode.CommentThreadCollapsibleState.Expanded : vscode.CommentThreadCollapsibleState.Collapsed;
-        ct.canReply = true;
+        ct.canReply = this.ctx.role === "owner" || t.to.includes(this.ctx.wf.cfg.member) || t.replies.some((r) => r.author === this.ctx.wf.cfg.member);
         this.threads.set(t.id, ct);
       }
     }
@@ -278,6 +370,11 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     if (!ctx?.epic || !ctx.worktree) throw new Error("에픽 작업 폴더에서 실행하세요. (Flightdeck: 새 에픽으로 시작)");
     return ctx as Ctx & { epic: string; worktree: string };
   };
+  const needOwner = () => {
+    const c = need();
+    if (c.role !== "owner") throw new Error("읽기 전용 창입니다. 담당자의 작업 폴더에서만 할 수 있습니다.");
+    return c;
+  };
   const run = (name: string, fn: (...a: any[]) => Promise<unknown>) =>
     vscode.commands.registerCommand(name, async (...a: any[]) => {
       try {
@@ -289,30 +386,105 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     });
 
   let view: ThreadView | null = null;
+  /** 부가 동작(일감 멘션·상태, 원격 맞추기)의 경고를 보여 준다 */
+  const flushWarnings = () => {
+    for (const w of ctx?.wf.warnings.splice(0) ?? []) {
+      out.appendLine(`[경고] ${w}`);
+      vscode.window.showWarningMessage(`Flightdeck: ${w}`);
+    }
+  };
+  /** 내 에픽 쓰레드에 남이 단 새 답글 알림용 (쓰레드 → 답글 수) */
+  let replyCounts: Map<string, number> | null = null;
   const refresh = async () => {
+    if (ctx?.blocked) {
+      status.text = "$(rocket) Flightdeck · 로그인 필요";
+      status.tooltip = ctx.blocked;
+      status.command = "flightdeck.login";
+      status.show();
+      return;
+    }
     if (!ctx?.epic) {
-      status.text = "$(rocket) Flightdeck";
-      status.tooltip = "Flightdeck: 새 에픽";
-      status.command = "flightdeck.newEpic";
+      status.text = `$(rocket) Flightdeck${ctx?.mode === "server" ? ` · @${ctx.wf.cfg.member}` : ""}${ctx?.offline ? " · 서버 연결 안 됨" : ""}`;
+      status.tooltip = ctx?.mode === "server" ? "Flightdeck: 내 일감 / 받은 질문" : "Flightdeck: 새 에픽";
+      status.command = "flightdeck.menu";
       status.show();
       return;
     }
     const s = await ctx.wf.sync(ctx.epic);
+    flushWarnings();
     for (const r of ctx.wf.lastRender.filter((x) => x.external)) {
       // §7.4 외부 변경 감지: 편집 기록에 없던 변경(셸·다른 에디터 등)
       vscode.window.showWarningMessage(
         `Flightdeck 밖에서 ${r.file}이(가) 수정됐습니다. 출처 external로 기록했습니다${r.restoredIds ? `. 지워지거나 바뀐 문단 ID ${r.restoredIds}개를 복원했습니다` : ""}.`,
       );
     }
+    // 새 답글 알림 (§3.7 VS Code 실행 중): 남이 단 것만
+    const me = ctx.wf.cfg.member;
+    if (replyCounts) {
+      for (const t of s.threads.values()) {
+        const fresh = t.replies.slice(replyCounts.get(t.id) ?? 0).filter((r) => r.author !== me);
+        for (const r of fresh) vscode.window.showInformationMessage(`Flightdeck: @${r.author}이(가) 답했습니다 (${t.id}): ${r.body.split("\n")[0]!.slice(0, 80)}`);
+      }
+    }
+    replyCounts = new Map([...s.threads.values()].map((t) => [t.id, t.replies.length]));
     const open = [...s.threads.values()].filter((t) => t.status === "open").length;
-    status.text = `$(rocket) Flightdeck · ${ctx.epic} · ${s.phase}${open ? ` · 열린 쓰레드 ${open}` : ""}`;
-    status.tooltip = "Flightdeck: 단계 완료 / 초안 / 이어서 작업";
+    const ro = ctx.role === "viewer" ? " · 읽기 전용" : "";
+    status.text = `$(rocket) Flightdeck · ${ctx.epic} · ${s.phase}${ro}${open ? ` · 열린 쓰레드 ${open}` : ""}${ctx.offline ? " · 서버 연결 안 됨" : ""}`;
+    status.tooltip = ctx.role === "viewer" ? "질문 대상의 읽기 전용 창: 받은 쓰레드에 답글만 답니다" : "Flightdeck: 단계 완료 / 초안 / 이어서 작업";
     status.command = "flightdeck.menu";
     status.show();
     await view?.refresh(s);
   };
 
-  if (ctx?.epic && ctx.worktree) {
+  // 받은 질문 알림 (§3.7): 처음 보는 것만. 알린 쓰레드는 모든 창이 공유하는 globalState에 남긴다
+  const notifyInbox = async (items: InboxItem[]) => {
+    const seen = new Set(ext.globalState.get<string[]>("flightdeck.notified") ?? []);
+    const fresh = items.filter((i) => !seen.has(`${i.thread.id}#${i.thread.replies.length}`));
+    if (!fresh.length) return;
+    await ext.globalState.update("flightdeck.notified", [...seen, ...fresh.map((i) => `${i.thread.id}#${i.thread.replies.length}`)].slice(-500));
+    for (const i of fresh) {
+      const last = i.thread.replies.at(-1);
+      void vscode.window
+        .showInformationMessage(`Flightdeck: ${last ? `@${last.author}의 답글` : `@${i.thread.author}의 질문`} (${i.epic}): ${(last?.body ?? i.thread.body).split("\n")[0]!.slice(0, 80)}`, "열기")
+        .then((pick) => (pick ? openViewer(i.epic, i.commit) : undefined))
+        .then(undefined, (e) => vscode.window.showErrorMessage(`Flightdeck: ${(e as Error).message}`));
+    }
+  };
+
+  const sameWindow = ext.extensionMode === vscode.ExtensionMode.Development; // 개발 모드의 새 창에는 개발 중인 확장이 실리지 않는다
+  const openViewer = async (epic: string, commit?: string) => {
+    if (!ctx) throw new Error("git 레포 폴더를 연 창에서 실행하세요.");
+    const r = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Flightdeck: ${epic} 읽기 전용 창 준비` }, () => ctx.wf.openAsViewer(epic, commit));
+    if (ctx.worktree && samePath(ctx.worktree, r.worktree)) return void (await refresh());
+    await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(r.worktree), { forceNewWindow: !sameWindow });
+  };
+
+  // 원격 메타 브랜치 감시 (§3.7: 20초 ls-remote). 바뀌면 이 창을 다시 그리고 받은 질문을 알린다
+  if (ctx && !ctx.blocked && ctx.wf.store instanceof RemoteEventStore) {
+    const interval = Number(process.env.FLIGHTDECK_POLL_MS) || 20_000;
+    const onChange = async () => {
+      try {
+        if (ctx.epic && ctx.role === "viewer") await ctx.wf.openAsViewer(ctx.epic); // 최신 공유 커밋으로
+        await refresh();
+        await notifyInbox(await ctx.wf.inbox());
+      } catch (e) {
+        out.appendLine(`[watch] ${(e as Error).stack ?? e}`);
+      }
+    };
+    const w = ctx.wf.store.watch(() => void onChange(), { intervalMs: interval, onError: (e) => out.appendLine(`[watch] ${e}`) });
+    ext.subscriptions.push({ dispose: () => w.dispose() });
+    setTimeout(() => void ctx.wf.inbox().then(notifyInbox, (e) => out.appendLine(`[inbox] ${e}`)), 1000);
+  }
+
+  // 읽기 전용 창: 파일을 읽기 전용으로 연다 (§2.4). 이 창의 변경은 다음 공유 커밋으로 옮길 때 버려진다
+  if (ctx?.epic && ctx.role === "viewer") {
+    await vscode.workspace.getConfiguration("files").update("readonlyInclude", { "**": true }, vscode.ConfigurationTarget.Workspace).then(undefined, () => undefined);
+  }
+
+  if (ctx?.epic && ctx.worktree && ctx.role === "viewer") {
+    view = new ThreadView(ctx);
+    ext.subscriptions.push(view);
+  } else if (ctx?.epic && ctx.worktree) {
     view = new ThreadView(ctx);
     ext.subscriptions.push(view);
     const dataDir = await ctx.wf.eng.dataDir();
@@ -332,6 +504,28 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
   ext.subscriptions.push(
     run("flightdeck.newEpic", async () => {
       if (!ctx) throw new Error("git 레포 폴더를 연 창에서 실행하세요.");
+      if (ctx.blocked) throw new Error(ctx.blocked);
+      if (ctx.mode === "server") {
+        // 서버 모드: 나에게 배정된 일감에서 고른다 (§1.4, §9.1)
+        if (!ctx.wf.cfg.remote?.tracker) {
+          const pick = await vscode.window.showWarningMessage("일감 도구 개인 토큰이 없습니다. 먼저 설정하세요.", "토큰 설정");
+          if (pick) await vscode.commands.executeCommand("flightdeck.setTrackerToken");
+          return;
+        }
+        const list = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Flightdeck: 내 일감 불러오는 중" }, () => ctx.wf.assignedEpics());
+        if (!list.length) return void vscode.window.showInformationMessage("시작할 일감이 없습니다 (나에게 배정되고 태그가 붙은, 아직 시작하지 않은 일감).");
+        const t = await vscode.window.showQuickPick(
+          list.map((e) => ({ label: e.title, description: `${e.epicId} · ${e.status}`, detail: e.body.split("\n")[0], e })),
+          { title: "내 일감에서 에픽 시작" },
+        );
+        if (!t) return;
+        const { worktree } = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Flightdeck: ${t.e.epicId} 시작 (서버 서명 요청)` }, () => ctx.wf.startFromTracker(t.e));
+        flushWarnings();
+        const pick = await vscode.window.showInformationMessage(`${t.e.epicId} 작업 폴더를 만들었습니다. 분석 초안을 에이전트에게 맡길까요?`, "초안 작성 후 열기", "바로 열기");
+        if (pick === "초안 작성 후 열기") await draftWithProgress(ctx.wf, t.e.epicId, out);
+        if (pick) await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(worktree), { forceNewWindow: !sameWindow });
+        return;
+      }
       const epic = await vscode.window.showInputBox({ title: "새 에픽 (1/3)", prompt: "에픽 ID (일감 도구의 ID. 예: CU-86abc123)", validateInput: (v) => (/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(v) ? null : "영문·숫자·-·_만") });
       if (!epic) return;
       const title = await vscode.window.showInputBox({ title: "새 에픽 (2/3)", prompt: "제목" });
@@ -347,7 +541,7 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     }),
 
     run("flightdeck.draft", async () => {
-      const c = need();
+      const c = needOwner();
       await draftWithProgress(c.wf, c.epic, out);
       await refresh();
       const pick = await vscode.window.showInformationMessage("초안을 작성했습니다. 같은 세션을 이어서 대화형으로 계속할 수 있습니다.", "이어서 작업");
@@ -355,7 +549,7 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     }),
 
     run("flightdeck.resume", async () => {
-      const c = need();
+      const c = needOwner();
       const s = await readState(await c.wf.eng.dataDir(), c.epic);
       const cmd = s.draft_session ? c.wf.cfg.adapter.resumeCommand!({ sessionId: s.draft_session, cwd: c.worktree }) : [c.wf.cfg.adapter.id === "claude-code" ? "claude" : c.wf.cfg.adapter.id];
       // 부모 프로세스의 CLAUDECODE·CLAUDE_CODE_* 를 지운 환경으로 연다 (§6.1)
@@ -366,7 +560,7 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     }),
 
     run("flightdeck.completePhase", async () => {
-      const c = need();
+      const c = needOwner();
       const r = await c.wf.completePhase(c.epic);
       if (!r.ok) {
         vscode.window.showWarningMessage(`아직 단계를 완료할 수 없습니다:\n${r.problems.map((p) => `• ${p}`).join("\n")}`, { modal: true });
@@ -378,14 +572,64 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     }),
 
     run("flightdeck.menu", async () => {
+      const owner = !!ctx?.epic && ctx.role === "owner";
+      const server = ctx?.mode === "server";
       const items = [
-        { label: "$(check) 단계 완료", cmd: "flightdeck.completePhase" },
-        { label: "$(sparkle) 에이전트 초안 작성", cmd: "flightdeck.draft" },
-        { label: "$(terminal) 이어서 작업 (Claude Code)", cmd: "flightdeck.resume" },
+        ...(owner
+          ? [
+              { label: "$(check) 단계 완료", cmd: "flightdeck.completePhase" },
+              { label: "$(sparkle) 에이전트 초안 작성", cmd: "flightdeck.draft" },
+              { label: "$(terminal) 이어서 작업 (Claude Code)", cmd: "flightdeck.resume" },
+            ]
+          : []),
+        ...(!ctx?.epic ? [{ label: server ? "$(tasklist) 내 일감에서 에픽 시작" : "$(add) 새 에픽", cmd: "flightdeck.newEpic" }] : []),
+        ...(server ? [{ label: "$(mail) 받은 질문", cmd: "flightdeck.inbox" }] : []),
         { label: "$(refresh) 새로 고침", cmd: "flightdeck.refresh" },
+        ...(server ? [{ label: "$(key) 일감 도구 개인 토큰 설정", cmd: "flightdeck.setTrackerToken" }, { label: "$(sign-out) 서버 로그아웃", cmd: "flightdeck.logout" }] : []),
       ];
-      const p = await vscode.window.showQuickPick(items, { title: "Flightdeck" });
+      const p = await vscode.window.showQuickPick(items, { title: `Flightdeck${server ? ` · @${ctx!.wf.cfg.member}` : ""}` });
       if (p) await vscode.commands.executeCommand(p.cmd);
+    }),
+
+    run("flightdeck.inbox", async () => {
+      if (!ctx || ctx.blocked) throw new Error(ctx?.blocked ?? "git 레포 폴더를 연 창에서 실행하세요.");
+      const items = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Flightdeck: 받은 질문 확인" }, () => ctx.wf.inbox());
+      flushWarnings();
+      if (!items.length) return void vscode.window.showInformationMessage("답할 질문이 없습니다.");
+      const p = await vscode.window.showQuickPick(
+        items.map((i) => ({ label: i.thread.body.split("\n")[0]!.slice(0, 80), description: `${i.epic} · ${i.thread.id} · @${i.thread.author}`, detail: i.thread.replies.length ? `마지막 답글: @${i.thread.replies.at(-1)!.author}` : undefined, i })),
+        { title: "받은 질문" },
+      );
+      if (p) await openViewer(p.i.epic, p.i.commit);
+    }),
+
+    run("flightdeck.login", async () => {
+      const cfg = vscode.workspace.getConfiguration("flightdeck");
+      const url = cfg.get<string>("serverUrl");
+      if (!url) throw new Error("flightdeck.serverUrl 설정이 없습니다 (개발 모드에서는 로그인하지 않습니다)");
+      const client = new ServerClient(url, null, cfg.get<string>("serverKeyFingerprint") ?? "");
+      const dev = cfg.get<string>("devLoginMember");
+      let token: string;
+      if (dev) token = await client.devLogin(dev);
+      else token = await googleLogin(url);
+      await ext.secrets.store(tokenKey(url), token);
+      const me = await new ServerClient(url, token, "").me();
+      const pick = await vscode.window.showInformationMessage(`Flightdeck: @${me.id}(으)로 로그인했습니다. 창을 다시 불러옵니다.`, "다시 불러오기");
+      if (pick) await vscode.commands.executeCommand("workbench.action.reloadWindow");
+    }),
+
+    run("flightdeck.logout", async () => {
+      const url = vscode.workspace.getConfiguration("flightdeck").get<string>("serverUrl");
+      if (url) await ext.secrets.delete(tokenKey(url));
+      await vscode.commands.executeCommand("workbench.action.reloadWindow");
+    }),
+
+    run("flightdeck.setTrackerToken", async () => {
+      const t = await vscode.window.showInputBox({ title: "일감 도구(ClickUp) 개인 토큰", prompt: "ClickUp 설정 → Apps → API Token. VS Code 비밀 저장소에만 둡니다 (§1.4)", password: true, ignoreFocusOut: true });
+      if (!t) return;
+      await ext.secrets.store(TRACKER_TOKEN_KEY, t.trim());
+      const pick = await vscode.window.showInformationMessage("토큰을 저장했습니다. 창을 다시 불러오면 적용됩니다.", "다시 불러오기");
+      if (pick) await vscode.commands.executeCommand("workbench.action.reloadWindow");
     }),
 
     run("flightdeck.refresh", refresh),
@@ -429,6 +673,23 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     }),
   );
 
+  // 일감 멘션의 링크 (§3.7): vscode://flightdeck.flightdeck/open?epic=…&thread=…
+  ext.subscriptions.push(
+    vscode.window.registerUriHandler({
+      handleUri: async (uri) => {
+        try {
+          const epic = new URLSearchParams(uri.query).get("epic");
+          if (uri.path !== "/open" || !epic || !ctx) return;
+          const st = await readState(await ctx.wf.eng.dataDir(), epic).catch(() => null);
+          if (st?.role === "owner") return void (await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(st.worktree), { forceNewWindow: !sameWindow }));
+          await openViewer(epic);
+        } catch (e) {
+          vscode.window.showErrorMessage(`Flightdeck: ${(e as Error).message}`);
+        }
+      },
+    }),
+  );
+
   await refresh().catch((e) => out.appendLine(String(e)));
 
   // 자동 점검: FLIGHTDECK_SMOKE=<결과 파일>이면 활성화 결과를 쓰고 창을 닫는다 (개발용)
@@ -438,7 +699,7 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     const { writeFile } = await import("node:fs/promises");
     // 문단 ID 보호 점검: analysis.md에서 ID 줄 하나를 지우고 다른 줄도 고친 뒤 저장 → ID만 복원되고 다른 수정은 남는가
     let pidTest: unknown = null;
-    if (ctx?.epic && ctx.worktree) {
+    if (ctx?.epic && ctx.worktree && ctx.role === "owner" && !process.env.FLIGHTDECK_SMOKE_SKIP_PID) {
       const file = path.join(ctx.worktree, ".flightdeck", "epics", ctx.epic, "analysis.md");
       if (existsSync(file)) {
         const doc = await vscode.workspace.openTextDocument(file);
@@ -480,7 +741,18 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     }
     await writeFile(
       smoke,
-      JSON.stringify({ epic: ctx?.epic ?? null, repo: ctx?.repo ?? null, member: ctx?.wf.cfg.member ?? null, phase: s?.phase ?? null, status: status.text, threads: s ? s.threads.size : 0, commentThreads: (view as any)?.threads?.size ?? 0, pidTest }, null, 2),
+      JSON.stringify(
+        {
+          epic: ctx?.epic ?? null, repo: ctx?.repo ?? null, member: ctx?.wf.cfg.member ?? null, phase: s?.phase ?? null, status: status.text,
+          threads: s ? s.threads.size : 0, commentThreads: (view as any)?.threads?.size ?? 0, pidTest,
+          mode: ctx?.mode ?? null, role: ctx?.role ?? null, blocked: ctx?.blocked ?? null, offline: ctx?.offline ?? null,
+          configVersion: ctx?.wf.cfg.remote?.config.version ?? null, tracker: !!ctx?.wf.cfg.remote?.tracker,
+          inbox: ctx?.mode === "server" && !ctx.blocked ? (await ctx.wf.inbox()).map((i) => `${i.epic}/${i.thread.id}`) : null,
+          assigned: ctx?.wf.cfg.remote?.tracker && !ctx.epic ? (await ctx.wf.assignedEpics()).map((e) => e.epicId) : null,
+        },
+        null,
+        2,
+      ),
     );
     await vscode.commands.executeCommand("workbench.action.quit");
   }
@@ -500,6 +772,32 @@ function pidAt(doc: vscode.TextDocument, line: number): string | null {
   const blocks = parseBlocks(lines);
   const b = blocks.find((x) => line >= x.start && line <= x.end) ?? blocks.find((x) => x.start === line + 1);
   return b?.pid ?? null;
+}
+
+/**
+ * Google 로그인 (§12): 브라우저로 서버의 /auth/login을 열고, 서버가 루프백 주소로 돌려주는 세션 토큰을 받는다.
+ * M2에서는 OAuth 클라이언트가 없어 실제로 확인하지 못했다 (개발용 로그인으로 진행).
+ */
+function googleLogin(serverUrl: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const srv = createServer((req, res) => {
+      const u = new URL(req.url ?? "/", "http://127.0.0.1");
+      const token = u.searchParams.get("token");
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(token ? "<p>Flightdeck 로그인 완료. 이 탭을 닫고 VS Code로 돌아가세요.</p>" : "<p>로그인 실패</p>");
+      srv.close();
+      if (token) resolve(token);
+      else reject(new Error("로그인 응답에 토큰이 없습니다"));
+    });
+    srv.listen(0, "127.0.0.1", () => {
+      const port = (srv.address() as { port: number }).port;
+      void vscode.env.openExternal(vscode.Uri.parse(`${serverUrl.replace(/\/$/, "")}/auth/login?port=${port}`));
+    });
+    setTimeout(() => {
+      srv.close();
+      reject(new Error("로그인 시간이 지났습니다 (5분)"));
+    }, 5 * 60_000);
+  });
 }
 
 function samePath(a: string, b: string): boolean {
