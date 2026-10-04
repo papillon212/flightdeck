@@ -48,6 +48,8 @@ export interface InboxItem {
   thread: Thread;
   /** 질문이 달린 문서의 공유 커밋 (thread.created.commit) */
   commit?: string;
+  /** 내가 담당한 에픽 (리뷰어가 단 쓰레드). 읽기 전용 창이 아니라 내 작업 폴더에서 연다 */
+  mine?: boolean;
 }
 
 export const ARTIFACT_FILES = ["analysis.md", "design.md"] as const;
@@ -258,10 +260,10 @@ export class EpicWorkflow {
     for (const epic of await this.store.listEpics()) {
       const events = await this.store.list(epic);
       const s = await this.reduceEvents(epic, events);
-      if (s.owner === this.cfg.member) continue; // 내 에픽은 내 작업 폴더에서 본다
-      for (const t of myOpenThreads(s, this.cfg.member).filter((x) => x.to.includes(this.cfg.member))) {
+      // 나에게 온 열린 쓰레드 중 내가 마지막으로 답하지 않은 것. 내 에픽이면 리뷰어가 담당자에게 단 수정 요청·질문이다(내 작업 폴더에서 연다)
+      for (const t of myOpenThreads(s, this.cfg.member).filter((x) => x.to.includes(this.cfg.member) && x.author !== this.cfg.member)) {
         const created = events.find((e) => e.type === "thread.created" && e.data.thread === t.id) as EventOf<"thread.created"> | undefined;
-        out.push({ epic, thread: t, ...(created?.data.commit ? { commit: created.data.commit } : {}) });
+        out.push({ epic, thread: t, ...(created?.data.commit ? { commit: created.data.commit } : {}), ...(s.owner === this.cfg.member ? { mine: true } : {}) });
       }
     }
     return out;
@@ -340,7 +342,27 @@ export class EpicWorkflow {
     const local = await readState(dataDir, epic);
     if (local.phase !== s.phase) await writeState(dataDir, { ...(await readState(dataDir, epic)), phase: s.phase });
     await this.renderDocs(epic, s);
+    if (local.role === "owner") await this.reconcileTracker(epic, s);
     return s;
+  }
+
+  /** 단계별로 한 번만 일감 상태를 확인한다 (에픽 → 마지막으로 맞춘 단계) */
+  private reconciled = new Map<string, Phase>();
+
+  /**
+   * 조정 (§1.4 reconcile): reducer 단계 ≠ 일감 상태이면 맞춘다. 단계 전환을 일으킨 사람이 일감 도구 토큰이 없어
+   * 바꾸지 못한 경우를 담당자의 확장이 메운다 (M3 실측: architect 승인 뒤 일감이 '설계'에 머묾)
+   */
+  private async reconcileTracker(epic: string, s: EpicState): Promise<void> {
+    const t = this.cfg.remote?.tracker;
+    if (!t || !s.tracker_ref || this.reconciled.get(epic) === s.phase) return;
+    const want = this.statusMap()[s.phase];
+    try {
+      if (want && (await t.getEpic(s.tracker_ref)).status.toLowerCase() !== want.toLowerCase()) await t.setPhase(s.tracker_ref, s.phase);
+      this.reconciled.set(epic, s.phase);
+    } catch (e) {
+      this.warnings.push(`일감 상태를 맞추지 못했다: ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   /** 마지막 renderDocs 결과 (확장이 "Flightdeck 밖에서 수정됨" 알림에 쓴다, §7.4) */

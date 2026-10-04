@@ -18,6 +18,12 @@
       { "command": "flightdeck.login", "title": "서버 로그인", "category": "Flightdeck" },
       { "command": "flightdeck.logout", "title": "서버 로그아웃", "category": "Flightdeck" },
       { "command": "flightdeck.setTrackerToken", "title": "일감 도구(ClickUp) 개인 토큰 설정", "category": "Flightdeck" },
+      { "command": "flightdeck.requestReview", "title": "리뷰 요청", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
+      { "command": "flightdeck.approve", "title": "승인", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
+      { "command": "flightdeck.postAllDrafts", "title": "쓰레드 초안 모두 올리기", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
+      { "command": "flightdeck.askAgent", "title": "내 에이전트에게 묻기", "category": "Flightdeck", "icon": "$(comment-discussion)", "enablement": "flightdeck.inEpic" },
+      { "command": "flightdeck.postDraft", "title": "올리기", "icon": "$(cloud-upload)" },
+      { "command": "flightdeck.discardDraft", "title": "버리기", "icon": "$(trash)" },
       { "command": "flightdeck.draft", "title": "에이전트 초안 작성", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
       { "command": "flightdeck.resume", "title": "이어서 작업 (Claude Code)", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
       { "command": "flightdeck.completePhase", "title": "단계 완료", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
@@ -33,12 +39,17 @@
       ],
       "comments/commentThread/title": [
         { "command": "flightdeck.resolve", "group": "navigation", "when": "commentController == flightdeck && commentThread == fd-open" },
-        { "command": "flightdeck.reopen", "group": "navigation", "when": "commentController == flightdeck && commentThread == fd-resolved" }
+        { "command": "flightdeck.reopen", "group": "navigation", "when": "commentController == flightdeck && commentThread == fd-resolved" },
+        { "command": "flightdeck.askAgent", "group": "navigation", "when": "commentController == flightdeck && commentThread =~ /^fd-(open|resolved)$/" },
+        { "command": "flightdeck.postDraft", "group": "navigation", "when": "commentController == flightdeck && commentThread == fd-draft" },
+        { "command": "flightdeck.discardDraft", "group": "navigation", "when": "commentController == flightdeck && commentThread =~ /^fd-draft/" }
       ],
       "commandPalette": [
         { "command": "flightdeck.reply", "when": "false" },
         { "command": "flightdeck.resolve", "when": "false" },
-        { "command": "flightdeck.reopen", "when": "false" }
+        { "command": "flightdeck.reopen", "when": "false" },
+        { "command": "flightdeck.postDraft", "when": "false" },
+        { "command": "flightdeck.discardDraft", "when": "false" }
       ]
     },
     "configuration": {

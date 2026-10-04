@@ -44,7 +44,7 @@ class FakeTracker implements TrackerAdapter {
   }
 }
 
-async function member(id: string): Promise<EpicWorkflow> {
+async function member(id: string, withTracker = true): Promise<EpicWorkflow> {
   const repo = path.join(root, id);
   await git(["clone", "-q", remote, repo], { cwd: root });
   for (const [k, v] of [["user.name", id], ["user.email", `${id}@e.com`]]) await git(["config", k!, v!], { cwd: repo });
@@ -54,7 +54,7 @@ async function member(id: string): Promise<EpicWorkflow> {
   const configDir = await cacheConfig(path.join(repo, ".git", "flightdeck"), config);
   return new EpicWorkflow({
     repo, member: id, configDir, distDir: DIST, adapter: new ClaudeCodeAdapter(),
-    remote: { server, product: "sample", config, tracker: new FakeTracker({ ANALYSIS: "분석", DESIGN: "설계", IMPLEMENTATION: "구현" }) },
+    remote: { server, product: "sample", config, ...(withTracker ? { tracker: new FakeTracker({ ANALYSIS: "분석", DESIGN: "설계", IMPLEMENTATION: "구현" }) } : {}) },
   });
 }
 
@@ -82,7 +82,8 @@ beforeAll(async () => {
   srv = createServer((q, s) => void app(q, s));
   await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
   url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
-  [A, P, C] = [await member("dh.lee"), await member("park"), await member("choi")];
+  // choi는 일감 도구 토큰이 없다 (단계를 넘겨도 일감 상태를 못 바꿈 → 담당자 확장이 조정)
+  [A, P, C] = [await member("dh.lee"), await member("park"), await member("choi", false)];
 
   // DESIGN 단계까지
   await A.start(EPIC, "토큰 회전", "리프레시 토큰을 회전시킨다.", { trackerRef: "77abc" });
@@ -132,6 +133,8 @@ describe("설계 2티어 리뷰 (M3 완료 기준)", { timeout: 60_000 }, () => 
     expect(s.threads.get(t)).toMatchObject({ author: "park", kind: "change_request", anchor: { pid: risk.pid } });
     const created = (await P.store.list(EPIC)).find((e) => e.type === "thread.created" && e.data.thread === t)!;
     expect(created.data).toMatchObject({ source: "agent", commit: item!.commit });
+    // 담당자에게는 받은 질문으로 알린다 (내 에픽이라 작업 폴더에서 연다)
+    expect((await A.inbox()).map((i) => [i.thread.id, i.thread.author, i.mine])).toEqual([[t, "park", true]]);
     // 본인이 연 쓰레드가 열려 있으면 승인 거부
     await expect(P.approve(EPIC)).rejects.toThrow(/승인자가 연 열린 쓰레드 1개/);
   });
@@ -167,11 +170,13 @@ describe("설계 2티어 리뷰 (M3 완료 기준)", { timeout: 60_000 }, () => 
     await P.approve(EPIC);
   });
 
-  it("architect(choi): 승인 → IMPLEMENTATION, 일감 상태 구현. 모두 서버 서명", async () => {
+  it("architect(choi): 승인 → IMPLEMENTATION. 일감 상태는 담당자 확장이 조정(§1.4). 모두 서버 서명", async () => {
     const [item] = await C.reviewInbox();
     expect(item?.tier).toBe("architect");
     const s = await C.approve(EPIC);
     expect(s.phase).toBe("IMPLEMENTATION");
+    expect(tracker.status).toBe("설계"); // choi는 일감 도구 토큰이 없다
+    await A.sync(EPIC);
     expect(tracker.status).toBe("구현");
     const approvals = (await C.store.list(EPIC)).filter((e) => e.type === "review.approved");
     expect(approvals.map((e) => [e.author, (e.data as { tier: string }).tier, !!e.sig])).toEqual([

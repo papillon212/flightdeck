@@ -8,7 +8,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import * as vscode from "vscode";
 import { ClaudeCodeAdapter, cleanEnv } from "@flightdeck/agent";
-import { coalesce, nowIso, parseBlocks, PID_LINE, restoreParagraphIds, sha256, type ConfigPayload, type EpicState, type Thread } from "@flightdeck/core";
+import { coalesce, nowIso, parseBlocks, parseDrafts, PID_LINE, restoreParagraphIds, reviewOf, sha256, type ConfigPayload, type EpicState, type Thread } from "@flightdeck/core";
 import { git, RemoteEventStore } from "@flightdeck/git";
 import { appendEditRecords, readState } from "@flightdeck/hook";
 import { parsePipeline, type EditRecord, type LocalEpicState, type Phase } from "@flightdeck/schema";
@@ -168,11 +168,15 @@ async function resolveCtx(ext: vscode.ExtensionContext): Promise<Ctx | null> {
 class ThreadView implements vscode.Disposable {
   private controller = vscode.comments.createCommentController("flightdeck", "Flightdeck");
   private threads = new Map<string, vscode.CommentThread>();
+  /** 쓰레드 초안 (§3.2 v0.13): Comments 쓰레드 → 파일·초안 키 */
+  private draftThreads = new Map<vscode.CommentThread, { file: string; key: string }>();
+  /** 지금 이 창에서 새 쓰레드를 만들 수 있는가: 담당자, 또는 현재 티어 리뷰어 (§3.4) */
+  private canCreate = false;
 
   constructor(private ctx: Ctx) {
     this.controller.commentingRangeProvider = {
-      // 읽기 전용 창(질문 대상)은 새 쓰레드를 만들 수 없다. 받은 쓰레드에 답글만 단다 (§3.4)
-      provideCommentingRanges: (doc) => (this.ctx.role === "owner" && this.isArtifact(doc.uri) ? [new vscode.Range(0, 0, Math.max(0, doc.lineCount - 1), 0)] : []),
+      // 질문 대상은 새 쓰레드를 만들 수 없다(답글만). 리뷰어는 자기 차례에 수정 요청·질문을 단다 (§3.4)
+      provideCommentingRanges: (doc) => (this.canCreate && this.isArtifact(doc.uri) ? [new vscode.Range(0, 0, Math.max(0, doc.lineCount - 1), 0)] : []),
     };
     this.controller.options = { prompt: "질문·요청을 쓰세요. @멤버로 받는 사람을 지정합니다", placeHolder: "예: @park TTL은 몇 분인가요?" };
   }
@@ -188,11 +192,29 @@ class ThreadView implements vscode.Disposable {
     if (!this.ctx.epic || !this.ctx.worktree) return;
     for (const t of this.threads.values()) t.dispose();
     this.threads.clear();
+    for (const t of this.draftThreads.keys()) t.dispose();
+    this.draftThreads.clear();
+    const me = this.ctx.wf.cfg.member;
+    const cur = state.review.requested ? reviewOf(state)?.current : null;
+    this.canCreate = this.ctx.role === "owner" || !!cur?.reviewers.includes(me);
     for (const name of ARTIFACT_FILES) {
       const file = path.join(this.ctx.worktree, ".flightdeck", "epics", this.ctx.epic, name);
       if (!existsSync(file)) continue;
-      const lines = (await readFile(file, "utf8")).split(/\r?\n/);
+      const text = await readFile(file, "utf8");
+      const lines = text.split(/\r?\n/);
       const blocks = parseBlocks(lines);
+      // 에이전트가 쓴 초안: 확인 후 올린다
+      for (const d of parseDrafts(text)) {
+        const head = d.reply ? `답글 → ${d.reply}` : `${KIND_LABEL[d.kind as keyof typeof KIND_LABEL] ?? d.kind}${d.to.length ? ` → ${d.to.map((m) => "@" + m).join(" ")}` : ""}`;
+        const ct = this.controller.createCommentThread(vscode.Uri.file(file), new vscode.Range(d.start, 0, d.end, 0), [
+          { author: { name: `초안 (@${me}의 에이전트)` }, body: new vscode.MarkdownString(`**${head}**\n\n${d.body}${d.error ? `\n\n⚠️ 올릴 수 없음: ${d.error}` : ""}`), mode: vscode.CommentMode.Preview },
+        ]);
+        ct.label = `초안 · ${head}`;
+        ct.contextValue = d.error ? "fd-draft-bad" : "fd-draft";
+        ct.canReply = false;
+        ct.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+        this.draftThreads.set(ct, { file: name, key: d.key });
+      }
       for (const t of [...state.threads.values()].filter((x) => x.file === name && x.anchor.type === "paragraph")) {
         const b = blocks.find((x) => x.pid === (t.anchor.type === "paragraph" ? t.anchor.pid : ""));
         const line = b ? b.end : Math.max(0, lines.length - 1);
@@ -209,6 +231,18 @@ class ThreadView implements vscode.Disposable {
 
   get(id: string): vscode.CommentThread | undefined {
     return this.threads.get(id);
+  }
+
+  draftOf(thread: vscode.CommentThread): { file: string; key: string } | undefined {
+    return this.draftThreads.get(thread);
+  }
+
+  get draftCount(): number {
+    return this.draftThreads.size;
+  }
+
+  draftList(): vscode.CommentThread[] {
+    return [...this.draftThreads.keys()];
   }
 
   get size(): number {
@@ -428,6 +462,11 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     const s = await ctx.wf.sync(ctx.epic);
     flushWarnings();
     for (const r of ctx.wf.lastRender.filter((x) => x.external)) {
+      if (ctx.role === "viewer") {
+        // §6.2 v0.13: 읽기 전용 창에서는 쓰레드 초안 밖의 변경을 되돌린다
+        vscode.window.showWarningMessage(`Flightdeck: 읽기 전용 창이라 ${r.file}의 내용 변경을 되돌렸습니다. 질문·코멘트는 쓰레드 초안(<!-- flightdeck:draft … -->)으로 쓰세요.`);
+        continue;
+      }
       // §7.4 외부 변경 감지: 편집 기록에 없던 변경(셸·다른 에디터 등)
       vscode.window.showWarningMessage(
         `Flightdeck 밖에서 ${r.file}이(가) 수정됐습니다. 출처 external로 기록했습니다${r.restoredIds ? `. 지워지거나 바뀐 문단 ID ${r.restoredIds}개를 복원했습니다` : ""}.`,
@@ -444,8 +483,13 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     replyCounts = new Map([...s.threads.values()].map((t) => [t.id, t.replies.length]));
     const open = [...s.threads.values()].filter((t) => t.status === "open").length;
     const ro = ctx.role === "viewer" ? " · 읽기 전용" : "";
-    status.text = `$(rocket) Flightdeck · ${ctx.epic} · ${s.phase}${ro}${open ? ` · 열린 쓰레드 ${open}` : ""}${ctx.offline ? " · 서버 연결 안 됨" : ""}`;
-    status.tooltip = ctx.role === "viewer" ? "질문 대상의 읽기 전용 창: 받은 쓰레드에 답글만 답니다" : "Flightdeck: 단계 완료 / 초안 / 이어서 작업";
+    // 티어 리뷰 중이면 현재 티어 (§9.2 상태 바: DESIGN(architect))
+    const rv = s.review.requested ? reviewOf(s) : null;
+    const tier = rv?.current ? `(${rv.current.name})` : "";
+    const myTurn = !!rv?.current?.reviewers.includes(me) && !rv.current.approvedBy.includes(me) && s.owner !== me;
+    const drafts = (await ctx.wf.drafts(ctx.epic).catch(() => [])).length;
+    status.text = `$(rocket) Flightdeck · ${ctx.epic} · ${s.phase}${tier}${ro}${myTurn ? " · 내 리뷰 차례" : ""}${open ? ` · 열린 쓰레드 ${open}` : ""}${drafts ? ` · 초안 ${drafts}` : ""}${ctx.offline ? " · 서버 연결 안 됨" : ""}`;
+    status.tooltip = ctx.role === "viewer" ? "읽기 전용 창: 받은 쓰레드에 답글, 리뷰 차례면 수정 요청·승인" : "Flightdeck: 단계 완료·리뷰 요청 / 초안 / 이어서 작업";
     status.command = "flightdeck.menu";
     status.show();
     await view?.refresh(s);
@@ -459,7 +503,7 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     await ext.globalState.update("flightdeck.notified", [...seen, ...fresh.map((i) => `${i.thread.id}#${i.thread.replies.length}`)].slice(-500));
     for (const i of fresh) {
       const last = i.thread.replies.at(-1);
-      void notify(`Flightdeck: ${last ? `@${last.author}의 답글` : `@${i.thread.author}의 질문`} (${i.epic}): ${(last?.body ?? i.thread.body).split("\n")[0]!.slice(0, 80)}`, "열기")
+      void notify(`Flightdeck: ${last ? `@${last.author}의 답글` : `@${i.thread.author}의 ${KIND_LABEL[i.thread.kind]}`} (${i.epic}): ${(last?.body ?? i.thread.body).split("\n")[0]!.slice(0, 80)}`, "열기")
         .then((pick) => (pick ? openViewer(i.epic, i.commit) : undefined))
         .then(undefined, (e) => vscode.window.showErrorMessage(`Flightdeck: ${(e as Error).message}`));
     }
@@ -468,26 +512,49 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
   const sameWindow = ext.extensionMode === vscode.ExtensionMode.Development; // 개발 모드의 새 창에는 개발 중인 확장이 실리지 않는다
   const openViewer = async (epic: string, commit?: string) => {
     if (!ctx) throw new Error("git 레포 폴더를 연 창에서 실행하세요.");
+    // 내가 담당한 에픽(리뷰어가 단 쓰레드)은 내 작업 폴더에서 연다
+    const mine = await readState(await ctx.wf.eng.dataDir(), epic).catch(() => null);
+    if (mine?.role === "owner") {
+      if (ctx.worktree && samePath(ctx.worktree, mine.worktree)) return void (await refresh());
+      return void (await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(mine.worktree), { forceNewWindow: !sameWindow }));
+    }
     const r = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Flightdeck: ${epic} 읽기 전용 창 준비` }, () => ctx.wf.openAsViewer(epic, commit));
     if (ctx.worktree && samePath(ctx.worktree, r.worktree)) return void (await refresh());
     await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(r.worktree), { forceNewWindow: !sameWindow });
   };
 
-  // 원격 메타 브랜치 감시 (§3.7: 20초 ls-remote). 바뀌면 이 창을 다시 그리고 받은 질문을 알린다
+  // 리뷰 차례 알림 (§4.2): 리뷰 요청마다 한 번
+  const notifyReviews = async (items: Awaited<ReturnType<EpicWorkflow["reviewInbox"]>>) => {
+    const seen = new Set(ext.globalState.get<string[]>("flightdeck.notified") ?? []);
+    const fresh = items.filter((i) => !seen.has(`review#${i.epic}#${i.commit}#${i.tier}`));
+    if (!fresh.length) return;
+    await ext.globalState.update("flightdeck.notified", [...seen, ...fresh.map((i) => `review#${i.epic}#${i.commit}#${i.tier}`)].slice(-500));
+    for (const i of fresh) {
+      void notify(`Flightdeck: 리뷰 차례입니다 (${i.epic} · ${i.phase} · ${i.tier} 티어)`, "열기")
+        .then((pick) => (pick ? openViewer(i.epic, i.commit) : undefined))
+        .then(undefined, (e) => vscode.window.showErrorMessage(`Flightdeck: ${(e as Error).message}`));
+    }
+  };
+
+  // 원격 메타 브랜치 감시 (§3.7: 20초 ls-remote). 바뀌면 이 창을 다시 그리고 받은 질문·리뷰 차례를 알린다
   if (ctx && !ctx.blocked && ctx.wf.store instanceof RemoteEventStore) {
     const interval = Number(process.env.FLIGHTDECK_POLL_MS) || 20_000;
     const onChange = async () => {
       try {
-        if (ctx.epic && ctx.role === "viewer") await ctx.wf.openAsViewer(ctx.epic); // 최신 공유 커밋으로
+        if (ctx.epic && ctx.role === "viewer") await ctx.wf.openAsViewer(ctx.epic); // 리뷰 요청된(없으면 최신 공유) 커밋으로
         await refresh();
         await notifyInbox(await ctx.wf.inbox());
+        await notifyReviews(await ctx.wf.reviewInbox());
       } catch (e) {
         out.appendLine(`[watch] ${(e as Error).stack ?? e}`);
       }
     };
     const w = ctx.wf.store.watch(() => void onChange(), { intervalMs: interval, onError: (e) => out.appendLine(`[watch] ${e}`) });
     ext.subscriptions.push({ dispose: () => w.dispose() });
-    setTimeout(() => void ctx.wf.inbox().then(notifyInbox, (e) => out.appendLine(`[inbox] ${e}`)), 1000);
+    setTimeout(() => {
+      void ctx.wf.inbox().then(notifyInbox, (e) => out.appendLine(`[inbox] ${e}`));
+      void ctx.wf.reviewInbox().then(notifyReviews, (e) => out.appendLine(`[review] ${e}`));
+    }, 1000);
   }
 
   // 읽기 전용 창: 파일을 읽기 전용으로 연다 (§2.4). 이 창의 변경은 다음 공유 커밋으로 옮길 때 버려진다
@@ -495,15 +562,12 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     await vscode.workspace.getConfiguration("files").update("readonlyInclude", { "**": true }, vscode.ConfigurationTarget.Workspace).then(undefined, () => undefined);
   }
 
-  if (ctx?.epic && ctx.worktree && ctx.role === "viewer") {
+  if (ctx?.epic && ctx.worktree) {
     view = new ThreadView(ctx);
     ext.subscriptions.push(view);
-  } else if (ctx?.epic && ctx.worktree) {
-    view = new ThreadView(ctx);
-    ext.subscriptions.push(view);
-    const dataDir = await ctx.wf.eng.dataDir();
-    ext.subscriptions.push(new HumanEdits(ctx, dataDir, ctx.wf.cfg.member, refresh));
-    // 에이전트가 산출물을 고치면(디스크 변경) 문단 ID를 붙이고 쓰레드를 다시 그린다
+    // 읽기 전용 창은 편집 기록을 남기지 않는다 (§2.4)
+    if (ctx.role === "owner") ext.subscriptions.push(new HumanEdits(ctx, await ctx.wf.eng.dataDir(), ctx.wf.cfg.member, refresh));
+    // 에이전트가 산출물을 고치면(디스크 변경) 다시 그린다: 담당자 창은 문단 ID·쓰레드, 읽기 전용 창은 초안만 남기고 되돌림
     const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.join(ctx.worktree, ".flightdeck", "epics", ctx.epic), "{analysis,design}.md"));
     let t: NodeJS.Timeout | null = null;
     const later = () => {
@@ -588,14 +652,22 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     run("flightdeck.menu", async () => {
       const owner = !!ctx?.epic && ctx.role === "owner";
       const server = ctx?.mode === "server";
+      const s = ctx?.epic ? await ctx.wf.epicState(ctx.epic) : null;
+      const reviewPhase = !!s && !!reviewOf(s);
+      const cur = s?.review.requested ? reviewOf(s)?.current : null;
+      const myTurn = !!cur?.reviewers.includes(ctx!.wf.cfg.member) && !cur.approvedBy.includes(ctx!.wf.cfg.member);
+      const drafts = view?.draftCount ?? 0;
       const items = [
         ...(owner
           ? [
-              { label: "$(check) 단계 완료", cmd: "flightdeck.completePhase" },
+              reviewPhase ? { label: "$(git-pull-request) 리뷰 요청", cmd: "flightdeck.requestReview" } : { label: "$(check) 단계 완료", cmd: "flightdeck.completePhase" },
               { label: "$(sparkle) 에이전트 초안 작성", cmd: "flightdeck.draft" },
               { label: "$(terminal) 이어서 작업 (Claude Code)", cmd: "flightdeck.resume" },
             ]
           : []),
+        ...(ctx?.epic && myTurn ? [{ label: `$(pass) 승인 (${cur!.name} 티어)`, cmd: "flightdeck.approve" }] : []),
+        ...(drafts ? [{ label: `$(cloud-upload) 쓰레드 초안 모두 올리기 (${drafts})`, cmd: "flightdeck.postAllDrafts" }] : []),
+        ...(ctx?.epic && ctx.role === "viewer" ? [{ label: "$(comment-discussion) 내 에이전트에게 묻기", cmd: "flightdeck.askAgent" }] : []),
         ...(!ctx?.epic ? [{ label: server ? "$(tasklist) 내 일감에서 에픽 시작" : "$(add) 새 에픽", cmd: "flightdeck.newEpic" }] : []),
         ...(server ? [{ label: "$(mail) 받은 질문", cmd: "flightdeck.inbox" }] : []),
         { label: "$(refresh) 새로 고침", cmd: "flightdeck.refresh" },
@@ -607,14 +679,78 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
 
     run("flightdeck.inbox", async () => {
       if (!ctx || ctx.blocked) throw new Error(ctx?.blocked ?? "git 레포 폴더를 연 창에서 실행하세요.");
-      const items = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Flightdeck: 받은 질문 확인" }, () => ctx.wf.inbox());
+      const [items, reviews] = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Flightdeck: 받은 질문·리뷰 차례 확인" }, () => Promise.all([ctx.wf.inbox(), ctx.wf.reviewInbox()]));
       flushWarnings();
-      if (!items.length) return void vscode.window.showInformationMessage("답할 질문이 없습니다.");
+      if (!items.length && !reviews.length) return void vscode.window.showInformationMessage("답할 질문도, 리뷰 차례도 없습니다.");
       const p = await vscode.window.showQuickPick(
-        items.map((i) => ({ label: i.thread.body.split("\n")[0]!.slice(0, 80), description: `${i.epic} · ${i.thread.id} · @${i.thread.author}`, detail: i.thread.replies.length ? `마지막 답글: @${i.thread.replies.at(-1)!.author}` : undefined, i })),
-        { title: "받은 질문" },
+        [
+          ...reviews.map((r) => ({ label: `$(eye) 리뷰 차례: ${r.epic}`, description: `${r.phase} · ${r.tier} 티어`, epic: r.epic, commit: r.commit as string | undefined })),
+          ...items.map((i) => ({ label: i.thread.body.split("\n")[0]!.slice(0, 80), description: `${i.epic} · ${i.thread.id} · @${i.thread.author}`, detail: i.thread.replies.length ? `마지막 답글: @${i.thread.replies.at(-1)!.author}` : undefined, epic: i.epic, commit: i.commit })),
+        ],
+        { title: "받은 질문·리뷰 차례" },
       );
-      if (p) await openViewer(p.i.epic, p.i.commit);
+      if (p) await openViewer(p.epic, p.commit);
+    }),
+
+    run("flightdeck.requestReview", async () => {
+      const c = needOwner();
+      const r = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Flightdeck: ${c.epic} 리뷰 요청 (공유 → 서버 서명)` }, () => c.wf.requestReview(c.epic));
+      if (!r.ok) return void vscode.window.showWarningMessage(`아직 리뷰를 요청할 수 없습니다:\n${r.problems.map((p) => `• ${p}`).join("\n")}`, { modal: true });
+      await refresh();
+      const cur = reviewOf(r.state)?.current;
+      vscode.window.showInformationMessage(cur ? `Flightdeck: 리뷰를 요청했습니다. 지금 차례: ${cur.name} 티어 (${cur.reviewers.map((m) => "@" + m).join(" ")})` : `Flightdeck: 리뷰어가 있는 티어가 없어 ${r.state.phase}로 넘어갔습니다.`);
+    }),
+
+    run("flightdeck.approve", async () => {
+      const c = need();
+      const s0 = await c.wf.epicState(c.epic);
+      const cur = reviewOf(s0)?.current;
+      const ok = await vscode.window.showInformationMessage(`${c.epic} ${s0.phase}를 ${cur?.name ?? ""} 티어로 승인할까요? 리뷰 요청된 문서에 대한 승인으로 서버가 서명합니다.`, { modal: true }, "승인");
+      if (!ok) return;
+      const s = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Flightdeck: 승인 (서버 서명)" }, () => c.wf.approve(c.epic));
+      await refresh();
+      vscode.window.showInformationMessage(s.phase !== s0.phase ? `Flightdeck: 모든 티어가 승인해 ${s.phase}로 넘어갔습니다.` : `Flightdeck: 승인했습니다. 다음 차례: ${reviewOf(s)?.current?.name ?? "-"} 티어`);
+    }),
+
+    // 쓰레드 초안 (§3.2 v0.13): 에이전트가 쓴 것을 확인해 올리거나 버린다
+    run("flightdeck.postDraft", async (thread: vscode.CommentThread) => {
+      const c = need();
+      const d = view?.draftOf(thread);
+      if (!d) return;
+      const id = await c.wf.postDraft(c.epic, d.file, d.key);
+      await refresh();
+      vscode.window.showInformationMessage(`Flightdeck: 초안을 올렸습니다 (${id}).`);
+    }),
+    run("flightdeck.discardDraft", async (thread: vscode.CommentThread) => {
+      const c = need();
+      const d = view?.draftOf(thread);
+      if (d) await c.wf.discardDraft(c.epic, d.file, d.key);
+      await refresh();
+    }),
+    run("flightdeck.postAllDrafts", async () => {
+      const c = need();
+      const all = await c.wf.drafts(c.epic);
+      const ok = all.filter((x) => !x.draft.error);
+      const pick = await vscode.window.showInformationMessage(`쓰레드 초안 ${ok.length}개를 @${c.wf.cfg.member} 이름으로 올릴까요?${all.length > ok.length ? ` (형식 오류 ${all.length - ok.length}개는 건너뜀)` : ""}`, { modal: true }, "모두 올리기");
+      if (!pick) return;
+      const failed: string[] = [];
+      for (const x of ok) await c.wf.postDraft(c.epic, x.file, x.draft.key).catch((e) => failed.push(`${x.draft.body.slice(0, 30)}…: ${(e as Error).message}`));
+      await refresh();
+      if (failed.length) vscode.window.showWarningMessage(`Flightdeck: ${failed.length}개를 올리지 못했습니다:\n${failed.join("\n")}`, { modal: true });
+      else vscode.window.showInformationMessage(`Flightdeck: 초안 ${ok.length}개를 올렸습니다.`);
+    }),
+
+    // 내 에이전트에게 묻기 (§3.6): 이 창에서 Claude Code를 연다. 리뷰 정책 훅이 걸려 있어 기록되지 않고 초안만 쓴다
+    run("flightdeck.askAgent", async (thread?: vscode.CommentThread) => {
+      const c = need();
+      const id = thread ? view?.idOf(thread) : null;
+      const q = await vscode.window.showInputBox({ title: "내 에이전트에게 묻기", prompt: id ? `${id} 쓰레드에 대해` : "예: 설계 문서에 재사용 탐지 처리가 담겼는지 검사하고, 빠졌으면 리스크 문단에 수정 요청 초안을 달아 줘", ignoreFocusOut: true });
+      if (q === undefined) return;
+      const prompt = id ? `${id} 쓰레드(flightdeck_list_threads)에 대해: ${q}` : q;
+      const env = Object.fromEntries(Object.keys(process.env).filter((k) => !(k in cleanEnv())).map((k) => [k, null]));
+      const term = vscode.window.createTerminal({ name: `Flightdeck 묻기 ${c.epic}`, cwd: c.worktree, env: env as Record<string, null> });
+      term.show();
+      term.sendText(`${c.wf.cfg.adapter.id === "claude-code" ? "claude" : c.wf.cfg.adapter.id} ${JSON.stringify(prompt)}`);
     }),
 
     run("flightdeck.login", async () => {
@@ -713,7 +849,7 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     void runScenario(
       {
         wf: ctx.wf, epic: ctx.epic, worktree: ctx.worktree, role: ctx.role,
-        commentThread: (id) => view?.get(id), commentThreadCount: () => view?.size ?? 0, statusText: () => status.text,
+        commentThread: (id) => view?.get(id), draftThreads: () => view?.draftList() ?? [], commentThreadCount: () => view?.size ?? 0, statusText: () => status.text,
         notifications: notified, refresh, openViewer,
       },
       scenario,
