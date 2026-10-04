@@ -19,6 +19,8 @@ const data = {
     kind: z.enum(["question", "change_request", "note"]),
     to: z.array(MemberId),
     body: z.string().min(1),
+    /** 문서 공유 커밋: 질문 대상이 이 커밋으로 문서를 본다 (§3.1, §2.4) */
+    commit: GitSha.optional(),
   }),
   "thread.replied": z.object({
     thread: ThreadId,

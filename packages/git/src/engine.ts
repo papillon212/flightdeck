@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile, copyFile, stat, utimes } from 
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { git, RAW_ARGS, RAW_ENV } from "./exec.ts";
+import { git, GitError, isMissingRemoteRef, RAW_ARGS, RAW_ENV } from "./exec.ts";
 
 const ZERO = "0000000000000000000000000000000000000000";
 
@@ -83,6 +83,50 @@ export class GitEngine {
     if (exists) await this.g(["worktree", "add", "-q", wt, branch]);
     else await this.g(["worktree", "add", "-q", "-b", branch, wt, baseSha]);
     return { path: wt, branch, baseSha };
+  }
+
+  static remoteEpicRef(epic: string, remote = "origin"): string {
+    return `refs/remotes/${remote}/${GitEngine.epicBranch(epic)}`;
+  }
+
+  /** 에픽 브랜치를 원격에 올린다 (문서 공유 커밋, 설계 §3.1 thread.created.commit). fast-forward만 */
+  async pushEpicBranch(epic: string, remote = "origin"): Promise<string> {
+    const branch = GitEngine.epicBranch(epic);
+    const sha = await this.revParse(`refs/heads/${branch}`);
+    await this.g(["push", "-q", "--no-verify", remote, `${sha}:refs/heads/${branch}`]);
+    await this.g(["update-ref", GitEngine.remoteEpicRef(epic, remote), sha]);
+    return sha;
+  }
+
+  /** 원격 에픽 브랜치를 받는다. 없으면 null */
+  async fetchEpicBranch(epic: string, remote = "origin"): Promise<string | null> {
+    const branch = GitEngine.epicBranch(epic);
+    try {
+      await this.g(["fetch", "-q", "--no-tags", remote, `+refs/heads/${branch}:${GitEngine.remoteEpicRef(epic, remote)}`]);
+    } catch (e) {
+      if (e instanceof GitError && isMissingRemoteRef(e)) return null;
+      throw e;
+    }
+    return this.revParse(GitEngine.remoteEpicRef(epic, remote));
+  }
+
+  /**
+   * 질문 대상의 읽기 전용 창 (설계 §2.4): 에픽 브랜치의 지정 커밋(없으면 원격 끝)을 분리(detached) 상태로 연다.
+   * 이 창의 파일은 렌더링만 바뀌므로, 다시 열 때는 그 변경을 버리고 새 커밋으로 옮긴다.
+   */
+  async openViewWorktree(epic: string, commit?: string, remote = "origin"): Promise<{ path: string; commit: string }> {
+    const target = commit ?? (await this.fetchEpicBranch(epic, remote));
+    if (!target) throw new Error(`원격에 에픽 브랜치가 없다: ${GitEngine.epicBranch(epic)}`);
+    if (!(await this.tryRevParse(`${target}^{commit}`))) await this.fetchEpicBranch(epic, remote);
+    const wt = this.worktreePath(epic);
+    await this.ensureExcludes();
+    if (existsSync(wt)) {
+      await this.g(["checkout", "-q", "-f", "--detach", target], wt);
+    } else {
+      await mkdir(path.dirname(wt), { recursive: true });
+      await this.g(["worktree", "add", "-q", "--detach", wt, target]);
+    }
+    return { path: wt, commit: target };
   }
 
   async removeWorktree(name: string, force = false): Promise<void> {

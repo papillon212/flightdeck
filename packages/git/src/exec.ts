@@ -10,6 +10,11 @@ export class GitError extends Error {
   }
 }
 
+/** fetch 대상 ref가 원격에 없다는 오류인가 */
+export function isMissingRemoteRef(e: GitError): boolean {
+  return /couldn't find remote ref/i.test(e.stderr);
+}
+
 export interface GitOptions {
   cwd: string;
   env?: Record<string, string>;
