@@ -1,0 +1,134 @@
+// 서버 서명 이벤트 요청 처리 (설계 §3.1, §4.2, §12 "서명 요청").
+// 제품 레포의 서버 쪽 사본(bare)에서 메타 브랜치를 받아 reducer로 현재 상태를 계산하고,
+// 요청자·차례·관문·artifact_hash를 확인한 뒤 author=요청자로 서명해 메타 브랜치에 push한다.
+import { existsSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
+import path from "node:path";
+import { artifactHash, checkSections, nowIso, reduce, signEvent, ulid } from "@flightdeck/core";
+import { git, GitEngine, GitError, RemoteEventStore } from "@flightdeck/git";
+import { Event as EventSchema, parsePipeline, PHASE_ARTIFACT, type Event, type Phase, type Trust } from "@flightdeck/schema";
+import type { Member, ServerStore } from "./store.ts";
+
+export class RequestError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+export interface EventRequest {
+  product: string;
+  epic: string;
+  type: string;
+  data: Record<string, unknown>;
+}
+
+export const SERVER_IDENTITY = { name: "flightdeck-server", email: "flightdeck-server@localhost" };
+
+export class EventSigner {
+  private queues = new Map<string, Promise<unknown>>();
+
+  constructor(
+    private deps: { store: ServerStore; dataDir: string; privateKeyPem: string; publicKey: string },
+  ) {}
+
+  /** 제품 레포의 서버 쪽 사본. 없으면 만든다 */
+  async mirror(product: string): Promise<{ dir: string; target: string }> {
+    const cfg = await this.deps.store.currentConfig(product);
+    if (!cfg) throw new RequestError(404, `설정이 없는 제품: ${product}`);
+    const pipeline = parsePipeline(cfg.pipeline_yaml);
+    const dir = path.join(this.deps.dataDir, "repos", `${product}.git`);
+    if (!existsSync(dir)) {
+      await mkdir(path.dirname(dir), { recursive: true });
+      await git(["clone", "-q", "--bare", "--no-tags", pipeline.repo, dir], { cwd: this.deps.dataDir });
+      for (const [k, v] of [["user.name", SERVER_IDENTITY.name], ["user.email", SERVER_IDENTITY.email]]) await git(["config", k!, v!], { cwd: dir });
+    }
+    return { dir, target: pipeline.landing.target };
+  }
+
+  async trust(): Promise<Trust> {
+    const deactivated: Record<string, string> = {};
+    for (const m of await this.deps.store.listMembers()) if (m.deactivated_at) deactivated[m.id] = m.deactivated_at;
+    return { mode: "server", serverKey: this.deps.publicKey, deactivated };
+  }
+
+  /** 제품별로 한 번에 하나씩 처리한다 (같은 사본·메타 브랜치를 쓰므로) */
+  request(member: Member, req: EventRequest): Promise<{ event: Event; pushed: boolean }> {
+    const prev = this.queues.get(req.product) ?? Promise.resolve();
+    const run = prev.catch(() => undefined).then(() => this.handle(member, req));
+    this.queues.set(req.product, run);
+    return run;
+  }
+
+  private async handle(member: Member, req: EventRequest): Promise<{ event: Event; pushed: boolean }> {
+    if (!member.active) throw new RequestError(403, `비활성 멤버: ${member.id}`);
+    const { dir, target } = await this.mirror(req.product);
+    const store = new RemoteEventStore(dir, "origin", { author: SERVER_IDENTITY });
+    try {
+      await store.sync();
+    } catch (e) {
+      throw new RequestError(503, `메타 브랜치를 받지 못함: ${e instanceof Error ? e.message : e}`);
+    }
+    const trust = await this.trust();
+    const events = await store.list(req.epic);
+    const state = reduce(req.epic, events, trust);
+    const eng = new GitEngine(dir);
+
+    let data: Record<string, unknown>;
+    switch (req.type) {
+      case "epic.started": {
+        const cfg = (await this.deps.store.currentConfig(req.product))!;
+        const base = String(req.data.base_sha ?? "");
+        await git(["fetch", "-q", "--no-tags", "origin", `+refs/heads/${target}:refs/remotes/origin/${target}`], { cwd: dir });
+        if (!/^[0-9a-f]{40}$/.test(base) || !(await isAncestor(dir, base, `refs/remotes/origin/${target}`))) {
+          throw new RequestError(409, `base_sha가 원격 ${target}에 없음: ${base || "(없음)"}`);
+        }
+        data = { tracker_ref: String(req.data.tracker_ref ?? req.epic), owner: member.id, base_sha: base, config_version: cfg.version };
+        break;
+      }
+      case "phase.completed": {
+        const phase = String(req.data.phase ?? "") as Phase;
+        const artifact = PHASE_ARTIFACT[phase as keyof typeof PHASE_ARTIFACT];
+        if (!artifact) throw new RequestError(400, `산출물이 없는 단계: ${phase}`);
+        const head = await eng.fetchEpicBranch(req.epic).catch((e) => {
+          throw new RequestError(503, `에픽 브랜치를 받지 못함: ${e instanceof Error ? e.message : e}`);
+        });
+        if (!head) throw new RequestError(409, "에픽 브랜치가 원격에 없음. 산출물을 먼저 공유해야 한다");
+        const file = `.flightdeck/epics/${req.epic}/${artifact.file}`;
+        const text = await git(["show", `${head}:${file}`], { cwd: dir }).catch(() => null);
+        if (text === null) throw new RequestError(409, `에픽 브랜치에 ${artifact.file}가 없음`);
+        const sections = checkSections(text, artifact.sections);
+        if (!sections.ok) throw new RequestError(409, `${artifact.file} 형식 문제: ${JSON.stringify({ missing: sections.missing, outOfOrder: sections.outOfOrder, empty: sections.empty })}`);
+        const hash = artifactHash(text);
+        if (req.data.artifact_hash !== undefined && req.data.artifact_hash !== hash) {
+          throw new RequestError(409, `에픽 브랜치에 올라간 ${artifact.file}가 요청한 내용과 다름. 먼저 공유해야 한다`);
+        }
+        data = { phase, artifact_hash: hash };
+        break;
+      }
+      default:
+        throw new RequestError(400, `서버 서명을 지원하지 않는 이벤트: ${req.type}`);
+    }
+
+    const unsigned = EventSchema.parse({ v: 1, id: ulid(), type: req.type, epic: req.epic, author: member.id, at: nowIso(), data }) as Event;
+    const event = signEvent(unsigned, this.deps.privateKeyPem);
+    const ignored = reduce(req.epic, [...events, event], trust).ignored.find((i) => i.event === event.id);
+    if (ignored) throw new RequestError(409, `${req.type} 거부: ${ignored.reason} (요청자: ${member.id}, 현재 단계: ${state.phase})`);
+
+    await store.append(event); // 로컬 커밋 후 push. push 실패분은 다음 요청·주기에 다시 보낸다
+    const r = await store.sync().catch(() => ({ pending: 1 }));
+    return { event, pushed: r.pending === 0 };
+  }
+}
+
+async function isAncestor(cwd: string, a: string, b: string): Promise<boolean> {
+  try {
+    await git(["merge-base", "--is-ancestor", a, b], { cwd });
+    return true;
+  } catch (e) {
+    if (e instanceof GitError) return false;
+    throw e;
+  }
+}

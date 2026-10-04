@@ -29,7 +29,7 @@ const Skip = z.object({
   tiers: z.array(z.string()).min(1),
 });
 
-/** pipeline.yaml (설계 §5). 설정 레포 flightdeck-config/products/<product>/에 있다 */
+/** pipeline.yaml (설계 §5). 서버 DB의 제품별 설정 버전에 있고, 어드민 화면에서 편집한다 (§2.5) */
 export const Pipeline = z.object({
   version: z.literal(1),
   product: z.string().min(1),
@@ -42,9 +42,9 @@ export const Pipeline = z.object({
     max_turns: z.number().int().positive().default(200),
   }),
 
+  /** 그룹만 둔다. 멤버 자체(이메일·일감 도구 ID)는 서버 어드민의 멤버 목록에 있다 (§2.5) */
   members: z.object({
     groups: z.record(z.string(), z.array(MemberId)).default({}),
-    tracker_ids: z.record(MemberId, z.union([z.number(), z.string()])).default({}),
   }),
 
   tracker: z.looseObject({ provider: z.string().min(1) }),

@@ -1,4 +1,4 @@
-# 설정 레포 템플릿 (설계 §2.5, §5). design.md §5 예시에서 만든 견본
+# 제품 설정 견본 (설계 §2.5, §5). design.md §5 예시에서 만든 것. 서버 초기 데이터로 가져올 수 있다
 version: 1
 product: sample
 repo: git@github.com:example/sample.git
@@ -10,15 +10,11 @@ agent:
     claude-code: claude-opus-5-5
   max_turns: 200
 
-members:                           # 공개키는 flightdeck-config/members/
+members:                           # 멤버 자체(이메일·일감 도구 ID)는 서버 어드민의 멤버 목록에서 관리
   groups:
     leads: [kim]
     architects: [park, lee]
     qa: [choi]
-  tracker_ids:
-    dh.lee: 1111111
-    kim: 1234567
-    park: 2345678
 
 tracker:
   provider: clickup

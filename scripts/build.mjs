@@ -1,6 +1,7 @@
 // 실행물 묶기
 // - dist/flightdeck-hook.mjs, dist/flightdeck-mcp.mjs: 훅 CLI, MCP 서버 (Node 단일 파일, ESM)
 // - dist/fd-demo.mjs: 데모·통합 확인 스크립트
+// - dist/flightdeck-server.mjs: flightdeck-server (설계 §11.5)
 // - packages/vscode/ext/: VS Code 확장 (dist/extension.cjs + 위 실행 파일 + 내장 견본 설정)
 import { build } from "esbuild";
 import { cp, mkdir, rm } from "node:fs/promises";
@@ -23,6 +24,8 @@ await Promise.all([
   build({ ...esm, entryPoints: ["packages/hook/src/main.ts"], outfile: "dist/flightdeck-hook.mjs" }),
   build({ ...esm, entryPoints: ["packages/mcp/src/main.ts"], outfile: "dist/flightdeck-mcp.mjs" }),
   build({ ...esm, entryPoints: ["packages/vscode/src/demo.ts"], outfile: "dist/fd-demo.mjs" }),
+  // pg의 선택 의존성(pg-native)은 쓰지 않는다
+  build({ ...esm, entryPoints: ["packages/server/src/main.ts"], outfile: "dist/flightdeck-server.mjs", external: ["pg-native"] }),
   build({ ...common, format: "cjs", entryPoints: ["packages/vscode/src/extension.ts"], outfile: "packages/vscode/ext/dist/extension.cjs", external: ["vscode"] }),
 ]);
 
@@ -31,4 +34,4 @@ await mkdir(`${ext}/dist`, { recursive: true });
 for (const f of ["flightdeck-hook.mjs", "flightdeck-mcp.mjs"]) await cp(`dist/${f}`, `${ext}/dist/${f}`);
 await rm(`${ext}/config`, { recursive: true, force: true });
 await cp("examples/flightdeck-config/products/sample", `${ext}/config/sample`, { recursive: true });
-console.log("built dist/{flightdeck-hook,flightdeck-mcp,fd-demo}.mjs, packages/vscode/ext/{dist,config}");
+console.log("built dist/{flightdeck-hook,flightdeck-mcp,fd-demo,flightdeck-server}.mjs, packages/vscode/ext/{dist,config}");

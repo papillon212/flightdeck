@@ -87,6 +87,16 @@
 | M2-1 | (이번 커밋) | 정규화 JSON(RFC 8785 숫자 예 포함), ed25519 서버 서명·검증, reducer의 신뢰 기준(`server`/`dev`). 서명 없음·다른 키·서명 뒤 변조·서명 없는 `epic.started`(에픽 위조)·비활성 멤버를 테스트. 훅·MCP는 로컬 상태 파일의 `trust`로 같은 기준을 쓴다. 테스트 98개 |
 | M2-2 | (이번 커밋) | `RemoteEventStore`(sync·watch·이력 재작성 감지), 에픽 브랜치 공유·읽기 전용 창. 로컬 bare 원격 테스트 7개 5회 반복 통과. GitHub 결과는 아래 |
 
+| M2-3 | (이번 커밋) | `packages/server`: 저장소(메모리·PostgreSQL), 개발용 로그인(루프백만, 루프백이 아닌 주소에서 켜면 시작 거부), Google 로그인(코드만, OAuth 클라이언트 없어 미확인), `GET /me`·`/config`(서명)·`POST /events`, 어드민 화면(멤버, 파이프라인·룰 편집 = 새 설정 버전, 변경 이력). 설정 검증 `verifyConfig`는 확장도 쓰도록 core에 둠. 테스트 9개(PostgreSQL은 `FD_TEST_PG`일 때) |
+
+### M2-3에서 정한 처리
+
+- **서버 서명 요청 처리** (`POST /events`): 제품 레포의 서버 쪽 사본(bare)에서 메타 브랜치를 sync하고 reducer로 다시 계산한다. 서명한 후보 이벤트를 넣은 결과에서 무시되면(권한·차례·관문) 409로 이유를 돌려준다. 제품별로 하나씩 처리한다(동시 시작 3건 → 1건만 성공).
+- **에픽 시작**: `owner`는 요청자, `config_version`은 현재 설정 버전으로 서버가 채운다(요청 값은 무시). `base_sha`는 원격 main에서 닿는 커밋이어야 한다.
+- **단계 완료**: 에픽 브랜치를 fetch해 산출물을 읽는다. 형식 검사(§6.3)를 하고 `artifact_hash`를 서버가 계산한다. 요청에 해시가 있으면 같아야 한다. 확장은 산출물을 커밋·push한 뒤 요청해야 한다.
+- 파이프라인의 `members.tracker_ids`를 없애고 멤버 목록의 `tracker_id`로 옮겼다(v0.12 §5).
+- 설정 응답에 멤버 이메일은 넣지 않는다.
+
 ### M2-2 GitHub 확인 (2026-10-04, `spikes/12-meta-github/check.ts`)
 
 `papillon212/test-flightdeck`, 클론 2개(A, B). 확인 후 시험 브랜치는 지웠다.
