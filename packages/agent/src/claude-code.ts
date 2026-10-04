@@ -11,10 +11,12 @@ const EVENT_KIND: Record<string, HookEventKind> = {
   UserPromptSubmit: "prompt.submit",
   PreToolUse: "tool.before",
   PostToolUse: "tool.after",
+  // 실패한 도구 호출(예: 종료 코드가 0이 아닌 Bash)은 PostToolUse 대신 이 훅이 온다 (M4 제안 X9)
+  PostToolUseFailure: "tool.after",
   Stop: "session.stop",
   SessionEnd: "session.end",
 };
-const HOOK_NAME = Object.fromEntries(Object.entries(EVENT_KIND).map(([k, v]) => [v, k])) as Record<HookEventKind, string>;
+const HOOK_NAME = { "session.start": "SessionStart", "prompt.submit": "UserPromptSubmit", "tool.before": "PreToolUse", "tool.after": "PostToolUse", "session.stop": "Stop", "session.end": "SessionEnd" } as Record<HookEventKind, string>;
 
 const WRITE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 const READ_TOOLS = new Set(["Read", "Grep", "Glob", "LS", "NotebookRead"]);
@@ -86,6 +88,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
         UserPromptSubmit: entry(),
         PreToolUse: entry("*"),
         PostToolUse: entry("*"),
+        PostToolUseFailure: entry("*"),
         Stop: entry(),
         SessionEnd: entry(),
       },
@@ -125,6 +128,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
         command: typeof input.command === "string" ? input.command : undefined,
         input,
         response: r.tool_response,
+        ...(r.hook_event_name === "PostToolUseFailure" ? { failed: true, error: typeof r.error === "string" ? r.error : undefined } : {}),
       };
     }
     return ev;
@@ -139,7 +143,8 @@ export class ClaudeCodeAdapter implements AgentAdapter {
       return { stdout: JSON.stringify({ hookSpecificOutput: { hookEventName, permissionDecision: "deny", permissionDecisionReason: r.reason } }), exitCode: 0 };
     }
     if (!["session.start", "prompt.submit", "tool.after"].includes(event.kind)) return { stdout: "", exitCode: 0 };
-    return { stdout: JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext: r.text } }), exitCode: 0 };
+    const name = event.tool?.failed ? "PostToolUseFailure" : hookEventName;
+    return { stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: name, additionalContext: r.text } }), exitCode: 0 };
   }
 
   extractEdits(_event: HookEvent, before: FileSnapshot, after: FileSnapshot) {

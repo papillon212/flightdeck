@@ -9,6 +9,7 @@
   "dependencies": {
     "@flightdeck/core": "workspace:*",
     "@flightdeck/git": "workspace:*",
+    "@flightdeck/hook": "workspace:*",
     "@flightdeck/schema": "workspace:*"
   }
 }

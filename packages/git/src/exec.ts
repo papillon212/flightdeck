@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 
 export class GitError extends Error {
   constructor(
@@ -35,6 +35,27 @@ export function git(args: string[], opts: GitOptions): Promise<string> {
     );
     if (opts.input !== undefined) child.stdin!.end(opts.input);
   });
+}
+
+/** 바이너리 출력용 git 실행 (압축한 세션 원본 blob 등) */
+export function gitBuffer(args: string[], opts: GitOptions): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    execFile("git", args, { cwd: opts.cwd, env: { ...process.env, ...opts.env }, maxBuffer: 1 << 28, encoding: "buffer" }, (err, stdout, stderr) => {
+      if (err) reject(new GitError(args, typeof err.code === "number" ? err.code : null, stderr.toString("utf8")));
+      else resolve(stdout);
+    });
+  });
+}
+
+/**
+ * ref를 원격에 올리는 git push를 분리된 백그라운드 프로세스로 띄운다 (M4 제안 X7).
+ * 훅 안에서 push를 기다리면 에이전트가 원격 왕복(GitHub 약 4초)만큼 멈춘다. 실패하면 다음 push가 다시 올린다
+ */
+export function pushDetached(cwd: string, remote: string, refs: string[]): void {
+  if (!refs.length) return;
+  const child = spawn("git", ["push", "-q", "--no-verify", remote, ...refs.map((r) => `${r}:${r}`)], { cwd, detached: true, stdio: "ignore" });
+  child.on("error", () => {});
+  child.unref();
 }
 
 /**

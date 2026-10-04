@@ -6,13 +6,14 @@
 // session.stop   → 바뀐 게 있으면 체크포인트(§8.1)
 // session.end    → 체크포인트 + run.finished
 import { existsSync, realpathSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { checkParagraphIds, nowIso, pipelineFromDir, reduce, reviewOf, sha256, ulid } from "@flightdeck/core";
 import type { EditRecord, EditSource, Event, LocalEpicState } from "@flightdeck/schema";
 import type { AgentAdapter, HookEvent, HookResponse } from "@flightdeck/agent";
-import { git, GitEngine, isSecret, LocalEventStore, RAW_ARGS, RAW_ENV } from "@flightdeck/git";
+import { git, GitEngine, isSecret, LocalEventStore, pushDetached, RAW_ARGS, RAW_ENV, RunStore } from "@flightdeck/git";
 import { phaseChangedContext, sessionContext, viewerContext } from "./context.ts";
+import { saveTranscript } from "./impl.ts";
 import { decide } from "./policy.ts";
 import { appendEditRecords, hookLog, lastSeq, saveSnapshot, takeSnapshot, updateState } from "./store.ts";
 
@@ -36,6 +37,8 @@ export async function handle(ev: HookEvent, d: HandlerDeps): Promise<HookRespons
       return onToolAfter(ev, d);
     case "session.stop":
       await checkpoint(ev, d, "턴 종료");
+      await storeTranscript(ev, d);
+      pushRefs(d);
       return { kind: "allow" };
     case "session.end":
       await onSessionEnd(ev, d);
@@ -202,8 +205,10 @@ async function onToolAfter(ev: HookEvent, d: HandlerDeps): Promise<HookResponse>
     }
   };
 
+  // 구현 단계의 편집은 지금 열린 Step(마지막 기록 + 1)에 속한다 (M4 제안 X2)
+  const step = s.phase === "IMPLEMENTATION" ? { step: s.impl_step + 1 } : {};
   if (snap.files) {
-    const source: EditSource = { kind: "agent", member: s.member, adapter: d.adapter.id, run: run.run_id, prompt_id: ev.promptId, tool_use_id: t.useId };
+    const source: EditSource = { kind: "agent", member: s.member, adapter: d.adapter.id, run: run.run_id, ...step, prompt_id: ev.promptId, tool_use_id: t.useId };
     for (const [file, before] of Object.entries(snap.files)) {
       const abs = path.join(worktree, file);
       push(file, before, existsSync(abs) ? await readFile(abs, "utf8") : null, source);
@@ -213,7 +218,7 @@ async function onToolAfter(ev: HookEvent, d: HandlerDeps): Promise<HookResponse>
     const eng = new GitEngine(s.repo, { excludeSecrets: s.excludeSecrets });
     const after = await eng.snapshotTree(worktree);
     if (after !== snap.tree) {
-      const source: EditSource = { kind: "agent_shell", member: s.member, run: run.run_id, cmd: t.command ?? t.name };
+      const source: EditSource = { kind: "agent_shell", member: s.member, run: run.run_id, ...step, cmd: t.command ?? t.name };
       const changed = (await git(["diff-tree", "-r", "-z", "--no-renames", snap.tree, after], { cwd: worktree })).split("\0").filter(Boolean);
       for (let i = 0; i < changed.length; i += 2) {
         const [, , preBlob, postBlob, status] = changed[i]!.split(" ") as [string, string, string, string, string];
@@ -225,6 +230,7 @@ async function onToolAfter(ev: HookEvent, d: HandlerDeps): Promise<HookResponse>
   }
   const added = await appendEditRecords(d.dataDir, s.epic, records);
   if (added.length) await hookLog(d.dataDir, s.epic, { kind: "edits", tool: t.name, seq: added.map((r) => r.seq) });
+  if (s.phase === "IMPLEMENTATION") await trace(d, ev, added, worktree);
   if (reverted.length) {
     return {
       kind: "context",
@@ -239,6 +245,29 @@ function isArtifact(file: string, epic: string): boolean {
   return file === `.flightdeck/epics/${epic}/analysis.md` || file === `.flightdeck/epics/${epic}/design.md`;
 }
 
+/** trace.jsonl (§7.2): 구현 단계의 파일 편집·셸 명령. 편집 기록의 요약이라 실패해도 실행을 막지 않는다 */
+async function trace(d: HandlerDeps, ev: HookEvent, added: EditRecord[], worktree: string): Promise<void> {
+  const s = d.state;
+  const t = ev.tool!;
+  const base = { ts: iso(d), tool: t.name, step: s.impl_step + 1 };
+  const lines: Record<string, unknown>[] = [];
+  if (t.kind === "shell") lines.push({ ...base, cmd: t.command ?? "", ...(t.failed ? { failed: true } : {}) });
+  const byFile = new Map<string, [number, number]>();
+  for (const r of added) {
+    const abs = path.join(worktree, r.file);
+    const text = existsSync(abs) ? await readFile(abs, "utf8") : "";
+    const a = text.slice(0, r.range[0]).split("\n").length;
+    const b = text.slice(0, r.range[0] + r.insert.length).split("\n").length;
+    const cur = byFile.get(r.file);
+    byFile.set(r.file, cur ? [Math.min(cur[0], a), Math.max(cur[1], b)] : [a, b]);
+  }
+  for (const [file, range] of byFile) lines.push({ ...base, file, range });
+  if (!lines.length) return;
+  const f = path.join(worktree, ".flightdeck", "epics", s.epic, "trace.jsonl");
+  await mkdir(path.dirname(f), { recursive: true });
+  await appendFile(f, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+}
+
 async function checkpoint(ev: HookEvent, d: HandlerDeps, why: string): Promise<string | null> {
   const s = d.state;
   const run = s.runs[ev.sessionId];
@@ -248,8 +277,33 @@ async function checkpoint(ev: HookEvent, d: HandlerDeps, why: string): Promise<s
     epic: s.epic,
     member: s.member,
     message: `에이전트 체크포인트 (${why})`,
-    trailers: { "Flightdeck-Run": run.run_id, "Flightdeck-Source": "agent", "Flightdeck-Seq": String(await lastSeq(d.dataDir, s.epic)) },
+    trailers: {
+      "Flightdeck-Run": run.run_id,
+      ...(s.phase === "IMPLEMENTATION" ? { "Flightdeck-Step": String(s.impl_step + 1) } : {}),
+      "Flightdeck-Source": "agent",
+      "Flightdeck-Seq": String(await lastSeq(d.dataDir, s.epic)),
+    },
   });
+}
+
+/** 세션 원본 저장 (§6.4, X7): 턴이 끝날 때마다 그 세션 파일을 새로 쓴다. 기록 경로라 실패해도 막지 않는다 */
+async function storeTranscript(ev: HookEvent, d: HandlerDeps): Promise<void> {
+  const run = d.state.runs[ev.sessionId];
+  const filter = d.adapter.filterTranscriptItem?.bind(d.adapter);
+  if (!run || !ev.transcriptPath || !filter) return;
+  try {
+    const n = await saveTranscript(d.state, run.run_id, ev.sessionId, ev.transcriptPath, filter);
+    await hookLog(d.dataDir, d.state.epic, { kind: "transcript", run: run.run_id, items: n });
+  } catch (e) {
+    await hookLog(d.dataDir, d.state.epic, { kind: "error", event: "transcript", message: e instanceof Error ? e.message : String(e) });
+  }
+}
+
+/** 서버 모드: 체크포인트·세션 원본 ref를 백그라운드로 올린다 (§8.1, X7) */
+function pushRefs(d: HandlerDeps): void {
+  const s = d.state;
+  if (!s.product) return;
+  pushDetached(s.repo, s.gitRemote ?? "origin", [GitEngine.checkpointRef(s.epic, s.member), RunStore.ref(s.epic)]);
 }
 
 async function onSessionEnd(ev: HookEvent, d: HandlerDeps): Promise<void> {
@@ -257,6 +311,8 @@ async function onSessionEnd(ev: HookEvent, d: HandlerDeps): Promise<void> {
   const run = s.runs[ev.sessionId];
   if (!run) return;
   await checkpoint(ev, d, "세션 종료");
+  await storeTranscript(ev, d);
+  pushRefs(d);
   const eng = new GitEngine(s.repo);
   const ckpt = (await eng.tryRevParse(GitEngine.checkpointRef(s.epic, s.member))) ?? undefined;
   await new LocalEventStore(s.repo).append({

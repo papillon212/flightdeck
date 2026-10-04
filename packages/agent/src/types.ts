@@ -26,6 +26,9 @@ export interface HookEvent {
     command?: string;
     input: unknown;
     response?: unknown;
+    /** 도구 호출이 실패했다 (Claude Code PostToolUseFailure) */
+    failed?: boolean;
+    error?: string;
   };
   raw: unknown;
 }

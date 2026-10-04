@@ -24,9 +24,10 @@ describe("쓰기 권한 (설계 §6.2)", () => {
     expect(write("DESIGN", ".flightdeck/epics/CU-1/analysis.md").allow).toBe(false);
   });
 
-  it("IMPLEMENTATION: .flightdeck 밖 전체 + impl-log + handoff", () => {
+  it("IMPLEMENTATION: .flightdeck 밖 전체 + handoff. impl-log는 flightdeck_log_step으로만 (M4 X10)", () => {
     expect(write("IMPLEMENTATION", "src/app.ts").allow).toBe(true);
-    expect(write("IMPLEMENTATION", ".flightdeck/epics/CU-1/impl-log.md").allow).toBe(true);
+    expect(write("IMPLEMENTATION", ".flightdeck/epics/CU-1/impl-log.md").allow).toBe(false);
+    expect(write("IMPLEMENTATION", ".flightdeck/epics/CU-1/trace.jsonl").allow).toBe(false);
     expect(write("IMPLEMENTATION", ".flightdeck/epics/CU-1/state.json").allow).toBe(false);
   });
 

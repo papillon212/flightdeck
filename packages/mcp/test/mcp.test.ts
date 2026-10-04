@@ -44,9 +44,9 @@ const call = async (name: string, args: object = {}) => {
 };
 
 describe("flightdeck MCP 서버 (설계 §6.1)", () => {
-  it("tools/list: M1 도구 3개", async () => {
+  it("tools/list: M1 도구 3개 + M4 도구 3개", async () => {
     const r = (await handleRpc({ jsonrpc: "2.0", id: 1, method: "tools/list" }, { statePath })) as any;
-    expect(r.result.tools.map((t: any) => t.name)).toEqual(["flightdeck_get_epic", "flightdeck_list_threads", "flightdeck_get_handoffs"]);
+    expect(r.result.tools.map((t: any) => t.name)).toEqual(["flightdeck_get_epic", "flightdeck_list_threads", "flightdeck_get_handoffs", "flightdeck_search_run", "flightdeck_log_step", "flightdeck_submit"]);
   });
 
   it("get_epic, list_threads, get_handoffs", async () => {

@@ -63,7 +63,17 @@ export async function sessionContext(c: ContextInput): Promise<string> {
   return out.join("\n\n");
 }
 
-const TOOLS_LINES = ["## Flightdeck 도구 (MCP)", "- flightdeck_get_epic: 일감 원문과 현재 단계\n- flightdeck_list_threads: 쓰레드와 답글\n- flightdeck_get_handoffs: 이전 실행들의 인수인계 기록"];
+const TOOLS_LINES = [
+  "## Flightdeck 도구 (MCP)",
+  [
+    "- flightdeck_get_epic: 일감 원문과 현재 단계",
+    "- flightdeck_list_threads: 쓰레드와 답글",
+    "- flightdeck_get_handoffs: 이전 실행들의 인수인계 기록",
+    "- flightdeck_search_run: 이전 실행의 세션 원본(대화) 검색. \"왜 이렇게 했나\"는 여기서 찾는다",
+    "- flightdeck_log_step: (구현 단계) Step 기록",
+    "- flightdeck_submit: (구현 단계) 구현 관문 검사",
+  ].join("\n"),
+];
 
 /** 쓰레드 초안 블록 문법 (§3.2 v0.13). 사용자가 질문·답글·코멘트를 달라고 하면 이렇게 쓴다 */
 const DRAFT_LINES = [
@@ -119,6 +129,16 @@ function artifactLines(phase: Phase, epicDir: string, runId: string): string[] {
   const a = PHASE_ARTIFACT[phase as keyof typeof PHASE_ARTIFACT];
   const lines: string[] = [];
   if (a) lines.push(`- 파일: ${epicDir}/${a.file}`, `- 필수 섹션(이 순서, \`## 제목\`): ${a.sections.join(", ")}`);
+  if (phase === "IMPLEMENTATION") {
+    lines.push(
+      `- 기준 설계: ${epicDir}/design.md (통과한 설계. 고치지 않는다)`,
+      "- 코드: 작업 폴더의 제품 코드. git 명령은 쓰지 않는다(버전 관리는 Flightdeck이 한다)",
+      `- 구현 기록: ${epicDir}/impl-log.md. **직접 쓰지 말고** Step 하나를 끝낼 때마다 flightdeck_log_step으로 기록한다.`,
+      "  넘기는 것: title, design_ref(design.md#p:xxxx — 이 Step이 구현한 설계 문단 ID), intent(의도), decision(결정), alternatives(검토한 대안), review_points(리뷰 포인트), verification(확인한 명령과 결과).",
+      "  체크포인트와 바뀐 줄 범위(changes)는 Flightdeck이 채운다. 기록하지 않은 Step의 편집은 '설명 없는 변경'으로 제출이 막힌다.",
+      "- 제출 전 flightdeck_submit으로 구현 관문(impl-log 형식, 설명 없는 변경)을 검사한다.",
+    );
+  }
   lines.push(`- 인수인계 기록: ${epicDir}/runs/${runId}/handoff.md`, `  첫 줄 \`# Run ${runId} · ${phase}\`, 섹션(\`## 제목\`): ${HANDOFF_SECTIONS.join(", ")}`);
   return lines;
 }

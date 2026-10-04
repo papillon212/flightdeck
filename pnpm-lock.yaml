@@ -74,6 +74,9 @@ importers:
       '@flightdeck/git':
         specifier: workspace:*
         version: link:../git
+      '@flightdeck/hook':
+        specifier: workspace:*
+        version: link:../hook
       '@flightdeck/schema':
         specifier: workspace:*
         version: link:../schema

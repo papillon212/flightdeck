@@ -69,6 +69,18 @@ export function diffToEdits(before: string, after: string): TextEdit[] {
   return edits;
 }
 
+/** 변경 전후를 편집 기록(seq 없음)으로 바꾼다. before null = 새 파일, after null = 삭제 */
+export function diffRecords(epic: string, file: string, before: string | null, after: string | null, source: EditRecord["source"], ts: string): Omit<EditRecord, "seq">[] {
+  if (before === after) return [];
+  if (after === null) return [{ epic, file, base_hash: sha256(before), range: [0, 0], insert: "", delete_file: true, source, ts }];
+  let base: string | null = before;
+  return diffToEdits(before ?? "", after).map((e) => {
+    const r = { epic, file, base_hash: sha256(base), range: e.range, insert: e.insert, source, ts };
+    base = applyTextEdit(base ?? "", e);
+    return r;
+  });
+}
+
 export interface ReplayResult {
   files: Map<string, string | null>;
   /** base_hash가 재적용 상태와 맞지 않은 레코드 (순서 검증 실패, §8.6) */

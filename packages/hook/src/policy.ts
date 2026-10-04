@@ -112,7 +112,8 @@ function writeAllowed(phase: Phase, r: string, epicDir: string, runId: string | 
     case "DESIGN":
       return r === `${epicDir}/design.md` || r === handoff;
     case "IMPLEMENTATION":
-      return !r.startsWith(".flightdeck/") || r === `${epicDir}/impl-log.md` || r === handoff;
+      // impl-log는 flightdeck_log_step으로만, trace는 훅이 쓴다 (M4 제안 X1·X10)
+      return !r.startsWith(".flightdeck/") || r === handoff;
     default:
       return false;
   }
@@ -122,6 +123,7 @@ function allowedWritesHint(phase: Phase, epicDir: string, runId: string | null):
   const handoff = runId ? `, ${epicDir}/runs/${runId}/handoff.md` : "";
   if (phase === "ANALYSIS") return `쓸 수 있는 파일: ${epicDir}/analysis.md${handoff}`;
   if (phase === "DESIGN") return `쓸 수 있는 파일: ${epicDir}/design.md${handoff}`;
+  if (phase === "IMPLEMENTATION") return `구현 기록(impl-log.md)은 flightdeck_log_step 도구로 씁니다. .flightdeck/ 안에서 직접 쓸 수 있는 것은 이번 실행의 인수인계 기록(${epicDir}/runs/<run-id>/handoff.md)뿐입니다.`;
   return "";
 }
 
