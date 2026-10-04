@@ -2,6 +2,9 @@ import { z } from "zod";
 import { Anchor } from "./anchor.ts";
 import { EpicId, GitSha, MemberId, Phase, Sha256, ThreadId, Timestamp, Ulid } from "./common.ts";
 
+/** 구현 관문 명령의 실행 결과 (§7.5). 전체 로그는 세션 원본 ref에 두고 해시만 남긴다 */
+export const GateCommands = z.array(z.object({ cmd: z.string().min(1), exit: z.number().int(), summary: z.string(), log_hash: Sha256 }));
+
 /** 이벤트 종류별 data (설계 §3.1 표) */
 const data = {
   "epic.started": z.object({
@@ -57,10 +60,7 @@ const data = {
     ckpt_from: GitSha.optional(),
     ckpt_to: GitSha.optional(),
   }),
-  "gate.reported": z.object({
-    commit: GitSha,
-    commands: z.array(z.object({ cmd: z.string(), exit: z.number().int(), summary: z.string(), log_hash: Sha256 })),
-  }),
+  "gate.reported": z.object({ commit: GitSha, commands: GateCommands }),
   "pilot.changed": z.object({
     from: MemberId,
     to: MemberId,

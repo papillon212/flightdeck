@@ -154,6 +154,23 @@ export class GitEngine {
     return this.revParse("HEAD", wt);
   }
 
+  /** 작업 트리 전체를 에픽 브랜치에 커밋한다 (구현 제출). 비밀 파일 패턴은 넣지 않는다. 바뀐 것이 없으면 null */
+  async commitAll(wt: string, message: string, trailers: Record<string, string> = {}): Promise<string | null> {
+    await this.g(["add", "-A", "."], wt);
+    const staged = (await this.g(["diff", "--cached", "--name-only", "-z"], wt)).split("\0").filter(Boolean);
+    const secret = staged.filter((f) => isSecret(f, this.excludeSecrets));
+    if (secret.length) await this.g(["reset", "-q", "--", ...secret], wt);
+    if (staged.length === secret.length) return null;
+    await this.g(["commit", "-q", "-F", "-"], wt, { input: withTrailers(message, trailers) });
+    return this.revParse("HEAD", wt);
+  }
+
+  /** 체크포인트 ref를 원격에 올린다 (§8.1) */
+  async pushCheckpoint(epic: string, member: string, remote = "origin"): Promise<void> {
+    const ref = GitEngine.checkpointRef(epic, member);
+    if (await this.tryRevParse(ref)) await this.g(["push", "-q", "--no-verify", remote, `${ref}:${ref}`]);
+  }
+
   static checkpointRef(epic: string, member: string): string {
     return `refs/flightdeck/ckpt/${epic}/${member}`;
   }

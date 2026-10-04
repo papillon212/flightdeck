@@ -1,14 +1,16 @@
 // 에픽 워크플로 (설계 §9.1 진입 흐름, §4 단계, §3 쓰레드). VS Code API를 쓰지 않는 순수 Node 모듈이다.
 // 확장(extension.ts)은 이 모듈을 화면에 연결만 한다. 테스트·스크립트에서도 그대로 쓴다.
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { applyTextEdit, artifactHash, checkSections, configVersionOf, diffToEdits, draftText, ensureParagraphIds, insertDrafts, myOpenThreads, needsServerSignature, nowIso, parseDrafts, pipelineFromDir, reduce, removeDrafts, renderThreads, replay, restoreParagraphIds, reviewOf, sha256, stripThreads, threadIdFrom, trustFromConfig, ulid, type ConfigPayload, type Draft, type EpicState, type Thread } from "@flightdeck/core";
-import { git, GitEngine, LocalEventStore, MetaRewriteError, RemoteEventStore } from "@flightdeck/git";
-import { DEV_TRUST, HANDOFF_SECTIONS, parsePipeline, PHASE_ARTIFACT, type Anchor, type EditRecord, type EditSource, type Event, type EventOf, type EventType, type LocalEpicStateInput, type Phase, type Pipeline, type Trust } from "@flightdeck/schema";
+import { gzipSync } from "node:zlib";
+import { applyTextEdit, artifactHash, checkSections, configVersionOf, diffToEdits, draftText, ensureParagraphIds, insertDrafts, linesLabel, myOpenThreads, needsServerSignature, nowIso, parseDrafts, parseImplLog, pipelineFromDir, reduce, removeDrafts, renderThreads, replay, restoreParagraphIds, reviewOf, sha256, stripThreads, threadIdFrom, trustFromConfig, ulid, type ConfigPayload, type CoverageReport, type Draft, type EpicState, type MemoGroup, type Thread } from "@flightdeck/core";
+import { git, GitEngine, LocalEventStore, MetaRewriteError, RAW_ARGS, RAW_ENV, RemoteEventStore, RunStore } from "@flightdeck/git";
+import { DEV_TRUST, HANDOFF_SECTIONS, parsePipeline, PHASE_ARTIFACT, type Anchor, type EditMemo, type EditRecord, type EditSource, type Event, type EventOf, type EventType, type LocalEpicStateInput, type Phase, type Pipeline, type Trust } from "@flightdeck/schema";
 import type { AgentAdapter } from "@flightdeck/agent";
 import type { TrackerAdapter, TrackerEpic } from "@flightdeck/tracker";
-import { appendEditRecords, readEditLog, readState, statePath, writeState } from "@flightdeck/hook";
+import { appendEditRecords, appendMemo, checkImplLogFile, computeCoverage, implLogRel, readEditLog, readMemos, readState, recordDrift, renderMemos, statePath, writeState, type ImplContext } from "@flightdeck/hook";
 import { cacheConfig, configCacheDir, loadCachedConfig, type ServerClient } from "./server-client.ts";
 
 /** 서버 모드 (M2 원격 협업). 없으면 개발 모드: 로컬 설정 폴더, 로컬 메타 브랜치, 서명 없음 */
@@ -219,7 +221,7 @@ export class EpicWorkflow {
         worktree,
         member: this.cfg.member,
         role: "owner",
-        ...(remote ? { product: remote.product } : {}),
+        ...(remote ? { product: remote.product, gitRemote: this.gitRemote } : {}),
         phase: "ANALYSIS",
         configDir: this.cfg.configDir,
         trust: this.trust,
@@ -304,7 +306,7 @@ export class EpicWorkflow {
       worktree: v.path,
       member: this.cfg.member,
       role: "viewer",
-      ...(this.cfg.remote ? { product: this.cfg.remote.product } : {}),
+      ...(this.cfg.remote ? { product: this.cfg.remote.product, gitRemote: this.gitRemote } : {}),
       phase: s0.phase,
       configDir,
       trust: this.trust,
@@ -664,7 +666,8 @@ export class EpicWorkflow {
   }
 
   /** 단계 완료 (§4.1): 검사 → 산출물·인수인계 커밋 → phase.completed → 동기화 */
-  async completePhase(epic: string): Promise<{ ok: true; commit: string | null; phase: Phase } | { ok: false; problems: string[] }> {
+  async completePhase(epic: string, opts: { onOutput?: (s: string) => void } = {}): Promise<{ ok: true; commit: string | null; phase: Phase } | { ok: false; problems: string[]; coverage?: CoverageReport }> {
+    if ((await this.epicState(epic)).phase === "IMPLEMENTATION") return this.submitImplementation(epic, opts);
     const { phase, problems } = await this.checkPhase(epic);
     if (reviewOf(await this.epicState(epic))) return { ok: false, problems: [`${phase} 단계는 "리뷰 요청" 후 티어 승인으로 넘어갑니다 (§4.2)`] };
     if (problems.length) return { ok: false, problems };
@@ -686,16 +689,171 @@ export class EpicWorkflow {
     return { ok: true, commit, phase: s.phase };
   }
 
+  // ---- 구현 (§7, §8.1, M4) ----
+
+  /** 구현 단계 공통 맥락: 로컬 상태 + 에픽의 base + coverage_ignore */
+  async implContext(epic: string): Promise<ImplContext> {
+    const s = await this.epicState(epic);
+    if (!s.base_sha) throw new Error(`시작되지 않은 에픽: ${epic}`);
+    const dataDir = await this.eng.dataDir();
+    const p = await this.pipelineFor(s.config_version);
+    return { state: await readState(dataDir, epic), dataDir, baseSha: s.base_sha, coverageIgnore: p?.phases.implementation.gate.coverage_ignore ?? [] };
+  }
+
+  /**
+   * 구현 관문 검사 (§7.3, X3): 편집 기록에 없는 변경을 external로 먼저 기록하고 coverage·impl-log 형식을 계산한다.
+   * 확장은 저장하지 않은 편집을 먼저 저장하고 부른다
+   */
+  async implementationStatus(epic: string): Promise<{ coverage: CoverageReport; implLog: string[]; drift: string[]; threshold: number; step: number }> {
+    const ctx = await this.implContext(epic);
+    const drift = await recordDrift(ctx);
+    const coverage = await computeCoverage(ctx);
+    const p = await this.pipelineFor((await this.epicState(epic)).config_version);
+    return { coverage, implLog: await checkImplLogFile(ctx.state), drift, threshold: p?.phases.implementation.gate.coverage ?? 1, step: ctx.state.impl_step };
+  }
+
+  /** 메모 (§7.4, X4): 수정 묶음에 메모를 붙이고 impl-log의 "직접 수정 메모"에 그린다 */
+  async addMemo(epic: string, group: MemoGroup, memo: string): Promise<void> {
+    if (!memo.trim()) throw new Error("메모가 비었습니다");
+    const ctx = await this.implContext(epic);
+    await appendMemo(ctx.dataDir, { epic, file: group.file, seqs: group.seqs, memo: memo.trim(), member: this.cfg.member, at: nowIso() });
+    // 줄 범위: 이번 묶음은 지금 계산한 것, 앞서 단 메모는 impl-log에 이미 그린 것
+    const implLog = path.join(ctx.state.worktree, implLogRel(epic));
+    const prev = existsSync(implLog) ? parseImplLog(await readFile(implLog, "utf8")).memos : [];
+    const same = (m: EditMemo) => m.file === group.file && m.seqs[0] === group.seqs[0] && m.seqs[1] === group.seqs[1];
+    await renderMemos(
+      ctx,
+      await readMemos(ctx.dataDir, epic),
+      (m) => (same(m) ? linesLabel(group.lines) : (prev.find((p) => p.file === m.file && p.memo === m.memo)?.lines ?? `편집 ${m.seqs[0]}-${m.seqs[1]}`)),
+      (m) => `@${m.member}`,
+    );
+  }
+
+  /** 체크포인트 (§8.1): 마지막 체크포인트와 다르면 만들고 원격에 올린다(서버 모드). 사람 저장·유휴 시 확장이 부른다 */
+  async checkpoint(epic: string, why: string, source: "human" | "agent" = "human"): Promise<string | null> {
+    const ctx = await this.implContext(epic);
+    if (ctx.state.role !== "owner") return null;
+    await recordDrift(ctx);
+    const log = await readEditLog(ctx.dataDir, epic);
+    const sha = await this.eng.checkpointIfChanged(ctx.state.worktree, {
+      epic,
+      member: this.cfg.member,
+      message: `체크포인트 (${why})`,
+      trailers: { "Flightdeck-Source": source, ...(ctx.state.phase === "IMPLEMENTATION" ? { "Flightdeck-Step": String(ctx.state.impl_step + 1) } : {}), "Flightdeck-Seq": String(log.at(-1)?.seq ?? 0) },
+    });
+    if (sha && this.cfg.remote) await this.eng.pushCheckpoint(epic, this.cfg.member, this.gitRemote).catch((e) => this.warnings.push(`체크포인트를 올리지 못했다: ${e instanceof Error ? e.message : e}`));
+    return sha;
+  }
+
+  async checkpoints(epic: string) {
+    return this.eng.listCheckpoints(epic, this.cfg.member);
+  }
+
+  /**
+   * 이 시점으로 복원 (§8.1, X8): 복원 직전 상태를 체크포인트로 남기고 작업 트리를 되돌린다.
+   * 바뀐 파일마다 파일 전체 교체를 편집 기록(출처 restore, 그 체크포인트의 seq)으로 남긴다
+   */
+  async restore(epic: string, target: string): Promise<{ before: string; files: string[] }> {
+    const ctx = await this.implContext(epic);
+    if (ctx.state.role !== "owner") throw new Error("읽기 전용 창에서는 복원할 수 없습니다");
+    await recordDrift(ctx);
+    const info = (await this.checkpoints(epic)).find((c) => c.sha === target);
+    const seq = Number(info?.trailers["Flightdeck-Seq"] ?? 0);
+    const wt = ctx.state.worktree;
+    const { before } = await this.eng.restoreCheckpoint(wt, target, { epic, member: this.cfg.member });
+    const changed = (await git(["diff-tree", "-r", "-z", "--name-only", "--no-renames", before, target], { cwd: wt })).split("\0").filter(Boolean);
+    const source = { kind: "restore" as const, member: this.cfg.member, ckpt: target, seq };
+    const ts = nowIso();
+    const records: Omit<EditRecord, "seq">[] = [];
+    for (const file of changed) {
+      const prev = await git([...RAW_ARGS, "cat-file", "blob", `${before}:${file}`], { cwd: wt, env: RAW_ENV }).catch(() => null);
+      const abs = path.join(wt, file);
+      // Flightdeck 기록(impl-log·trace·handoff)은 되돌리지 않는다. Step 체크포인트는 그 Step 기록보다 먼저 만들어지므로
+      // 되돌리면 그 Step의 기록이 사라진다 (M4 구현 중 발견)
+      if (file.startsWith(".flightdeck/")) {
+        if (prev === null) await rm(abs, { force: true });
+        else {
+          await mkdir(path.dirname(abs), { recursive: true });
+          await writeFile(abs, prev);
+        }
+        continue;
+      }
+      const next = existsSync(abs) ? await readFile(abs, "utf8") : null;
+      if (prev === next) continue;
+      records.push(
+        next === null
+          ? { epic, file, base_hash: sha256(prev), range: [0, 0], insert: "", delete_file: true, source, ts }
+          : { epic, file, base_hash: sha256(prev), range: [0, prev?.length ?? 0], insert: next, source, ts },
+      );
+    }
+    await appendEditRecords(ctx.dataDir, epic, records);
+    if (this.cfg.remote) await this.eng.pushCheckpoint(epic, this.cfg.member, this.gitRemote).catch(() => undefined);
+    await this.sync(epic);
+    return { before, files: records.map((r) => r.file) };
+  }
+
+  /** 구현 관문 명령 실행 (§7.5): 확장이 직접 실행한다(에이전트가 결과를 꾸밀 수 없게). 전체 로그는 세션 원본 ref에 둔다 */
+  async runGateCommands(epic: string, commit: string, onOutput?: (s: string) => void): Promise<{ cmd: string; exit: number; summary: string; log_hash: string }[]> {
+    const p = await this.pipelineFor((await this.epicState(epic)).config_version);
+    const wt = await this.worktree(epic);
+    const out: { cmd: string; exit: number; summary: string; log_hash: string }[] = [];
+    for (const [i, cmd] of (p?.phases.implementation.gate.commands ?? []).entries()) {
+      onOutput?.(`$ ${cmd}\n`);
+      const { exit, log } = await runShell(cmd, wt, onOutput);
+      const summary = log.trim().split("\n").filter((l) => l.trim()).at(-1)?.trim().slice(0, 200) ?? "";
+      await new RunStore(this.cfg.repo).put(epic, `gate/${commit}/${i}.log.gz`, gzipSync(log), `gate ${commit.slice(0, 10)} ${cmd}`);
+      out.push({ cmd, exit, summary, log_hash: sha256(log)! });
+    }
+    if (this.cfg.remote) await git(["push", "-q", "--no-verify", this.gitRemote, `${RunStore.ref(epic)}:${RunStore.ref(epic)}`], { cwd: this.cfg.repo }).catch((e) => this.warnings.push(`테스트 로그를 올리지 못했다: ${e instanceof Error ? e.message : e}`));
+    return out;
+  }
+
+  /**
+   * 구현 완료(제출) (§4.1, §7.3, §7.5, X5): 관문 검사 → 에픽 브랜치 커밋·공유 → 명령 실행·보고(gate.reported) → phase.completed.
+   * 설명 없는 변경이나 impl-log 형식 문제가 있으면 커밋하지 않고 이유를 돌려준다
+   */
+  async submitImplementation(
+    epic: string,
+    opts: { onOutput?: (s: string) => void } = {},
+  ): Promise<{ ok: true; commit: string; phase: Phase } | { ok: false; problems: string[]; coverage?: CoverageReport }> {
+    const s0 = await this.epicState(epic);
+    if (s0.owner !== this.cfg.member) return { ok: false, problems: [`담당자(@${s0.owner})만 제출할 수 있습니다`] };
+    if (s0.phase !== "IMPLEMENTATION") return { ok: false, problems: [`지금은 ${s0.phase} 단계입니다`] };
+    const st = await this.implementationStatus(epic);
+    const problems: string[] = [];
+    for (const h of st.coverage.unexplained) {
+      problems.push(`설명 없는 변경 ${h.file}:${linesLabel([h.newLines])} — ${h.sources.filter((x) => !x.explained).map((x) => x.why).join(", ") || "출처 없음"}`);
+    }
+    if (st.coverage.ratio < st.threshold) problems.unshift(`coverage ${(st.coverage.ratio * 100).toFixed(0)}% < ${(st.threshold * 100).toFixed(0)}%`);
+    problems.push(...st.implLog.map((p) => `impl-log: ${p}`));
+    const open = [...s0.threads.values()].filter((t) => t.phase === s0.phase && t.status === "open");
+    if (open.length) problems.push(`열린 쓰레드 ${open.length}개`);
+    if (problems.length) return { ok: false, problems, coverage: st.coverage };
+
+    const wt = await this.worktree(epic);
+    await this.eng.commitAll(wt, `${epic}: 구현 제출 (Step ${st.step})`, { "Flightdeck-Epic": epic, "Flightdeck-Phase": "IMPLEMENTATION" });
+    const commit = this.cfg.remote ? await this.eng.pushEpicBranch(epic, this.gitRemote) : await this.eng.revParse("HEAD", wt);
+    const commands = await this.runGateCommands(epic, commit, opts.onOutput);
+    await this.passEvent(epic, "gate.reported", { commit, commands });
+    const failed = commands.filter((c) => c.exit !== 0);
+    if (failed.length) return { ok: false, problems: failed.map((c) => `명령 실패 (종료 코드 ${c.exit}): ${c.cmd} — ${c.summary}`) };
+    await this.passEvent(epic, "phase.completed", { phase: "IMPLEMENTATION", commit });
+    const s = await this.sync(epic);
+    if (this.cfg.remote) await this.trackerPhase(epic, s.phase);
+    return { ok: true, commit, phase: s.phase };
+  }
+
   /** 자동 초안 (§6.1 headless): 백그라운드 claude -p. 끝나면 세션 ID로 이어서 작업(resume)한다 */
   async draft(epic: string, extra = ""): Promise<{ sessionId: string; result: string }> {
     const adapter = this.cfg.adapter;
     if (!adapter.headless) throw new Error(`${adapter.id}는 headless 실행을 지원하지 않습니다`);
     const s = await this.epicState(epic);
     const a = PHASE_ARTIFACT[s.phase as keyof typeof PHASE_ARTIFACT];
-    if (!a) throw new Error(`${s.phase} 단계는 자동 초안 대상이 아닙니다`);
+    if (!a && s.phase !== "IMPLEMENTATION") throw new Error(`${s.phase} 단계는 자동 실행 대상이 아닙니다`);
     const prompt = [
-      `Flightdeck ${s.phase} 단계의 초안을 작성하세요.`,
-      `세션 맥락에 있는 단계 룰과 산출물 형식(필수 섹션)을 따라 .flightdeck/epics/${epic}/${a.file}를 쓰고, 끝나기 전에 인수인계 기록(handoff.md)도 쓰세요.`,
+      a
+        ? `Flightdeck ${s.phase} 단계의 초안을 작성하세요.\n세션 맥락에 있는 단계 룰과 산출물 형식(필수 섹션)을 따라 .flightdeck/epics/${epic}/${a.file}를 쓰고, 끝나기 전에 인수인계 기록(handoff.md)도 쓰세요.`
+        : `Flightdeck IMPLEMENTATION 단계입니다. .flightdeck/epics/${epic}/design.md의 설계대로 구현하세요.\n세션 맥락의 단계 룰을 따라 Step 하나를 끝낼 때마다 flightdeck_log_step으로 기록하고, 끝나기 전에 flightdeck_submit으로 검사한 뒤 인수인계 기록(handoff.md)을 쓰세요.`,
       extra,
     ]
       .filter(Boolean)
@@ -711,4 +869,20 @@ export class EpicWorkflow {
     await this.sync(epic);
     return { sessionId: r.sessionId, result: r.result };
   }
+}
+
+/** 셸 명령 실행: 표준 출력·오류를 합친 로그와 종료 코드 */
+function runShell(cmd: string, cwd: string, onOutput?: (s: string) => void): Promise<{ exit: number; log: string }> {
+  return new Promise((resolve) => {
+    const child = spawn("sh", ["-c", cmd], { cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+    let log = "";
+    const on = (d: Buffer) => {
+      log += d.toString("utf8");
+      onOutput?.(d.toString("utf8"));
+    };
+    child.stdout.on("data", on);
+    child.stderr.on("data", on);
+    child.on("error", (e) => resolve({ exit: 127, log: log + String(e) }));
+    child.on("close", (code) => resolve({ exit: code ?? 1, log }));
+  });
 }

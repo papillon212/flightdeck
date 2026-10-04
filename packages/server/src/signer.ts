@@ -4,9 +4,9 @@
 import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import { artifactHash, checkSections, configVersionOf, nowIso, reduce, reviewOf, signEvent, ulid } from "@flightdeck/core";
+import { artifactHash, checkImplLog, checkSections, configVersionOf, nowIso, reduce, reviewOf, signEvent, ulid } from "@flightdeck/core";
 import { git, GitEngine, GitError, RemoteEventStore } from "@flightdeck/git";
-import { Event as EventSchema, parsePipeline, PHASE_ARTIFACT, type Event, type Phase, type Trust } from "@flightdeck/schema";
+import { Event as EventSchema, GateCommands, parsePipeline, PHASE_ARTIFACT, type Event, type Phase, type Trust } from "@flightdeck/schema";
 import type { Member, ServerStore } from "./store.ts";
 
 export class RequestError extends Error {
@@ -96,6 +96,14 @@ export class EventSigner {
       return { file: artifact.file, head, hash: artifactHash(text) };
     };
 
+    const remoteHead = async () => {
+      const head = await eng.fetchEpicBranch(req.epic).catch((e) => {
+        throw new RequestError(503, `에픽 브랜치를 받지 못함: ${e instanceof Error ? e.message : e}`);
+      });
+      if (!head) throw new RequestError(409, "에픽 브랜치가 원격에 없음. 먼저 공유해야 한다");
+      return head;
+    };
+
     let data: Record<string, unknown>;
     switch (req.type) {
       case "epic.started": {
@@ -108,7 +116,29 @@ export class EventSigner {
         data = { tracker_ref: String(req.data.tracker_ref ?? req.epic), owner: member.id, base_sha: base, config_version: cfg.version };
         break;
       }
+      case "gate.reported": {
+        // 테스트 결과 보고 (§7.5, M4 제안 X5): 보고한 커밋이 원격 에픽 브랜치에 있어야 한다. 테스트를 다시 돌리지는 않는다
+        const commit = String(req.data.commit ?? "");
+        const commands = GateCommands.safeParse(req.data.commands);
+        if (!commands.success) throw new RequestError(400, `commands 형식 문제: ${commands.error.message}`);
+        const head = await remoteHead();
+        if (!/^[0-9a-f]{40}$/.test(commit) || !(await isAncestor(dir, commit, head))) throw new RequestError(409, `보고한 커밋이 원격 에픽 브랜치에 없음: ${commit || "(없음)"}`);
+        data = { commit, commands: commands.data };
+        break;
+      }
       case "phase.completed":
+        if (state.phase === "IMPLEMENTATION" && req.data.phase === "IMPLEMENTATION") {
+          // 구현 완료 (§4.1, X5): 원격 에픽 브랜치 끝 = 검사한 커밋. impl-log 형식을 보고, 통과 보고는 reducer가 본다
+          const head = await remoteHead();
+          if (req.data.commit !== undefined && req.data.commit !== head) throw new RequestError(409, `원격 에픽 브랜치 끝(${head.slice(0, 10)})이 검사한 커밋과 다름. 먼저 공유해야 한다`);
+          const show = (f: string) => git(["show", `${head}:.flightdeck/epics/${req.epic}/${f}`], { cwd: dir }).catch(() => null);
+          const problems = checkImplLog(await show("impl-log.md"), await show("design.md"));
+          if (problems.length) throw new RequestError(409, `impl-log 형식 문제: ${problems.join("; ")}`);
+          const tree = (await git(["rev-parse", `${head}^{tree}`], { cwd: dir })).trim();
+          data = { phase: "IMPLEMENTATION", artifact_hash: `tree:${tree}`, commit: head };
+          break;
+        }
+      // falls through
       case "review.requested": {
         const phase = String(req.data.phase ?? "") as Phase;
         const a = await remoteArtifact(phase);
