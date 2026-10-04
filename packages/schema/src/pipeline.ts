@@ -5,9 +5,10 @@ import { MemberId } from "./common.ts";
 /** 지원 등급 (설계 §6.5) */
 export const SupportLevel = z.enum(["full", "partial", "minimal"]);
 
+/** 티어 리뷰어. 비어 있으면(빈 그룹·없는 그룹·빈 목록) 그 티어는 건너뛴다 (§4.2) */
 const Reviewers = z.union([
   z.object({ group: z.string().min(1) }),
-  z.object({ members: z.array(MemberId).min(1) }),
+  z.object({ members: z.array(MemberId) }),
 ]);
 
 const Tier = z.object({
@@ -19,14 +20,6 @@ const Tier = z.object({
 const Review = z.object({
   reapproval: z.enum(["on_change", "never"]).default("on_change"),
   tiers: z.array(Tier).min(1),
-});
-
-const Skip = z.object({
-  when: z.object({
-    tracker_tags: z.array(z.string()).optional(),
-    size: z.array(z.string()).optional(),
-  }),
-  tiers: z.array(z.string()).min(1),
 });
 
 /** pipeline.yaml (설계 §5). 서버 DB의 제품별 설정 버전에 있고, 어드민 화면에서 편집한다 (§2.5) */
@@ -60,7 +53,6 @@ export const Pipeline = z.object({
     design: z.object({
       rules: z.string().min(1),
       review: Review,
-      skip: z.array(Skip).default([]),
     }),
     implementation: z.object({
       rules: z.string().min(1),

@@ -40,9 +40,6 @@ phases:
       tiers:
         - { name: lead,      reviewers: { group: leads },      min_approvals: 1 }
         - { name: architect, reviewers: { group: architects }, min_approvals: 1 }
-    skip:
-      - when: { tracker_tags: [bugfix], size: [XS, S] }
-        tiers: [architect]
 
   implementation:
     rules: rules/implementation.md

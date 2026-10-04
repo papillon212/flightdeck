@@ -1,4 +1,4 @@
-# Flightdeck — 설계 문서 v0.12
+# Flightdeck — 설계 문서 v0.13
 
 > 코딩 에이전트 시대의 원격 페어 프로그래밍 워크플로우 도구
 > 작성일: 2026-10-01 · 상태: 초안(Draft)
@@ -59,6 +59,14 @@
 >   - 일감 멘션은 새 질문과 리뷰 차례에만 남긴다(§3.7).
 >   - **내장 git 서버를 기본**으로 하고, 외부 git 미러·외부 git 단독 방식도 지원한다. 내장 방식은 ref 규칙을 서버가 강제한다(D21, §1.5, M5.5).
 >   - (2026-10-04, M2 완료 확인 반영 V1) 한 PC 안의 편집 기록 쓰기는 **직렬화**하고, 재적용 중 `base_hash`가 맞지 않는 기록은 건너뛰고 보고한다(§8.6). M2 완료 표시(§14).
+> - **v0.13** (M3 계획 검토 반영, 근거: [m3-plan.md](m3-plan.md) W1~W8)
+>   - 티어 리뷰는 서버 서명 이벤트 **`review.requested`**로 시작하고, 마지막 티어 승인으로 다음 단계에 자동으로 넘어간다(§3.1, §4.1, §4.2).
+>   - 재승인 기준인 "현재 산출물"은 **마지막 리뷰 요청의 해시**다. 고치면 다시 요청하고, 해시가 다른 승인은 무효다(§4.2).
+>   - **티어는 일감의 검증 단계**이고 티어마다 심사 담당자가 있다. 담당자가 없는 티어는 건너뛴다. 건너뛰기는 판단이 아니라 설정이다. `skip` 규칙(태그·크기)을 없앴다(§4.2, §5).
+>   - 담당자가 어떤 티어의 **유일한** 리뷰어면 그 티어까지는 스스로 승인할 수 있다(§4.2).
+>   - 리뷰어 직접 수정(`review.edited`)을 없애고 **조종수에게 수정 제안**으로 통일했다(§3.4, §4.2, §9.3).
+>   - 리뷰어 본인이 연 쓰레드가 열려 있으면 그 리뷰어의 승인은 거부한다(§4.2).
+>   - 리뷰어 창에도 에이전트 설정을 넣는다(리뷰 정책). 에이전트가 문서에 **쓰레드 초안 블록**을 쓰면, 사람이 확인해 올린다(§3.2, §3.6, §6.2).
 
 ---
 
@@ -319,14 +327,14 @@ flightdeck-server DB
 |---|---|---|
 | `epic.started` | tracker_ref, owner, base_sha, config_version | ✅ |
 | `epic.config_upgraded` | from_version, to_version | ✅ |
-| `thread.created` | thread, phase, file, anchor(§3.5), kind, to[], body, commit?(문서 공유 커밋) | |
+| `thread.created` | thread, phase, file, anchor(§3.5), kind, to[], body, commit?(문서 공유 커밋), source?(`human`\|`agent`, 쓰레드 초안 §3.2) | |
 | `thread.replied` | thread, body, source(`human`\|`agent`\|`session`), patch?(수정 제안, §9.3) | |
 | `thread.resolved` / `thread.reopened` | thread | |
 | `thread.moved` | thread, anchor | |
 | `patch.applied` | thread, commit | |
 | `phase.completed` | phase, artifact_hash (담당자의 "분석 완료" 등) | ✅ |
+| `review.requested` | phase, artifact_hash, commit (담당자의 리뷰 요청, §4.2) | ✅ |
 | `review.approved` | phase, tier, artifact_hash (§4.2) | ✅ |
-| `review.edited` | phase, commit | |
 | `phase.reverted` | from, to, reason | |
 | `run.started` / `run.finished` | run_id, phase, member, ckpt_from, ckpt_to | |
 | `gate.reported` | commit, commands[{cmd, exit, summary, log_hash}] (§7.5) | ✅ |
@@ -380,6 +388,21 @@ flightdeck-server DB
     - 복원 시점: 에디터 저장은 **저장 직전**(`onWillSaveTextDocument`, 디스크 쓰기와 경쟁하지 않음), 에이전트·셸·외부 변경은 문서를 다시 그릴 때. 에이전트 파일 도구 편집은 훅이 즉시 되돌리고 사유를 에이전트에게 알린다.
   - 새 문단에는 확장이 저장 시 새 ID를 붙인다.
 - 쓰레드 블록은 확장이 관리하는 렌더링 영역이다. 직접 수정해도 다시 렌더링하면 사라진다.
+- **쓰레드 초안 블록**: 사람이 자기 에이전트에게 "이 문단에 질문 달아 줘", "그 쓰레드에 이렇게 답해 줘"라고 지시할 수 있도록, 에이전트(또는 사람)가 문서에 초안을 쓴다. 파일 편집만 할 수 있는 에이전트에서도 동작한다.
+
+  ```markdown
+  <!-- flightdeck:draft kind=question to=dh.lee -->
+  재사용 탐지 시 모든 세션을 끊는 근거는 무엇인가요?
+  <!-- /flightdeck:draft -->
+
+  <!-- flightdeck:draft reply=t-01JB2X4K -->
+  30분, 슬라이딩 갱신입니다.
+  <!-- /flightdeck:draft -->
+  ```
+
+  - 새 쓰레드(`kind`=`question`\|`change_request`\|`note`, `to`=쉼표로 구분한 멤버)의 앵커는 초안 바로 위 블록의 문단 ID다. 답글은 `reply=<쓰레드 ID>`.
+  - 확장은 저장·파일 변경 때 초안을 찾아 Comments에 **초안으로 표시**한다. 사람이 "올리기"(한 건씩 또는 모두)를 눌러야 이벤트가 된다. 메타 브랜치는 지울 수 없고 그 사람 이름으로 남기 때문이다. 올린 초안은 문서에서 지우고 쓰레드 블록으로 다시 그린다. 이벤트에는 `source: agent`를 남긴다.
+  - 권한은 일반 쓰레드와 같다(§3.4). 권한 밖의 초안은 올리기 전에 이유를 보여 준다.
 
 ### 3.3 코드 쓰레드
 
@@ -395,10 +418,10 @@ flightdeck-server DB
 
 | 동작 | 권한 |
 |---|---|
-| 생성 | 해당 단계 담당자 / 현재 티어 리뷰어 |
+| 생성 | 해당 단계 담당자 / 현재 티어 리뷰어 (리뷰 요청 이후) |
 | 답글 | 쓰레드 참여자 + 멘션 대상 |
 | resolve / reopen | 쓰레드 생성자 (분석 단계에서는 담당자) |
-| 수정 제안 반영 | 담당자 |
+| 수정 제안 반영 | 조종수 (에픽 브랜치에 쓰는 사람은 조종수 한 명, D17) |
 
 ### 3.5 위치 고정 (편집 기록 기반)
 
@@ -427,8 +450,10 @@ flightdeck-server DB
 - **"내 에이전트에게 묻기"**: 쓰레드를 인용해 Claude Code 세션을 연다. 이벤트도 세션 원본도 남기지 않는다.
   - 조종수는 **질문용 읽기 전용 사본**(`<epic-id>#ask`, 현재 체크포인트 기준)에서 연다.
   - 관찰자는 자신의 읽기 전용 관찰 창(`@live`)에서 연다.
-  - 두 곳 모두 훅이 쓰기와 셸을 차단한다. 기록되지 않는 경로로 코드가 바뀌는 것을 막기 위해서다.
-- **"쓰레드에 올리기"**: 사용자가 명시적으로 올린 내용만 기록한다.
+  - 질문 대상·리뷰어는 자신의 읽기 전용 창(§2.4)에서 연다.
+  - 모든 곳에서 훅이 셸을 읽기 전용 명령으로 제한하고, 쓰기는 **산출물 문서의 쓰레드 초안 블록**(§3.2)만 허용한다. 기록되지 않는 경로로 코드·문서 내용이 바뀌는 것을 막기 위해서다. 초안 블록 밖의 변경은 확장이 되돌린다.
+  - MCP 도구(에픽·쓰레드·인수인계 기록)는 그대로 쓴다. 에이전트가 쓰레드의 답글·해결 상태까지 읽고 문서를 검사한다.
+- **"쓰레드에 올리기"**: 사용자가 명시적으로 올린 내용만 기록한다. 에이전트가 쓴 초안도 사람이 올려야 기록된다(§3.2).
 
 ### 3.7 알림
 
@@ -461,7 +486,7 @@ INTAKE → ANALYSIS → DESIGN → IMPLEMENTATION → VERIFICATION → LANDING �
 |---|---|---|---|
 | INTAKE | — | `epic.md`, worktree | 자동 |
 | ANALYSIS | `agent_drafting` → `questioning` → `owner_review` | `analysis.md`, handoff | 쓰레드 전부 resolved + `phase.completed` |
-| DESIGN | `agent_drafting` → `owner_review` → `tier[1..n]_review` | `design.md`, handoff | 각 티어 `review.approved` + 열린 쓰레드 0 |
+| DESIGN | `agent_drafting` → `owner_review` → (`review.requested`) → `tier[k]_review` … | `design.md`, handoff | 리뷰어가 있는 모든 티어의 `review.approved` + 열린 쓰레드 0. 마지막 승인으로 자동 전환 |
 | IMPLEMENTATION | `agent_working` → `log_finalizing` → `gate_check` | 코드, impl-log, trace, handoff | 스키마 + coverage 100% + 명령 통과 |
 | VERIFICATION | `owner_review` → `tier[1..n]_review` | 코드 쓰레드 | 각 티어 `review.approved` + 열린 change_request 0 |
 | LANDING | `requested` → `server_verifying` → `pushing` | main 커밋 | 서버의 `epic.landed` (§11) |
@@ -469,16 +494,24 @@ INTAKE → ANALYSIS → DESIGN → IMPLEMENTATION → VERIFICATION → LANDING �
 
 ### 4.2 티어 승인 (서버 서명 이벤트)
 
-- 티어 차례가 되면 행위자의 확장이 다음 리뷰어에게 VS Code 알림과 일감 도구 멘션을 보낸다.
+- **티어는 일감의 검증 단계**다. 파이프라인이 단계별로 티어 순서(예: lead → architect)와 티어마다 심사하는 리뷰어를 정한다. **리뷰어가 없는 티어는 건너뛴다.** 건너뛰기는 그때그때 판단하지 않고 설정으로 정한다(§5).
+- **리뷰 요청** = `review.requested {phase, artifact_hash, commit}` (서버 서명). 담당자가 산출물을 에픽 브랜치에 공유하고 요청하면, 서버가 원격 문서의 형식(§6.3)과 해시를 확인해 서명한다. 리뷰어는 이 커밋을 읽기 전용 창으로 본다(§2.4).
+- 티어 차례가 되면 행위자의 확장이 그 티어 리뷰어에게 VS Code 알림과 일감 도구 멘션을 보낸다.
 - 승인 = `review.approved` 이벤트다. 리뷰어가 확장에서 승인을 누르면 확장이 서버에 요청하고, 서버가 아래 조건을 검증한 뒤 서버 키로 서명해 기록한다(§12). 담당자의 단계 완료(`phase.completed`)도 같은 방식이다.
-  - `artifact_hash`: 승인 시점 산출물의 해시. 설계 단계는 `design.md`, 검증 단계는 에픽 브랜치 tree 해시.
+  - `artifact_hash`: 승인하는 산출물의 해시. 설계 단계는 `design.md`, 검증 단계는 에픽 브랜치 tree 해시.
+- **현재 산출물** = 마지막 `review.requested`의 해시. reducer는 파일을 보지 않으므로 이것을 기준으로 삼는다. 담당자가 문서를 고치면 다시 요청해야 한다.
 - 서버(서명 전)와 reducer(받은 뒤)가 승인을 유효로 인정하는 조건
   - 서버 서명이 유효하다.
-  - 리뷰어가 해당 티어 멤버다.
-  - 현재 차례의 티어다.
-  - `reapproval: on_change`이면 `artifact_hash`가 현재 산출물과 같다. 다르면 그 티어부터 다시 승인받는다.
-- 리뷰어 직접 수정: 확장이 에픽 브랜치에 커밋하고 `review.edited` 이벤트를 남긴다.
-- 수정 요청: `change_request` 쓰레드를 만든다. 리뷰 사본에서 만든 **수정 제안(패치)**을 붙일 수 있다(§9.3).
+  - 리뷰어가 해당 티어의 리뷰어다.
+  - 현재 차례의 티어다. 현재 티어 = 유효 승인이 `min_approvals`에 못 미치는 첫 티어(리뷰어 없는 티어 제외).
+  - `artifact_hash`가 현재 산출물과 같다. 서버는 원격 에픽 브랜치의 문서와도 같은지 본다(요청 뒤 몰래 고친 문서의 승인 방지).
+  - **담당자 자신의 승인**은, 담당자가 어떤 티어의 **유일한** 리뷰어일 때만 유효하다. 그때 담당자는 그 티어까지(그 티어와 앞 티어)를 스스로 승인할 수 있다. 그 밖의 티어는 다른 사람이 승인한다.
+  - 담당자가 아닌 한 사람의 승인은 한 티어에만 센다(앞 티어에서 승인한 사람은 뒤 티어에서 세지 않는다).
+  - 승인하는 리뷰어 **본인이 연 쓰레드가 열려 있으면** 거부한다(먼저 해결). 다른 사람의 열린 쓰레드는 막지 않지만, 마지막 티어 승인 시점에 열린 쓰레드가 0이어야 단계가 넘어간다.
+- **재승인** (`reapproval`)
+  - `on_change`: 다시 요청해 해시가 바뀌면, 해시가 다른 이전 승인은 모두 무효다. 결과적으로 첫 티어부터 다시 승인받는다.
+  - `never`: 이전 승인을 유지한다.
+- 수정 요청: `change_request` 쓰레드를 만든다. 리뷰 사본에서 만든 **수정 제안(패치)**을 붙일 수 있고, **조종수**가 반영한다(§9.3). 리뷰어는 에픽 브랜치에 직접 쓰지 않는다(D17: 에픽 브랜치에 쓰는 사람은 조종수 한 명).
 
 ### 4.3 되돌림
 
@@ -533,12 +566,9 @@ phases:
     rules: rules/design.md
     review:
       reapproval: on_change
-      tiers:
+      tiers:                       # 검증 단계 순서. 리뷰어(그룹)가 비어 있는 티어는 건너뛴다 (§4.2)
         - { name: lead,      reviewers: { group: leads },      min_approvals: 1 }
         - { name: architect, reviewers: { group: architects }, min_approvals: 1 }
-    skip:
-      - when: { tracker_tags: [bugfix], size: [XS, S] }
-        tiers: [architect]
 
   implementation:
     rules: rules/implementation.md
@@ -710,6 +740,7 @@ retention:
 | DESIGN | `design.md`, `runs/<run-id>/handoff.md` | 읽기 전용 허용 목록 |
 | IMPLEMENTATION | `.flightdeck/` 제외 전체 + `impl-log.md`, handoff | 허용 (**모든 git 명령 차단**, `rm -rf` 등 차단) |
 | VERIFICATION | 없음 | 테스트 실행만 |
+| 읽기 전용 창 (질문 대상·리뷰어, 단계 무관) | 산출물 문서의 **쓰레드 초안 블록**만 (§3.2). 그 밖의 변경은 확장이 되돌린다 | 읽기 전용 허용 목록 |
 
 - 에이전트도 git 명령을 쓸 수 없다. 버전 관리는 확장만 한다(D12).
 - 모든 단계에서 다음 경로의 읽기·쓰기를 차단한다. 설정 캐시와 훅·MCP 설정을 에이전트가 조작하는 것을 막기 위해서다.
@@ -883,7 +914,6 @@ verification: "pnpm test auth  # ✅ 12 passed"
 | 대상 | 출처 | 메모를 받는 방법 |
 |---|---|---|
 | 조종수의 에디터 편집 | `human:<member>` | 확장이 연속된 직접 수정을 **수정 묶음**으로 자동으로 묶는다(같은 파일, 2분 이내 간격). 체크포인트 생성 시나 제출 전에 "메모 필요 n건" 패널에서 묶음마다 한 줄 메모를 쓴다 |
-| 리뷰어의 직접 수정 (`review.edited`) | `human:<member>` | 커밋 전에 메모 입력창이 뜬다. 메모 없이는 커밋되지 않는다 |
 | 외부 도구 변경 | `external:unknown` | 아래 "외부 변경 감지" 참고. 직접 수정과 같은 방식으로 메모를 받는다 |
 | 수정 제안 반영 | `patch:<thread>/<member>` | 연결된 쓰레드가 설명이므로 메모가 필요 없다 |
 
@@ -1127,7 +1157,8 @@ XP 페어 프로그래밍에서는 드라이버가 작성하고 내비게이터�
    - 구현 기록에서 Step별 의도와 리뷰 포인트를 읽는다.
    - 필요한 Step만 골라 diff를 연다.
    - coverage에서 강조된 hunk(`human`/`agent_shell`)를 확인한다.
-4. 리뷰어가 사본에서 고친 내용은 쓰레드에 **수정 제안(패치)**으로 첨부한다. 담당자가 `수정 제안 반영`을 누르면 에픽 브랜치에 적용되고 `patch.applied`가 남는다.
+4. 리뷰어가 사본에서 고친 내용은 쓰레드에 **수정 제안(패치)**으로 첨부한다. **조종수**가 `수정 제안 반영`을 누르면 에픽 브랜치에 적용되고 `patch.applied`가 남는다. 리뷰어는 에픽 브랜치에 직접 쓰지 않는다.
+   - 설계 문서 리뷰(M3)는 리뷰 요청 커밋의 읽기 전용 창에서 한다. 리뷰어의 에이전트가 문서·쓰레드를 검사하고, 지시받은 질문·수정 요청·답글을 쓰레드 초안으로 쓴다(§3.2, §3.6). 리뷰어가 확인해 올린다.
 5. 승인을 누르면 서버가 검증해 `review.approved`(서버 서명)를 남긴다. 리뷰 사본은 정리 대상이 된다.
 
 ---
@@ -1326,7 +1357,7 @@ flightdeck/
 | **M0 스파이크** | ① Comments API를 markdown에 적용 ② 대화형 Claude Code + worktree의 `settings.local.json` 훅(권한 차단·trace·사용자 설정과 병합, `.mcp.json` 최초 승인 흐름) ③ 훅 추가 컨텍스트로 **실행 중** 의견 전달(PostToolUse)과 단계 룰 갱신(UserPromptSubmit)이 되는지 ③-1 headless 초안 세션을 대화형으로 이어가기(resume) ③-2 `transcript_path` 세션 기록 파일 실시간 읽기 ④ Meet 회의록·전사 조회 ⑤ 메타 브랜치 동시 push ⑥ 체크포인트 숨은 커밋 push/fetch ⑦ 에디터·에이전트·셸 편집을 오프셋 편집 기록으로 빠짐없이 잡을 수 있는지(재적용 시 파일 해시 일치)<br>**결과(2026-10-02, 완료)**: ①~⑦ 모두 **가능**. "불가" 없음 ([m0-results.md](m0-results.md)). ④는 지난 회의 조회와 실제 회의의 회의록 생성 시간(4분 이내)까지 확인했다. Flightdeck 자체 OAuth 앱 + `meetings.space.created`로 연 회의의 회의록 자동 켜기는 M6에서 확인한다 | 각 항목 가능/불가 판정 |
 | **M1 로컬 단일 사용자** | core reducer·렌더러, **문단 ID + 편집 추적**, GitEngine 기초, **AgentAdapter 인터페이스 + claude-code 어댑터**, ANALYSIS 에이전트, handoff | 혼자 분석 → 설계 초안 |
 | **M2 원격 협업** | 서버 서명 이벤트, 메타 브랜치 EventStore, 알림, ClickUp 일감 수신, **서버 어드민(멤버·설정) + 설정 배포**, Google 로그인<br>**결과(2026-10-04, 완료)**: 실제 VS Code 두 창(멤버 둘, 한 PC) + GitHub + 서버 + ClickUp으로 분석 Q&A 전 단계 통과 ([m2-plan.md](m2-plan.md)). Google 로그인(OAuth 클라이언트 없음, 개발용 로그인으로 진행)과 실제 여러 사람의 사용은 완성 뒤 확인한다 | 2인이 원격으로 분석 Q&A |
-| **M3 설계 티어** | 티어 승인(서버 서명), reapproval, 수정 요청 반영 | 설계가 2티어 통과 |
+| **M3 설계 티어** | 리뷰 요청·티어 승인(서버 서명), reapproval, 리뷰어 없는 티어 건너뛰기, 수정 요청 쓰레드, 리뷰어 창의 에이전트(리뷰 정책, 쓰레드 초안 블록) | 설계가 2티어 통과 |
 | **M4 구현·기록** | 구현 에이전트, **체크포인트**, impl-log·trace, Step별 coverage, **세션 원본 저장·검색** | 설명 없는 hunk 차단 확인 |
 | **M5 검증·반영** | 코드 쓰레드, **리뷰 사본 + 수정 제안**, 테스트 결과 보고, **반영 서버 검증·rebase·main push**, main 보호 설정, 감사 | 실제 에픽 1개가 서버를 통해 main까지 |
 | **M6 회의** | Meet 연동, 포커스 이벤트, 회의록 앵커링. Flightdeck OAuth 앱으로 만든 회의 공간의 회의록 자동 켜기·`meetings.space.created` 범위 확인(M0에서 넘어옴) | 회의 요약이 올바른 쓰레드에 게시 |

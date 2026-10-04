@@ -21,6 +21,8 @@ const data = {
     body: z.string().min(1),
     /** 문서 공유 커밋: 질문 대상이 이 커밋으로 문서를 본다 (§3.1, §2.4) */
     commit: GitSha.optional(),
+    /** 에이전트가 쓴 쓰레드 초안을 사람이 올렸으면 agent (§3.2) */
+    source: z.enum(["human", "agent"]).optional(),
   }),
   "thread.replied": z.object({
     thread: ThreadId,
@@ -34,8 +36,9 @@ const data = {
   "patch.applied": z.object({ thread: ThreadId, commit: GitSha }),
   /** artifact_hash는 서버가 서명 전에 확인해 채운다 (§4.2). 개발 모드의 로컬 이벤트에는 없다 */
   "phase.completed": z.object({ phase: Phase, artifact_hash: z.string().min(1).optional() }),
+  /** 담당자의 리뷰 요청 (§4.2). 이 해시가 재승인 기준인 "현재 산출물"이다 */
+  "review.requested": z.object({ phase: Phase, artifact_hash: z.string().min(1), commit: GitSha }),
   "review.approved": z.object({ phase: Phase, tier: z.string().min(1), artifact_hash: z.string().min(1) }),
-  "review.edited": z.object({ phase: Phase, commit: GitSha }),
   "phase.reverted": z.object({ from: Phase, to: Phase, reason: z.string().min(1) }),
   "run.started": z.object({
     run_id: Ulid,
@@ -78,6 +81,7 @@ export const SERVER_SIGNED_TYPES: ReadonlySet<EventType> = new Set<EventType>([
   "epic.started",
   "epic.config_upgraded",
   "phase.completed",
+  "review.requested",
   "review.approved",
   "gate.reported",
   "epic.landed",
