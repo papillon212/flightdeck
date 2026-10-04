@@ -73,6 +73,18 @@ export class LocalEventStore implements EventStore {
     return (await this.listDetailed(epic)).events;
   }
 
+  /** 메타 브랜치에 이벤트가 있는 에픽 ID 목록 */
+  async listEpics(): Promise<string[]> {
+    const head = await this.head();
+    if (!head) return [];
+    const out = await this.g(["ls-tree", "-d", "-z", "--name-only", head, "epics/"]).catch(() => "");
+    return out
+      .split("\0")
+      .filter(Boolean)
+      .map((p) => p.slice("epics/".length))
+      .sort();
+  }
+
   async listDetailed(epic: string): Promise<ListResult> {
     const head = await this.head();
     if (!head) return { events: [], invalid: [] };

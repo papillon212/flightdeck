@@ -126,7 +126,13 @@ importers:
       '@flightdeck/schema':
         specifier: workspace:*
         version: link:../schema
+      '@flightdeck/tracker':
+        specifier: workspace:*
+        version: link:../tracker
     devDependencies:
+      '@flightdeck/server':
+        specifier: workspace:*
+        version: link:../server
       '@types/vscode':
         specifier: 1.90.0
         version: 1.90.0

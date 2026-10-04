@@ -11,9 +11,11 @@
     "@flightdeck/core": "workspace:*",
     "@flightdeck/git": "workspace:*",
     "@flightdeck/hook": "workspace:*",
-    "@flightdeck/schema": "workspace:*"
+    "@flightdeck/schema": "workspace:*",
+    "@flightdeck/tracker": "workspace:*"
   },
   "devDependencies": {
+    "@flightdeck/server": "workspace:*",
     "@types/vscode": "1.90.0"
   }
 }

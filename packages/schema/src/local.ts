@@ -26,6 +26,13 @@ export const LocalEpicState = z.object({
   worktree: z.string().min(1),
   /** 이 PC의 사용자 (조종수) */
   member: MemberId,
+  /**
+   * owner: 에픽 작업 폴더 (담당자). viewer: 질문 대상의 읽기 전용 창 (§2.4). viewer에는 에이전트 설정을 넣지 않고,
+   * 쓰레드 렌더링을 편집 기록에 남기지 않는다
+   */
+  role: z.enum(["owner", "viewer"]).default("owner"),
+  /** 서버 모드의 제품 ID (설정·서명 요청) */
+  product: z.string().optional(),
   phase: Phase,
   /** 단계 룰 폴더: <configDir>/rules/{common,analysis,…}.md (§2.5) */
   configDir: z.string().min(1),
