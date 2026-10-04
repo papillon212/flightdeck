@@ -180,7 +180,7 @@ class ThreadView implements vscode.Disposable {
   constructor(private ctx: Ctx) {
     this.controller.commentingRangeProvider = {
       // 질문 대상은 새 쓰레드를 만들 수 없다(답글만). 리뷰어는 자기 차례에 수정 요청·질문을 단다 (§3.4)
-      provideCommentingRanges: (doc) => (this.canCreate && this.isArtifact(doc.uri) ? [new vscode.Range(0, 0, Math.max(0, doc.lineCount - 1), 0)] : []),
+      provideCommentingRanges: (doc) => (this.canCreate && (this.isArtifact(doc.uri) || this.codeFile(doc.uri)) ? [new vscode.Range(0, 0, Math.max(0, doc.lineCount - 1), 0)] : []),
     };
     this.controller.options = { prompt: "질문·요청을 쓰세요. @멤버로 받는 사람을 지정합니다", placeHolder: "예: @park TTL은 몇 분인가요?" };
   }
@@ -189,6 +189,15 @@ class ThreadView implements vscode.Disposable {
     if (!this.ctx.epic || !this.ctx.worktree) return false;
     const dir = path.join(this.ctx.worktree, ".flightdeck", "epics", this.ctx.epic);
     return ARTIFACT_FILES.some((n) => samePath(uri.fsPath, path.join(dir, n)));
+  }
+
+  /** 코드 쓰레드를 달 수 있는 파일: 이 창의 작업 폴더 안, Flightdeck 기록 밖 (§3.3). 상대 경로 */
+  codeFile(uri: vscode.Uri): string | null {
+    if (uri.scheme !== "file" || !this.ctx.worktree) return null;
+    const rel = path.relative(this.ctx.worktree, uri.fsPath);
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+    const r = rel.split(path.sep).join("/");
+    return r.startsWith(".flightdeck/") || r.startsWith(".git/") || r.startsWith(".claude/") || r === ".mcp.json" ? null : r;
   }
 
   /** 상태가 바뀌면 쓰레드를 모두 다시 그린다. 위치는 thread.range가 아니라 문서의 문단 ID로 계산한다 (§3.3 v0.10) */
@@ -230,6 +239,19 @@ class ThreadView implements vscode.Disposable {
         ct.canReply = this.ctx.role === "owner" || t.to.includes(this.ctx.wf.cfg.member) || t.replies.some((r) => r.author === this.ctx.wf.cfg.member);
         this.threads.set(t.id, ct);
       }
+    }
+    // 코드 쓰레드 (§3.3, M5 Y2): 앵커 커밋 → 이 작업 트리 diff로 옮긴 줄
+    for (const p of await this.ctx.wf.codeThreadPositions(this.ctx.epic).catch(() => [])) {
+      const t = p.thread;
+      const ct = this.controller.createCommentThread(vscode.Uri.file(path.join(this.ctx.worktree, p.file)), new vscode.Range(p.range[0] - 1, 0, p.range[1] - 1, 0), comments(t));
+      const hasPatch = !!(t.patch || t.replies.some((r) => r.patch));
+      ct.label = `${t.id} · ${KIND_LABEL[t.kind]}${hasPatch ? " · 수정 제안" : ""}${t.applied.length ? " · 반영함" : ""}${p.lost ? " · 위치를 잃음(그 줄이 바뀜)" : ""}`;
+      // 담당자 창에서 반영하지 않은 수정 제안이면 "수정 제안 반영" 버튼
+      ct.contextValue = t.status === "open" ? (hasPatch && this.ctx.role === "owner" && !t.applied.length ? "fd-open-patch" : "fd-open") : "fd-resolved";
+      ct.state = t.status === "open" ? vscode.CommentThreadState.Unresolved : vscode.CommentThreadState.Resolved;
+      ct.collapsibleState = t.status === "open" ? vscode.CommentThreadCollapsibleState.Expanded : vscode.CommentThreadCollapsibleState.Collapsed;
+      ct.canReply = this.ctx.role === "owner" || t.to.includes(this.ctx.wf.cfg.member) || t.author === this.ctx.wf.cfg.member || t.replies.some((r) => r.author === this.ctx.wf.cfg.member);
+      this.threads.set(t.id, ct);
     }
   }
 
@@ -273,9 +295,11 @@ function comments(t: Thread): vscode.Comment[] {
     mode: vscode.CommentMode.Preview,
     timestamp: new Date(at),
   });
+  // 수정 제안(패치)은 diff로 보여 준다 (길면 앞부분만)
+  const withPatch = (body: string, patch?: string) => (patch ? `${body}\n\n**수정 제안**\n\n\`\`\`diff\n${patch.length > 4000 ? patch.slice(0, 4000) + "\n… (생략)" : patch}\n\`\`\`` : body);
   return [
-    c(`@${t.author}${t.to.length ? " → " + t.to.map((m) => "@" + m).join(" ") : ""}`, t.body, t.at),
-    ...t.replies.map((r) => c(`@${r.author}${SOURCE_LABEL[r.source]}`, r.body, r.at)),
+    c(`@${t.author}${t.to.length ? " → " + t.to.map((m) => "@" + m).join(" ") : ""}`, withPatch(t.body, t.patch), t.at),
+    ...t.replies.map((r) => c(`@${r.author}${SOURCE_LABEL[r.source]}`, withPatch(r.body, r.patch), r.at)),
   ];
 }
 
@@ -474,7 +498,7 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     const s = await ctx.wf.sync(ctx.epic);
     flushWarnings();
     for (const r of ctx.wf.lastRender.filter((x) => x.external)) {
-      if (ctx.role === "viewer") {
+      if (ctx.role !== "owner") {
         // §6.2 v0.13: 읽기 전용 창에서는 쓰레드 초안 밖의 변경을 되돌린다
         vscode.window.showWarningMessage(`Flightdeck: 읽기 전용 창이라 ${r.file}의 내용 변경을 되돌렸습니다. 질문·코멘트는 쓰레드 초안(<!-- flightdeck:draft … -->)으로 쓰세요.`);
         continue;
@@ -494,7 +518,19 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     }
     replyCounts = new Map([...s.threads.values()].map((t) => [t.id, t.replies.length]));
     const open = [...s.threads.values()].filter((t) => t.status === "open").length;
-    const ro = ctx.role === "viewer" ? " · 읽기 전용" : "";
+    const ro = ctx.role === "viewer" ? " · 읽기 전용" : ctx.role === "review" ? " · 리뷰 사본" : "";
+    // 반영 (§11, M5): 담당자 창은 main 이동 뒤 재보고를 스스로 한다 (Y6)
+    let landing = "";
+    if (s.phase === "LANDING" && s.landing) {
+      landing = s.landing.status === "needs_report" ? " · main 이동, 테스트 재보고" : " · 반영 중";
+      if (ctx.role === "owner" && s.landing.status === "needs_report" && !s.gates.has(s.landing.commit)) {
+        void ctx.wf
+          .followLanding(ctx.epic, s, { onOutput: (x) => out.append(x) })
+          .then((r) => (r === "reported" ? notify(`Flightdeck: ${ctx.epic} main이 움직여 병합 커밋으로 테스트를 다시 보고했습니다. 서버가 반영을 다시 시도합니다.`) : undefined))
+          .catch((e) => vscode.window.showErrorMessage(`Flightdeck: 재보고 실패: ${(e as Error).message}`));
+      }
+    }
+    if (s.phase === "DONE" && s.landed) landing = ` · main ${s.landed.main_commit.slice(0, 7)}`;
     // 티어 리뷰 중이면 현재 티어 (§9.2 상태 바: DESIGN(architect))
     const rv = s.review.requested ? reviewOf(s) : null;
     const tier = rv?.current ? `(${rv.current.name})` : "";
@@ -505,7 +541,7 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       const st = await ctx.wf.implementationStatus(ctx.epic).catch((e) => (out.appendLine(`[impl] ${e}`), null));
       if (st) implLabel = ` · Step ${st.step + 1}${st.coverage.unexplained.length ? ` · 설명 필요 ${st.coverage.unexplained.length}` : ""}`;
     } else if (s.phase !== "IMPLEMENTATION") implLabel = "";
-    status.text = `$(rocket) Flightdeck · ${ctx.epic} · ${s.phase}${tier}${implLabel}${ro}${myTurn ? " · 내 리뷰 차례" : ""}${open ? ` · 열린 쓰레드 ${open}` : ""}${drafts ? ` · 초안 ${drafts}` : ""}${ctx.offline ? " · 서버 연결 안 됨" : ""}`;
+    status.text = `$(rocket) Flightdeck · ${ctx.epic} · ${s.phase}${tier}${implLabel}${landing}${ro}${myTurn ? " · 내 리뷰 차례" : ""}${open ? ` · 열린 쓰레드 ${open}` : ""}${drafts ? ` · 초안 ${drafts}` : ""}${ctx.offline ? " · 서버 연결 안 됨" : ""}`;
     status.tooltip = ctx.role === "viewer" ? "읽기 전용 창: 받은 쓰레드에 답글, 리뷰 차례면 수정 요청·승인" : "Flightdeck: 단계 완료·리뷰 요청 / 초안 / 이어서 작업";
     status.command = "flightdeck.menu";
     status.show();
@@ -558,7 +594,11 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     const interval = Number(process.env.FLIGHTDECK_POLL_MS) || 20_000;
     const onChange = async () => {
       try {
-        if (ctx.epic && ctx.role === "viewer") await ctx.wf.openAsViewer(ctx.epic); // 리뷰 요청된(없으면 최신 공유) 커밋으로
+        // 리뷰 요청된(없으면 최신 공유) 커밋으로. 반영이 끝난 에픽은 에픽 브랜치가 없어 옮기지 않는다
+        if (ctx.epic && ctx.role !== "owner") {
+          const s = await ctx.wf.epicState(ctx.epic);
+          if (s.phase !== "LANDING" && s.phase !== "DONE") await ctx.wf.openAsViewer(ctx.epic);
+        }
         await refresh();
         await notifyInbox(await ctx.wf.inbox());
         await notifyReviews(await ctx.wf.reviewInbox());
@@ -572,6 +612,17 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       void ctx.wf.inbox().then(notifyInbox, (e) => out.appendLine(`[inbox] ${e}`));
       void ctx.wf.reviewInbox().then(notifyReviews, (e) => out.appendLine(`[review] ${e}`));
     }, 1000);
+    // main 감사 (§11.4, Y8): 창을 열 때 한 번. 이미 알린 커밋은 다시 알리지 않는다
+    setTimeout(() => {
+      void ctx.wf.auditMain().then(async (f) => {
+        const seen = new Set(ext.globalState.get<string[]>("flightdeck.audited") ?? []);
+        const fresh = f.filter((x) => !seen.has(x.sha));
+        for (const x of f) out.appendLine(`[감사] ${x.sha.slice(0, 10)} ${x.subject} — ${x.reason}`);
+        if (!fresh.length) return;
+        await ext.globalState.update("flightdeck.audited", [...seen, ...fresh.map((x) => x.sha)].slice(-500));
+        void notify(`Flightdeck 감사: main에 반영 서버를 거치지 않은 커밋 ${fresh.length}개 (${fresh.map((x) => `${x.sha.slice(0, 7)} ${x.subject}`).join(", ")})`);
+      }, (e) => out.appendLine(`[감사] ${e}`));
+    }, 3000);
   }
 
   // 읽기 전용 창: 파일을 읽기 전용으로 연다 (§2.4). 이 창의 변경은 다음 공유 커밋으로 옮길 때 버려진다
@@ -738,6 +789,65 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       await vscode.window.showTextDocument(doc, { preview: true });
     }),
 
+    // ---- 검증·반영 (M5) ----
+
+    run("flightdeck.applyPatch", async (thread: vscode.CommentThread) => {
+      const c = needOwner();
+      const id = thread ? view?.idOf(thread) : null;
+      if (!id) throw new Error("수정 제안이 붙은 쓰레드에서 실행하세요");
+      await saveAll();
+      const files = await c.wf.applyPatch(c.epic, id);
+      await refresh();
+      const pick = await vscode.window.showInformationMessage(`수정 제안을 반영했습니다 (${files.join(", ")}). 확인한 뒤 "검증 다시 요청"을 누르세요.`, "검증 다시 요청");
+      if (pick) await vscode.commands.executeCommand("flightdeck.requestVerification");
+    }),
+
+    run("flightdeck.requestVerification", async () => {
+      const c = needOwner();
+      await saveAll();
+      out.show(true);
+      out.appendLine(`[검증 다시 요청] ${c.epic}: 관문 검사 → 커밋·공유 → 명령 실행 → 보고 → 리뷰 요청`);
+      const r = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Flightdeck: ${c.epic} 검증 다시 요청` }, () => c.wf.requestVerification(c.epic, { onOutput: (s) => out.append(s) }));
+      flushWarnings();
+      if (!r.ok) {
+        for (const p of r.problems) out.appendLine(`  • ${p}`);
+        return void vscode.window.showWarningMessage(`아직 다시 요청할 수 없습니다:\n${r.problems.map((p) => `• ${p}`).join("\n")}`, { modal: true });
+      }
+      await refresh();
+      const cur = reviewOf(r.state)?.current;
+      vscode.window.showInformationMessage(cur ? `Flightdeck: 검증을 다시 요청했습니다. 지금 차례: ${cur.name} 티어` : `Flightdeck: ${r.state.phase}`);
+    }),
+
+    run("flightdeck.resumeImplementation", async () => {
+      const c = needOwner();
+      const reason = await vscode.window.showInputBox({ title: "구현 재개 (VERIFICATION → IMPLEMENTATION)", prompt: "이유 (예: 수정 요청을 에이전트로 반영)", validateInput: (v) => (v.trim() ? null : "한 줄 이상") });
+      if (!reason) return;
+      await c.wf.resumeImplementation(c.epic, reason);
+      await refresh();
+    }),
+
+    run("flightdeck.suggestFix", async () => {
+      const c = need();
+      if (c.role !== "review") throw new Error("수정 제안은 검증 단계 리뷰 사본에서 만듭니다");
+      const ed = vscode.window.activeTextEditor;
+      const file = ed ? view?.codeFile(ed.document.uri) : null;
+      if (!ed || !file) throw new Error("고친 파일을 에디터로 열고, 제안을 달 줄을 선택한 뒤 실행하세요");
+      await saveAll();
+      const body = await vscode.window.showInputBox({ title: `수정 제안: ${file}:${ed.selection.start.line + 1}`, prompt: "무엇을 왜 고쳤는지 (받는 사람은 @멤버, 없으면 담당자)", validateInput: (v) => (v.trim() ? null : "한 줄 이상") });
+      if (!body) return;
+      const to = [...body.matchAll(/@([a-z0-9][a-z0-9._-]*)/gi)].map((m) => m[1]!.toLowerCase());
+      const t = await c.wf.suggestFix(c.epic, { file, range: [ed.selection.start.line + 1, ed.selection.end.line + 1], body, ...(to.length ? { to } : {}) });
+      await refresh();
+      vscode.window.showInformationMessage(`수정 제안을 올렸습니다 (${t}). 리뷰 사본은 리뷰 커밋으로 되돌렸습니다.`);
+    }),
+
+    run("flightdeck.auditMain", async () => {
+      if (!ctx || ctx.blocked) throw new Error(ctx?.blocked ?? "git 레포 폴더를 연 창에서 실행하세요.");
+      const f = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Flightdeck: main 감사" }, () => ctx.wf.auditMain());
+      for (const x of f) out.appendLine(`[감사] ${x.sha.slice(0, 10)} ${x.subject} — ${x.reason}`);
+      vscode.window[f.length ? "showWarningMessage" : "showInformationMessage"](f.length ? `main에 반영 서버를 거치지 않은 커밋 ${f.length}개: ${f.map((x) => `${x.sha.slice(0, 7)} ${x.subject}`).join(", ")}` : "main 감사: 문제 없음");
+    }),
+
     run("flightdeck.menu", async () => {
       const owner = !!ctx?.epic && ctx.role === "owner";
       const server = ctx?.mode === "server";
@@ -747,6 +857,13 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       const myTurn = !!cur?.reviewers.includes(ctx!.wf.cfg.member) && !cur.approvedBy.includes(ctx!.wf.cfg.member);
       const drafts = view?.draftCount ?? 0;
       const items = [
+        ...(owner && s?.phase === "VERIFICATION"
+          ? [
+              { label: "$(git-pull-request) 검증 다시 요청 (수정 제안 반영 뒤)", cmd: "flightdeck.requestVerification" },
+              { label: "$(debug-step-back) 구현 재개 (IMPLEMENTATION으로)", cmd: "flightdeck.resumeImplementation" },
+            ]
+          : []),
+        ...(ctx?.epic && ctx.role === "review" ? [{ label: "$(lightbulb) 수정 제안 만들기 (리뷰 사본에서 고친 내용)", cmd: "flightdeck.suggestFix" }] : []),
         ...(owner && s?.phase === "IMPLEMENTATION"
           ? [
               { label: "$(check) 구현 완료 (관문 검사·테스트·제출)", cmd: "flightdeck.completePhase" },
@@ -755,7 +872,7 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
               { label: "$(history) 체크포인트로 복원", cmd: "flightdeck.restoreCheckpoint" },
               { label: "$(diff) 체크포인트 비교", cmd: "flightdeck.compareCheckpoint" },
             ]
-          : owner
+          : owner && (s?.phase === "ANALYSIS" || s?.phase === "DESIGN")
             ? [
                 reviewPhase ? { label: "$(git-pull-request) 리뷰 요청", cmd: "flightdeck.requestReview" } : { label: "$(check) 단계 완료", cmd: "flightdeck.completePhase" },
                 { label: "$(sparkle) 에이전트 초안 작성", cmd: "flightdeck.draft" },
@@ -766,7 +883,7 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
         ...(drafts ? [{ label: `$(cloud-upload) 쓰레드 초안 모두 올리기 (${drafts})`, cmd: "flightdeck.postAllDrafts" }] : []),
         ...(ctx?.epic && ctx.role === "viewer" ? [{ label: "$(comment-discussion) 내 에이전트에게 묻기", cmd: "flightdeck.askAgent" }] : []),
         ...(!ctx?.epic ? [{ label: server ? "$(tasklist) 내 일감에서 에픽 시작" : "$(add) 새 에픽", cmd: "flightdeck.newEpic" }] : []),
-        ...(server ? [{ label: "$(mail) 받은 질문", cmd: "flightdeck.inbox" }] : []),
+        ...(server ? [{ label: "$(mail) 받은 질문", cmd: "flightdeck.inbox" }, { label: "$(shield) main 감사", cmd: "flightdeck.auditMain" }] : []),
         { label: "$(refresh) 새로 고침", cmd: "flightdeck.refresh" },
         ...(server ? [{ label: "$(key) 일감 도구 개인 토큰 설정", cmd: "flightdeck.setTrackerToken" }, { label: "$(sign-out) 서버 로그아웃", cmd: "flightdeck.logout" }] : []),
       ];
@@ -887,6 +1004,27 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       const id = view?.idOf(reply.thread);
       if (id) {
         await c.wf.reply(c.epic, id, reply.text);
+      } else if (view?.codeFile(reply.thread.uri)) {
+        // 코드 쓰레드 (§3.3). 리뷰 사본에서는 고친 내용을 수정 제안으로 붙일 수 있다 (M5 Y3)
+        const file = view.codeFile(reply.thread.uri)!;
+        const range: [number, number] = [(reply.thread.range?.start.line ?? 0) + 1, (reply.thread.range?.end.line ?? 0) + 1];
+        const to = [...reply.text.matchAll(/@([a-z0-9][a-z0-9._-]*)/gi)].map((m) => m[1]!.toLowerCase());
+        const kind = await vscode.window.showQuickPick(
+          [
+            ...(c.role === "review" ? [{ label: "수정 제안 (리뷰 사본에서 고친 내용을 붙임)", value: "suggest" as const }] : []),
+            { label: "수정 요청", value: "change_request" as const },
+            { label: "질문", value: "question" as const },
+            { label: "메모", value: "note" as const },
+          ],
+          { title: "코드 쓰레드 종류" },
+        );
+        if (!kind) return;
+        if (kind.value === "suggest") await c.wf.suggestFix(c.epic, { file, range, body: reply.text, ...(to.length ? { to } : {}) });
+        else {
+          const owner = (await c.wf.epicState(c.epic)).owner;
+          await c.wf.createCodeThread(c.epic, { file, range, kind: kind.value, to: to.length ? to : owner && owner !== c.wf.cfg.member ? [owner] : [], body: reply.text });
+        }
+        reply.thread.dispose();
       } else {
         const doc = await vscode.workspace.openTextDocument(reply.thread.uri);
         const pid = pidAt(doc, reply.thread.range?.start.line ?? 0);

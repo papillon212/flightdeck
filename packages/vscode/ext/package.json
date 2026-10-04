@@ -30,6 +30,11 @@
       { "command": "flightdeck.unexplained", "title": "설명 필요 변경 (메모 쓰기)", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
       { "command": "flightdeck.restoreCheckpoint", "title": "체크포인트로 복원", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
       { "command": "flightdeck.compareCheckpoint", "title": "체크포인트 비교", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
+      { "command": "flightdeck.applyPatch", "title": "수정 제안 반영", "icon": "$(git-merge)" },
+      { "command": "flightdeck.requestVerification", "title": "검증 다시 요청", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
+      { "command": "flightdeck.resumeImplementation", "title": "구현 재개", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
+      { "command": "flightdeck.suggestFix", "title": "수정 제안 만들기 (리뷰 사본)", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
+      { "command": "flightdeck.auditMain", "title": "main 감사", "category": "Flightdeck" },
       { "command": "flightdeck.menu", "title": "메뉴", "category": "Flightdeck" },
       { "command": "flightdeck.refresh", "title": "새로 고침", "category": "Flightdeck" },
       { "command": "flightdeck.reply", "title": "올리기", "enablement": "!commentIsEmpty" },
@@ -41,9 +46,10 @@
         { "command": "flightdeck.reply", "group": "inline", "when": "commentController == flightdeck" }
       ],
       "comments/commentThread/title": [
-        { "command": "flightdeck.resolve", "group": "navigation", "when": "commentController == flightdeck && commentThread == fd-open" },
+        { "command": "flightdeck.applyPatch", "group": "navigation", "when": "commentController == flightdeck && commentThread == fd-open-patch" },
+        { "command": "flightdeck.resolve", "group": "navigation", "when": "commentController == flightdeck && commentThread =~ /^fd-open/" },
         { "command": "flightdeck.reopen", "group": "navigation", "when": "commentController == flightdeck && commentThread == fd-resolved" },
-        { "command": "flightdeck.askAgent", "group": "navigation", "when": "commentController == flightdeck && commentThread =~ /^fd-(open|resolved)$/" },
+        { "command": "flightdeck.askAgent", "group": "navigation", "when": "commentController == flightdeck && commentThread =~ /^fd-(open|open-patch|resolved)$/" },
         { "command": "flightdeck.postDraft", "group": "navigation", "when": "commentController == flightdeck && commentThread == fd-draft" },
         { "command": "flightdeck.discardDraft", "group": "navigation", "when": "commentController == flightdeck && commentThread =~ /^fd-draft/" }
       ],
@@ -52,7 +58,8 @@
         { "command": "flightdeck.resolve", "when": "false" },
         { "command": "flightdeck.reopen", "when": "false" },
         { "command": "flightdeck.postDraft", "when": "false" },
-        { "command": "flightdeck.discardDraft", "when": "false" }
+        { "command": "flightdeck.discardDraft", "when": "false" },
+        { "command": "flightdeck.applyPatch", "when": "false" }
       ]
     },
     "configuration": {

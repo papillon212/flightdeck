@@ -173,7 +173,8 @@ describe("구현·기록 (M4 완료 기준)", { timeout: 60_000 }, () => {
     await agent("src/token.js", (await readFile(await wtFile("src/token.js"), "utf8")).replace(" // BUG", ""));
     await step("BUG 제거", pidRotate);
     const r = await A.submitImplementation(EPIC);
-    expect(r).toMatchObject({ ok: true, phase: "VERIFICATION" });
+    // 이 설정은 검증 티어에도 리뷰어가 없어 건너뛴다 → 바로 반영 대기 (M5)
+    expect(r).toMatchObject({ ok: true, phase: "LANDING" });
     const events = (await A.store.list(EPIC)).filter((e) => e.type === "gate.reported" || e.type === "phase.completed");
     expect(events.map((e) => [e.type, !!e.sig, (e.data as { phase?: string }).phase ?? ""])).toEqual([
       ["phase.completed", true, "ANALYSIS"],
