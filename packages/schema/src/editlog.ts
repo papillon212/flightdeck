@@ -22,7 +22,8 @@ export const EditSource = z.discriminatedUnion("kind", [
   }),
   z.object({ kind: z.literal("patch"), member: MemberId, thread: ThreadId }),
   // Flightdeck 자신의 렌더링: 문단 ID 부여, 쓰레드 블록 그리기 (설계 제안 T4)
-  z.object({ kind: z.literal("flightdeck"), member: MemberId, reason: z.enum(["paragraph_ids", "thread_render"]) }),
+  // draft_posted: 올린 쓰레드 초안 블록을 문서에서 지움 (§3.2 v0.13)
+  z.object({ kind: z.literal("flightdeck"), member: MemberId, reason: z.enum(["paragraph_ids", "thread_render", "draft_posted"]) }),
   z.object({ kind: z.literal("external"), commit: z.string().optional() }), // commit 없으면 external:unknown
 ]);
 export type EditSource = z.infer<typeof EditSource>;

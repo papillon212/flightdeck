@@ -3,13 +3,13 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { applyTextEdit, artifactHash, checkSections, diffToEdits, ensureParagraphIds, myOpenThreads, needsServerSignature, nowIso, reduce, renderThreads, replay, restoreParagraphIds, sha256, stripThreads, threadIdFrom, trustFromConfig, ulid, type ConfigPayload, type EpicState, type Thread } from "@flightdeck/core";
+import { applyTextEdit, artifactHash, checkSections, configVersionOf, diffToEdits, draftText, ensureParagraphIds, insertDrafts, myOpenThreads, needsServerSignature, nowIso, parseDrafts, pipelineFromDir, reduce, removeDrafts, renderThreads, replay, restoreParagraphIds, reviewOf, sha256, stripThreads, threadIdFrom, trustFromConfig, ulid, type ConfigPayload, type Draft, type EpicState, type Thread } from "@flightdeck/core";
 import { git, GitEngine, LocalEventStore, MetaRewriteError, RemoteEventStore } from "@flightdeck/git";
-import { DEV_TRUST, HANDOFF_SECTIONS, parsePipeline, PHASE_ARTIFACT, type Anchor, type EditRecord, type EditSource, type Event, type EventOf, type EventType, type LocalEpicState, type Phase, type Trust } from "@flightdeck/schema";
+import { DEV_TRUST, HANDOFF_SECTIONS, parsePipeline, PHASE_ARTIFACT, type Anchor, type EditRecord, type EditSource, type Event, type EventOf, type EventType, type LocalEpicState, type Phase, type Pipeline, type Trust } from "@flightdeck/schema";
 import type { AgentAdapter } from "@flightdeck/agent";
 import type { TrackerAdapter, TrackerEpic } from "@flightdeck/tracker";
 import { appendEditRecords, readEditLog, readState, statePath, writeState } from "@flightdeck/hook";
-import type { ServerClient } from "./server-client.ts";
+import { cacheConfig, configCacheDir, loadCachedConfig, type ServerClient } from "./server-client.ts";
 
 /** 서버 모드 (M2 원격 협업). 없으면 개발 모드: 로컬 설정 폴더, 로컬 메타 브랜치, 서명 없음 */
 export interface RemoteConfig {
@@ -126,12 +126,44 @@ export class EpicWorkflow {
     return `node ${q(path.join(this.cfg.distDir, "flightdeck-hook.mjs"))} ${this.cfg.adapter.id} --repo ${q(this.cfg.repo)} --epic ${q(epic)}`;
   }
 
+  private pipelineCache = new Map<string, Pipeline | undefined>();
+
+  /**
+   * 에픽에 고정된 설정 버전의 파이프라인 (§2.5 버전 고정, 티어 리뷰 판정).
+   * 개발 모드는 설정 폴더, 서버 모드는 받은 설정 → 캐시 → 서버 순으로 찾는다
+   */
+  async pipelineFor(version: string | null): Promise<Pipeline | undefined> {
+    if (!version) return undefined;
+    if (this.pipelineCache.has(version)) return this.pipelineCache.get(version);
+    const r = this.cfg.remote;
+    let p: Pipeline | undefined;
+    if (!r) p = pipelineFromDir(this.cfg.configDir);
+    else if (version === r.config.version) p = parsePipeline(r.config.pipeline_yaml);
+    else {
+      const dataDir = await this.eng.dataDir();
+      let c = await loadCachedConfig(dataDir, r.product, version);
+      if (!c) {
+        c = await r.server.config(r.product, version).catch(() => null);
+        if (c) await cacheConfig(dataDir, c);
+      }
+      p = c ? parsePipeline(c.pipeline_yaml) : undefined;
+    }
+    if (p) this.pipelineCache.set(version, p);
+    return p;
+  }
+
+  /** 이벤트로 에픽 상태를 계산한다 (신뢰 기준 + 에픽의 파이프라인) */
+  async reduceEvents(epic: string, events: Event[]): Promise<EpicState> {
+    const p = await this.pipelineFor(configVersionOf(events, epic));
+    return reduce(epic, events, this.trust, { pipelines: () => p });
+  }
+
   private async emit<T extends EventType>(epic: string, type: T, data: EventOf<T>["data"], author = this.cfg.member, id = ulid()): Promise<EventOf<T>> {
     if (this.cfg.remote && needsServerSignature({ type })) throw new Error(`${type}는 서버에 요청해야 하는 단계 통과 이벤트다 (§12)`);
     const e = { v: 1, id, type, epic, author, at: nowIso(), data } as EventOf<T>;
     // 메타 브랜치는 append-only라 한번 쓰면 지울 수 없다. reducer가 무시할 이벤트(권한·관문)는 쓰기 전에 막고 이유를 알린다
     const events = await this.store.list(epic);
-    const ignored = reduce(epic, [...events, e as Event], this.trust).ignored.find((i) => i.event === e.id);
+    const ignored = (await this.reduceEvents(epic, [...events, e as Event])).ignored.find((i) => i.event === e.id);
     if (ignored) throw new Error(`${type} 거부: ${ignored.reason}${ignored.reason.includes("권한") ? ` (나: ${author})` : ""}`);
     await this.store.append(e as Event);
     return e;
@@ -225,7 +257,7 @@ export class EpicWorkflow {
     const out: InboxItem[] = [];
     for (const epic of await this.store.listEpics()) {
       const events = await this.store.list(epic);
-      const s = reduce(epic, events, this.trust);
+      const s = await this.reduceEvents(epic, events);
       if (s.owner === this.cfg.member) continue; // 내 에픽은 내 작업 폴더에서 본다
       for (const t of myOpenThreads(s, this.cfg.member).filter((x) => x.to.includes(this.cfg.member))) {
         const created = events.find((e) => e.type === "thread.created" && e.data.thread === t.id) as EventOf<"thread.created"> | undefined;
@@ -244,8 +276,26 @@ export class EpicWorkflow {
     const s0 = await this.epicState(epic);
     if (s0.owner === null) throw new Error(`시작되지 않은 에픽: ${epic}`);
     if (s0.owner === this.cfg.member) throw new Error("내가 담당한 에픽은 작업 폴더에서 연다");
-    const v = await this.eng.openViewWorktree(epic, commit, this.gitRemote);
     const dataDir = await this.eng.dataDir();
+    // 올리지 않은 쓰레드 초안은 커밋을 옮겨도 남긴다 (리뷰어의 에이전트가 쓴 것, §3.2)
+    const kept = new Map<string, { draft: Draft; text: string }[]>();
+    const prevWt = this.eng.worktreePath(epic);
+    for (const name of ARTIFACT_FILES) {
+      const f = path.join(this.epicDir(prevWt, epic), name);
+      if (!existsSync(f)) continue;
+      const md = await readFile(f, "utf8");
+      const ds = parseDrafts(md).map((d) => ({ draft: d, text: draftText(md, d) }));
+      if (ds.length) kept.set(name, ds);
+    }
+    // 리뷰 중이면 리뷰 요청된 커밋을 본다 (요청 뒤 담당자가 고친 것은 다시 요청할 때까지 보지 않는다, §4.2)
+    const v = await this.eng.openViewWorktree(epic, commit ?? s0.review.requested?.commit, this.gitRemote);
+    for (const [name, ds] of kept) {
+      const f = path.join(this.epicDir(v.path, epic), name);
+      if (existsSync(f)) await writeFile(f, insertDrafts(await readFile(f, "utf8"), ds));
+    }
+    // 단계 룰·파이프라인은 에픽에 고정된 설정 버전 (훅·MCP가 읽는다)
+    const version = s0.config_version;
+    const configDir = this.cfg.remote && version && (await this.pipelineFor(version)) ? configCacheDir(dataDir, this.cfg.remote.product, version) : this.cfg.configDir;
     await writeState(dataDir, {
       epic,
       repo: this.cfg.repo,
@@ -254,11 +304,18 @@ export class EpicWorkflow {
       role: "viewer",
       ...(this.cfg.remote ? { product: this.cfg.remote.product } : {}),
       phase: s0.phase,
-      configDir: this.cfg.configDir,
+      configDir,
       trust: this.trust,
       excludeSecrets: this.eng.excludeSecrets,
       runs: {},
     });
+    // 에이전트 설정: 리뷰 정책 훅 + MCP (§3.6, §6.2 v0.13). 기록은 남기지 않는다
+    await this.cfg.adapter.installConfig(
+      v.path,
+      this.hookCommand(epic),
+      { name: "flightdeck", command: "node", args: [path.join(this.cfg.distDir, "flightdeck-mcp.mjs"), "--repo", this.cfg.repo, "--epic", epic] },
+      { model: this.cfg.model },
+    );
     return { worktree: v.path, state: await this.sync(epic) };
   }
 
@@ -271,7 +328,7 @@ export class EpicWorkflow {
   }
 
   async epicState(epic: string): Promise<EpicState> {
-    return reduce(epic, await this.store.list(epic), this.trust);
+    return this.reduceEvents(epic, await this.store.list(epic));
   }
 
   /** 이벤트로 상태를 다시 계산해 로컬 상태 파일(훅이 읽음)의 단계를 맞추고, 문서를 다시 그린다 */
@@ -311,19 +368,27 @@ export class EpicWorkflow {
     const wt = await this.worktree(epic);
     const dataDir = await this.eng.dataDir();
     if ((await readState(dataDir, epic)).role === "viewer") {
-      // 읽기 전용 창: 공유 커밋 내용 위에 쓰레드만 그린다. 편집 기록에 남기지 않는다 (§2.4)
+      // 읽기 전용 창 (§2.4, §6.2 v0.13): 공유 커밋 내용 위에 쓰레드를 그리고, 쓰레드 초안만 남긴다.
+      // 초안 밖의 변경(에이전트·사람)은 버린다. 편집 기록에 남기지 않는다
       const changed: string[] = [];
+      const report: RenderReport[] = [];
       for (const name of ARTIFACT_FILES) {
         const file = path.join(this.epicDir(wt, epic), name);
-        if (!existsSync(file)) continue;
+        const rel = path.relative(wt, file).split(path.sep).join("/");
+        const shared = await git(["show", `HEAD:${rel}`], { cwd: wt }).catch(() => null);
+        if (shared === null || !existsSync(file)) continue;
         const disk = await readFile(file, "utf8");
-        const next = renderThreads(stripThreads(disk), name, state.threads.values());
+        const drafts = parseDrafts(disk).map((d) => ({ draft: d, text: draftText(disk, d) }));
+        const rendered = renderThreads(stripThreads(shared), name, state.threads.values());
+        const next = insertDrafts(rendered, drafts);
         if (next !== disk) {
           await writeFile(file, next);
           changed.push(name);
+          // 초안·쓰레드 블록을 빼고도 다르면 문서 내용을 고친 것 → 되돌렸다고 알린다
+          if (stripThreads(removeDrafts(disk)) !== stripThreads(removeDrafts(next))) report.push({ file: name, external: true, restoredIds: 0, changed: true });
         }
       }
-      this.lastRender = [];
+      this.lastRender = report;
       return changed;
     }
     const log = await readEditLog(dataDir, epic);
@@ -379,22 +444,27 @@ export class EpicWorkflow {
   async share(epic: string, message: string): Promise<string> {
     const wt = await this.worktree(epic);
     await this.renderDocs(epic);
+    // 올리지 않은 쓰레드 초안은 개인 것이다. 공유 커밋에 들어가면 리뷰어·질문 대상에게 보인다 (§3.2)
+    const pending = (await this.drafts(epic)).length;
+    if (pending) throw new Error(`올리지 않은 쓰레드 초안이 ${pending}개 있습니다. 먼저 올리거나 지운 뒤 공유하세요`);
     const rel = path.relative(wt, this.epicDir(wt, epic));
     await this.eng.commit(wt, [rel], message, { "Flightdeck-Epic": epic });
     if (this.cfg.remote) return this.eng.pushEpicBranch(epic, this.gitRemote);
     return this.eng.revParse("HEAD", wt);
   }
 
-  async createThread(epic: string, t: { file: string; pid: string; kind: "question" | "change_request" | "note"; to: string[]; body: string }): Promise<string> {
+  async createThread(epic: string, t: { file: string; pid: string; kind: "question" | "change_request" | "note"; to: string[]; body: string; source?: "human" | "agent" }): Promise<string> {
     const s = await this.epicState(epic);
-    if ((await this.role(epic)) === "viewer") throw new Error("읽기 전용 창에서는 쓰레드를 만들 수 없다. 받은 질문에 답글만 단다");
+    const viewer = (await this.role(epic)) === "viewer";
     const unknown = this.cfg.remote ? t.to.filter((m) => !this.cfg.remote!.config.members.some((x) => x.id === m && x.active)) : [];
     if (unknown.length) throw new Error(`등록되지 않았거나 비활성인 멤버: ${unknown.map((m) => "@" + m).join(", ")}`);
     const id = ulid();
     const thread = threadIdFrom(id);
     const anchor: Anchor = { type: "paragraph", pid: t.pid };
-    const commit = this.cfg.remote ? await this.share(epic, `${epic}: 질문 공유 (${thread})`) : undefined;
-    await this.emit(epic, "thread.created", { thread, phase: s.phase, file: t.file, anchor, kind: t.kind, to: t.to, body: t.body, ...(commit ? { commit } : {}) }, this.cfg.member, id);
+    // 담당자는 문서를 공유하고 그 커밋을 남긴다. 리뷰어(읽기 전용 창)는 지금 보고 있는 커밋을 남긴다 (리뷰어는 에픽 브랜치에 쓰지 않는다)
+    const commit = viewer ? await this.eng.revParse("HEAD", await this.worktree(epic)) : this.cfg.remote ? await this.share(epic, `${epic}: 질문 공유 (${thread})`) : undefined;
+    const data = { thread, phase: s.phase, file: t.file, anchor, kind: t.kind, to: t.to, body: t.body, ...(commit ? { commit } : {}), ...(t.source === "agent" ? { source: "agent" as const } : {}) };
+    await this.emit(epic, "thread.created", data, this.cfg.member, id);
     await this.sync(epic);
     await this.mention(epic, t.to, `${t.kind === "question" ? "질문" : t.kind === "change_request" ? "수정 요청" : "메모"} 1건 · ${t.file}`, thread);
     return thread;
@@ -422,6 +492,123 @@ export class EpicWorkflow {
   async setThreadStatus(epic: string, thread: string, resolved: boolean, author?: string): Promise<void> {
     await this.emit(epic, resolved ? "thread.resolved" : "thread.reopened", { thread }, author);
     await this.sync(epic);
+  }
+
+  // ---- 쓰레드 초안 (§3.2 v0.13): 에이전트가 문서에 쓰고, 사람이 확인해 올린다 ----
+
+  /** 이 창의 산출물에 있는 쓰레드 초안 */
+  async drafts(epic: string): Promise<{ file: string; draft: Draft }[]> {
+    const wt = await this.worktree(epic);
+    const out: { file: string; draft: Draft }[] = [];
+    for (const name of ARTIFACT_FILES) {
+      const f = path.join(this.epicDir(wt, epic), name);
+      if (existsSync(f)) for (const d of parseDrafts(await readFile(f, "utf8"))) out.push({ file: name, draft: d });
+    }
+    return out;
+  }
+
+  /** 초안을 문서에서 지운다 (담당자 창은 편집 기록에 flightdeck/draft_posted로 남긴다). 지우기 전 내용을 돌려준다 */
+  private async takeDraft(epic: string, file: string, key: string): Promise<{ before: string; draft: Draft }> {
+    const wt = await this.worktree(epic);
+    const f = path.join(this.epicDir(wt, epic), file);
+    const before = await readFile(f, "utf8");
+    const draft = parseDrafts(before).find((d) => d.key === key);
+    if (!draft) throw new Error("초안을 찾지 못했다 (이미 올렸거나 바뀌었다). 새로 고쳐 주세요");
+    const after = removeDrafts(before, [key]);
+    await writeFile(f, after);
+    if ((await this.role(epic)) === "owner") {
+      const rel = path.relative(wt, f).split(path.sep).join("/");
+      await this.recordDiff(epic, rel, before, after, { kind: "flightdeck", member: this.cfg.member, reason: "draft_posted" });
+    }
+    return { before, draft };
+  }
+
+  /** 초안을 올린다: 새 쓰레드 또는 답글 (source: agent). 실패하면 초안을 되살린다 */
+  async postDraft(epic: string, file: string, key: string): Promise<string> {
+    const { before, draft: d } = await this.takeDraft(epic, file, key);
+    try {
+      if (d.error) throw new Error(d.error);
+      if (d.reply) {
+        await this.reply(epic, d.reply, d.body, { source: "agent" });
+        return d.reply;
+      }
+      return await this.createThread(epic, { file, pid: d.anchor!, kind: d.kind!, to: d.to, body: d.body, source: "agent" });
+    } catch (e) {
+      const wt = await this.worktree(epic);
+      const f = path.join(this.epicDir(wt, epic), file);
+      if ((await this.role(epic)) === "owner") await this.recordDiff(epic, path.relative(wt, f).split(path.sep).join("/"), await readFile(f, "utf8"), before, { kind: "flightdeck", member: this.cfg.member, reason: "draft_posted" });
+      await writeFile(f, before);
+      throw e;
+    }
+  }
+
+  /** 초안을 버린다 */
+  async discardDraft(epic: string, file: string, key: string): Promise<void> {
+    await this.takeDraft(epic, file, key);
+    await this.sync(epic);
+  }
+
+  // ---- 티어 리뷰 (§4.2 v0.13) ----
+
+  /** 리뷰 요청: 산출물 형식 확인 → 공유 → 서버에 review.requested → 현재 티어 리뷰어에게 일감 멘션 */
+  async requestReview(epic: string): Promise<{ ok: true; state: EpicState } | { ok: false; problems: string[] }> {
+    const s0 = await this.epicState(epic);
+    const problems: string[] = [];
+    if (s0.owner !== this.cfg.member) problems.push(`담당자(@${s0.owner})만 리뷰를 요청할 수 있습니다`);
+    const a = PHASE_ARTIFACT[s0.phase as keyof typeof PHASE_ARTIFACT];
+    if (!a || !reviewOf(s0)) problems.push(`${s0.phase} 단계는 티어 리뷰가 없습니다`);
+    const wt = await this.worktree(epic);
+    if (a) {
+      const file = path.join(this.epicDir(wt, epic), a.file);
+      if (!existsSync(file)) problems.push(`${a.file}이 없습니다`);
+      else {
+        const c = checkSections(await readFile(file, "utf8"), a.sections);
+        if (c.missing.length) problems.push(`빠진 섹션: ${c.missing.join(", ")}`);
+        if (c.outOfOrder) problems.push(`섹션 순서가 다릅니다 (${a.sections.join(" → ")})`);
+        if (c.empty.length) problems.push(`빈 섹션: ${c.empty.join(", ")}`);
+      }
+    }
+    if (problems.length) return { ok: false, problems };
+    const head = await this.share(epic, `${epic}: ${s0.phase} 리뷰 요청`);
+    const text = await git(["show", `${head}:.flightdeck/epics/${epic}/${a!.file}`], { cwd: wt });
+    await this.passEvent(epic, "review.requested", { phase: s0.phase, artifact_hash: artifactHash(text) });
+    const s = await this.sync(epic);
+    await this.mentionReviewTurn(epic, s);
+    return { ok: true, state: s };
+  }
+
+  /** 리뷰 차례 멘션 (§3.7, §4.2): 현재 티어 리뷰어 중 아직 승인하지 않은 사람 */
+  private async mentionReviewTurn(epic: string, s: EpicState): Promise<void> {
+    const cur = reviewOf(s)?.current;
+    if (!cur || s.phase !== "DESIGN") return;
+    const a = PHASE_ARTIFACT[s.phase as keyof typeof PHASE_ARTIFACT];
+    const to = cur.reviewers.filter((m) => m !== this.cfg.member && !cur.approvedBy.includes(m));
+    await this.mention(epic, to, `리뷰 차례(${cur.name}) · ${a.file}`);
+  }
+
+  /** 내 리뷰 차례: 리뷰 요청된 에픽 중 현재 티어 리뷰어인데 아직 승인하지 않은 것 */
+  async reviewInbox(): Promise<{ epic: string; tier: string; commit: string; phase: Phase }[]> {
+    await this.pull();
+    const out: { epic: string; tier: string; commit: string; phase: Phase }[] = [];
+    for (const epic of await this.store.listEpics()) {
+      const s = await this.reduceEvents(epic, await this.store.list(epic));
+      const cur = reviewOf(s)?.current;
+      if (!s.review.requested || !cur || s.owner === this.cfg.member) continue;
+      if (cur.reviewers.includes(this.cfg.member) && !cur.approvedBy.includes(this.cfg.member)) out.push({ epic, tier: cur.name, commit: s.review.requested.commit, phase: s.phase });
+    }
+    return out;
+  }
+
+  /** 승인 (서버가 리뷰어 자격·차례·해시를 확인해 서명). 단계가 넘어가면 일감 상태를, 아니면 다음 티어 리뷰어에게 멘션 */
+  async approve(epic: string): Promise<EpicState> {
+    const s0 = await this.epicState(epic);
+    if (!s0.review.requested) throw new Error("리뷰 요청 전입니다");
+    const before = reviewOf(s0)?.current?.name;
+    await this.passEvent(epic, "review.approved", { phase: s0.phase, artifact_hash: s0.review.requested.hash });
+    const s = await this.sync(epic);
+    if (s.phase !== s0.phase) await this.trackerPhase(epic, s.phase);
+    else if (reviewOf(s)?.current?.name !== before) await this.mentionReviewTurn(epic, s);
+    return s;
   }
 
   // ---- 단계 (§4) ----
@@ -457,6 +644,7 @@ export class EpicWorkflow {
   /** 단계 완료 (§4.1): 검사 → 산출물·인수인계 커밋 → phase.completed → 동기화 */
   async completePhase(epic: string): Promise<{ ok: true; commit: string | null; phase: Phase } | { ok: false; problems: string[] }> {
     const { phase, problems } = await this.checkPhase(epic);
+    if (reviewOf(await this.epicState(epic))) return { ok: false, problems: [`${phase} 단계는 "리뷰 요청" 후 티어 승인으로 넘어갑니다 (§4.2)`] };
     if (problems.length) return { ok: false, problems };
     const wt = await this.worktree(epic);
     await this.renderDocs(epic);

@@ -15,6 +15,8 @@ export interface PolicyInput {
   protectedPaths: string[];
   /** VERIFICATION에서 허용할 테스트 명령 (pipeline gate.commands) */
   testCommands?: string[];
+  /** viewer: 질문 대상·리뷰어의 읽기 전용 창 (§6.2 v0.13). 단계와 무관하게 산출물 문서(쓰레드 초안용)만 쓰고, 셸은 읽기 전용 */
+  role?: "owner" | "viewer";
 }
 
 export type Decision = { allow: true } | { allow: false; reason: string };
@@ -27,6 +29,17 @@ export const READ_ONLY_COMMANDS = new Set([
   "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "tree", "pwd", "echo", "which", "file", "stat", "du",
   "sort", "uniq", "cut", "jq", "diff", "cd", "true", "basename", "dirname", "realpath",
 ]);
+
+/** 읽기 전용 셸: 허용 목록 명령만, 명령 치환·파일 출력·git 불가 */
+function readOnlyShell(cmd: string, where: string): Decision {
+  const segments = splitCommand(cmd);
+  if (segments.some((s) => s.prog === "git")) return deny("git 명령은 쓸 수 없습니다. 버전 관리는 Flightdeck이 합니다.");
+  if (/\$\(|`/.test(cmd)) return deny(`${where}에서는 명령 치환을 쓸 수 없습니다(읽기 전용).`);
+  if (hasWriteRedirect(cmd)) return deny(`${where}에서는 파일로 출력할 수 없습니다(읽기 전용).`);
+  const bad = segments.find((s) => !READ_ONLY_COMMANDS.has(s.prog) || (s.prog === "find" && /\s-(delete|exec|execdir|ok|fprint)/.test(s.text)));
+  if (bad) return deny(`${where}에서는 읽기 전용 명령만 쓸 수 있습니다(${bad.prog} 불가).`);
+  return ALLOW;
+}
 
 export function decide(p: PolicyInput): Decision {
   const rel = (abs: string) => path.relative(p.worktree, abs).split(path.sep).join("/");
@@ -44,6 +57,20 @@ export function decide(p: PolicyInput): Decision {
     if (p.protectedPaths.includes(r)) return deny(`에이전트 설정 파일(${r})은 읽거나 쓸 수 없습니다.`);
   }
 
+  if (p.role === "viewer") {
+    if (p.tool.kind === "write") {
+      for (const abs of p.tool.paths) {
+        const r = inside(abs) ? rel(abs) : abs;
+        if (r !== `${epicDir}/analysis.md` && r !== `${epicDir}/design.md`) {
+          return deny(`읽기 전용 창입니다. 쓸 수 있는 것은 ${epicDir}/analysis.md·design.md의 쓰레드 초안 블록(<!-- flightdeck:draft … -->)뿐입니다 (${r} 불가).`);
+        }
+      }
+      return ALLOW; // 초안 블록 밖의 변경은 확장이 되돌린다
+    }
+    if (p.tool.kind === "shell") return readOnlyShell(p.tool.command ?? "", "읽기 전용 창");
+    return ALLOW;
+  }
+
   if (p.tool.kind === "write") {
     for (const abs of p.tool.paths) {
       if (!inside(abs)) return deny(`작업 폴더 밖(${abs})에는 쓸 수 없습니다.`);
@@ -59,13 +86,8 @@ export function decide(p: PolicyInput): Decision {
     if (segments.some((s) => s.prog === "git")) return deny("git 명령은 쓸 수 없습니다. 버전 관리는 Flightdeck이 합니다.");
     switch (p.phase) {
       case "ANALYSIS":
-      case "DESIGN": {
-        if (/\$\(|`/.test(cmd)) return deny(`${p.phase} 단계에서는 명령 치환을 쓸 수 없습니다(읽기 전용).`);
-        if (hasWriteRedirect(cmd)) return deny(`${p.phase} 단계에서는 파일로 출력할 수 없습니다(읽기 전용).`);
-        const bad = segments.find((s) => !READ_ONLY_COMMANDS.has(s.prog) || (s.prog === "find" && /\s-(delete|exec|execdir|ok|fprint)/.test(s.text)));
-        if (bad) return deny(`${p.phase} 단계에서는 읽기 전용 명령만 쓸 수 있습니다(${bad.prog} 불가).`);
-        return ALLOW;
-      }
+      case "DESIGN":
+        return readOnlyShell(cmd, `${p.phase} 단계`);
       case "IMPLEMENTATION": {
         if (segments.some((s) => s.prog === "rm" && /\s-[a-zA-Z]*r[a-zA-Z]*f|\s-[a-zA-Z]*f[a-zA-Z]*r|--recursive.*--force/.test(s.text))) return deny("rm -rf는 쓸 수 없습니다.");
         return ALLOW;

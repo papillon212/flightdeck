@@ -145,8 +145,11 @@ describe("2인 원격 분석 Q&A (M2 완료 기준)", { timeout: 60_000 }, () =>
     expect(listThreadBlocks(doc)).toEqual([expect.objectContaining({ id: inbox[0]!.thread.id, status: "open" })]);
     expect(doc.indexOf("TTL은 요구사항상")).toBeGreaterThan(doc.indexOf("- TTL이 몇 분인가?"));
     expect(await B.role(epic)).toBe("viewer");
-    expect(existsSync(path.join(v.worktree, ".claude/settings.local.json"))).toBe(false); // 에이전트 설정 없음
-    await expect(B.createThread(epic, { file: "analysis.md", pid: "p:0000", kind: "note", to: [], body: "x" })).rejects.toThrow(/읽기 전용 창/);
+    // 에이전트 설정: 리뷰 정책 훅 + MCP (v0.13 W7). git에는 잡히지 않는다
+    expect(existsSync(path.join(v.worktree, ".claude/settings.local.json"))).toBe(true);
+    expect(await git(["status", "--porcelain", "--untracked-files=all"], { cwd: v.worktree })).not.toMatch(/\.claude|\.mcp\.json/);
+    // 질문 대상은 리뷰어가 아니라 새 쓰레드를 만들 수 없다 (답글만)
+    await expect(B.createThread(epic, { file: "analysis.md", pid: "p:0000", kind: "note", to: [], body: "x" })).rejects.toThrow(/쓰레드 생성 권한 없음/);
     await B.reply(epic, inbox[0]!.thread.id, "30분, 슬라이딩 갱신입니다.");
     expect(await readEditLog(path.join(B.cfg.repo, ".git", "flightdeck"), epic)).toEqual([]); // 읽기 전용 창은 편집 기록을 남기지 않는다
     expect(await B.inbox()).toEqual([]); // 내가 마지막으로 답했으므로

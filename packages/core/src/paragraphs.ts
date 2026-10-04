@@ -9,6 +9,9 @@ import { diffArrays } from "diff";
 export const PID_LINE = /^<!-- (p:[0-9a-f]{4}) -->$/;
 export const THREAD_START = /^<!-- flightdeck:thread .*-->$/;
 export const THREAD_END = /^<!-- \/flightdeck:thread -->$/;
+// drafts.ts의 DRAFT_START/END와 같은 모양 (순환 import를 피해 여기 둔다)
+export const DRAFT_START_LINE = /^<!-- flightdeck:draft( [^>]*?)? ?-->$/;
+export const DRAFT_END_LINE = /^<!-- \/flightdeck:draft -->$/;
 const HEADING = /^#{1,6} /;
 const FENCE = /^(```|~~~)/;
 /** 최상위 목록 항목. 항목마다 따로 블록이 된다(불명확한 점 항목별로 쓰레드를 달 수 있게) */
@@ -34,6 +37,12 @@ export function parseBlocks(lines: string[]): Block[] {
       i++;
       continue;
     }
+    // 쓰레드 초안 블록(§3.2)도 문서 내용이 아니다: 문단 ID를 붙이지 않는다
+    if (DRAFT_START_LINE.test(line)) {
+      while (i < lines.length && !DRAFT_END_LINE.test(lines[i]!)) i++;
+      i++;
+      continue;
+    }
     if (line.trim() === "" || PID_LINE.test(line)) {
       i++;
       continue;
@@ -54,6 +63,7 @@ export function parseBlocks(lines: string[]): Block[] {
         !HEADING.test(lines[i]!) &&
         !FENCE.test(lines[i]!) &&
         !THREAD_START.test(lines[i]!) &&
+        !DRAFT_START_LINE.test(lines[i]!) &&
         !(i > start && LIST_ITEM.test(lines[i]!))
       )
         i++;

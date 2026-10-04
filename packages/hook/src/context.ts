@@ -59,7 +59,48 @@ export async function sessionContext(c: ContextInput): Promise<string> {
   const handoffs = listHandoffs(c.worktree, c.epic).filter((h) => !h.includes(c.runId));
   if (handoffs.length) out.push("## 이전 실행의 인수인계 기록", ...handoffs.map((h) => `- ${h}`), "필요하면 읽어서 이어받으세요(`flightdeck_get_handoffs`).");
 
-  out.push("## Flightdeck 도구 (MCP)", "- flightdeck_get_epic: 일감 원문과 현재 단계", "- flightdeck_list_threads: 쓰레드와 답글", "- flightdeck_get_handoffs: 이전 실행들의 인수인계 기록");
+  out.push(...TOOLS_LINES, ...DRAFT_LINES);
+  return out.join("\n\n");
+}
+
+const TOOLS_LINES = ["## Flightdeck 도구 (MCP)", "- flightdeck_get_epic: 일감 원문과 현재 단계\n- flightdeck_list_threads: 쓰레드와 답글\n- flightdeck_get_handoffs: 이전 실행들의 인수인계 기록"];
+
+/** 쓰레드 초안 블록 문법 (§3.2 v0.13). 사용자가 질문·답글·코멘트를 달라고 하면 이렇게 쓴다 */
+const DRAFT_LINES = [
+  "## 쓰레드 초안 (사용자가 질문·답글·코멘트를 달라고 할 때)",
+  [
+    "쓰레드 블록(<!-- flightdeck:thread … -->)은 직접 고치지 마세요. 대신 산출물 문서에 **초안 블록**을 쓰면, 사용자가 확인한 뒤 올립니다.",
+    "- 새 쓰레드: 대상 블록(문단·목록 항목) **바로 아래**에",
+    "  <!-- flightdeck:draft kind=question to=멤버1,멤버2 -->",
+    "  본문",
+    "  <!-- /flightdeck:draft -->",
+    "  kind는 question(질문) | change_request(수정 요청) | note(코멘트). to는 받을 멤버(없으면 생략).",
+    "- 답글: 아무 곳에나 <!-- flightdeck:draft reply=<쓰레드 ID> --> 본문 <!-- /flightdeck:draft -->",
+    "- 문단 ID 줄(<!-- p:xxxx -->)은 지우거나 바꾸지 마세요.",
+  ].join("\n"),
+];
+
+/** 질문 대상·리뷰어의 읽기 전용 창 (§3.6, §6.2 v0.13): 기록하지 않는 개인 질문 세션 */
+export async function viewerContext(c: { epic: string; phase: Phase; member: string; worktree: string; state: EpicState; review?: string }): Promise<string> {
+  const epicDir = `.flightdeck/epics/${c.epic}`;
+  const out = [
+    `[Flightdeck] 에픽 ${c.epic} · 단계 ${c.phase} · @${c.member}의 **읽기 전용 창**(질문 대상·리뷰). 이 세션은 기록하지 않습니다.`,
+    [
+      "- 문서 내용·코드는 고칠 수 없습니다. 고쳐도 확장이 되돌립니다.",
+      `- 쓸 수 있는 것: ${epicDir}/analysis.md·design.md 안의 **쓰레드 초안 블록**뿐 (아래 문법).`,
+      "- 셸은 읽기 전용 명령만 됩니다.",
+      "- 사용자가 문서를 검사해 달라고 하면 문서·쓰레드·인수인계 기록을 읽고 답하세요. 질문·답글·코멘트를 달라고 하면 초안 블록으로 쓰세요.",
+    ].join("\n"),
+  ];
+  if (c.review) out.push("## 리뷰", c.review);
+  const open = [...c.state.threads.values()].filter((t) => t.status === "open");
+  if (open.length) {
+    out.push("## 열린 쓰레드");
+    for (const t of open) out.push(`- ${t.id} (${t.kind}, @${t.author} → ${t.to.map((m) => "@" + m).join(" ") || "-"}): ${oneLine(t.body)}`);
+  }
+  const handoffs = listHandoffs(c.worktree, c.epic);
+  if (handoffs.length) out.push("## 인수인계 기록", ...handoffs.map((h) => `- ${h}`));
+  out.push(...TOOLS_LINES, ...DRAFT_LINES);
   return out.join("\n\n");
 }
 

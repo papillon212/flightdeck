@@ -8,11 +8,11 @@
 import { existsSync, realpathSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { checkParagraphIds, nowIso, pipelineFromDir, reduce, sha256, ulid } from "@flightdeck/core";
+import { checkParagraphIds, nowIso, pipelineFromDir, reduce, reviewOf, sha256, ulid } from "@flightdeck/core";
 import type { EditRecord, EditSource, Event, LocalEpicState } from "@flightdeck/schema";
 import type { AgentAdapter, HookEvent, HookResponse } from "@flightdeck/agent";
 import { git, GitEngine, isSecret, LocalEventStore, RAW_ARGS, RAW_ENV } from "@flightdeck/git";
-import { phaseChangedContext, sessionContext } from "./context.ts";
+import { phaseChangedContext, sessionContext, viewerContext } from "./context.ts";
 import { decide } from "./policy.ts";
 import { appendEditRecords, hookLog, lastSeq, saveSnapshot, takeSnapshot, updateState } from "./store.ts";
 
@@ -24,6 +24,7 @@ export interface HandlerDeps {
 }
 
 export async function handle(ev: HookEvent, d: HandlerDeps): Promise<HookResponse> {
+  if (d.state.role === "viewer") return handleViewer(ev, d);
   switch (ev.kind) {
     case "session.start":
       return onSessionStart(ev, d);
@@ -40,6 +41,34 @@ export async function handle(ev: HookEvent, d: HandlerDeps): Promise<HookRespons
       await onSessionEnd(ev, d);
       return { kind: "allow" };
   }
+}
+
+/**
+ * 읽기 전용 창 (§3.6, §6.2 v0.13): 개인 질문 세션이라 실행·편집 기록·체크포인트를 남기지 않는다.
+ * 권한만 본다(산출물 문서의 쓰레드 초안만 쓰기, 셸은 읽기 전용). 초안 밖의 변경은 확장이 되돌린다.
+ */
+async function handleViewer(ev: HookEvent, d: HandlerDeps): Promise<HookResponse> {
+  const s = d.state;
+  if (ev.kind === "session.start") {
+    const st = await loadEpicState(d);
+    const rv = reviewOf(st);
+    const review = rv?.current?.reviewers.includes(s.member)
+      ? `지금은 @${s.member}의 리뷰 차례입니다(${rv.current.name} 티어). 사용자가 승인 여부를 판단할 수 있게 문서를 검사해 주세요. 승인은 사용자가 직접 합니다.`
+      : undefined;
+    return { kind: "context", text: await viewerContext({ epic: s.epic, phase: st.phase, member: s.member, worktree: s.worktree, state: st, ...(review ? { review } : {}) }) };
+  }
+  if (ev.kind !== "tool.before") return { kind: "allow" };
+  const t = ev.tool!;
+  const decision = decide({
+    phase: s.phase,
+    epic: s.epic,
+    runId: null,
+    worktree: realpathLoose(s.worktree),
+    tool: { name: t.name, kind: t.kind, paths: t.paths.map(realpathLoose), command: t.command },
+    protectedPaths: d.adapter.protectedPaths(),
+    role: "viewer",
+  });
+  return decision.allow ? { kind: "allow" } : { kind: "deny", reason: decision.reason };
 }
 
 const iso = (d: HandlerDeps) => nowIso(d.now?.() ?? new Date());

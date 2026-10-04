@@ -1,7 +1,7 @@
 // 산출물 형식 검사 (설계 §6.3 analysis·design, §6.4 handoff).
 // 필수 `## <섹션>` 제목이 모두 있고, 이 순서대로 나오고, 내용이 비어 있지 않아야 한다.
-// 쓰레드 블록과 문단 ID 줄은 내용으로 치지 않는다.
-import { PID_LINE, THREAD_END, THREAD_START } from "./paragraphs.ts";
+// 쓰레드 블록·쓰레드 초안 블록과 문단 ID 줄은 내용으로 치지 않는다.
+import { DRAFT_END_LINE, DRAFT_START_LINE, PID_LINE, THREAD_END, THREAD_START } from "./paragraphs.ts";
 import { sha256 } from "./util.ts";
 
 /** 승인·단계 완료의 artifact_hash (§4.2): 에픽 브랜치에 올라간 산출물 파일 바이트(UTF-8)의 sha256 */
@@ -21,9 +21,9 @@ export function checkSections(md: string, required: readonly string[]): SectionC
   let inFence = false;
   let inThread = false;
   for (const line of md.split(/\r?\n/)) {
-    if (THREAD_START.test(line)) inThread = true;
+    if (THREAD_START.test(line) || DRAFT_START_LINE.test(line)) inThread = true;
     if (inThread) {
-      if (THREAD_END.test(line)) inThread = false;
+      if (THREAD_END.test(line) || DRAFT_END_LINE.test(line)) inThread = false;
       continue;
     }
     if (/^(```|~~~)/.test(line)) inFence = !inFence;

@@ -155,7 +155,8 @@ describe("GitEngine: 체크포인트 (설계 §8.1)", () => {
   });
 });
 
-describe("LocalEventStore (설계 §1.3, §3.1)", () => {
+// 동시 추가는 git 프로세스를 많이 띄워 전체 테스트를 함께 돌리면 느려진다
+describe("LocalEventStore (설계 §1.3, §3.1)", { timeout: 60_000 }, () => {
   let t = 1_790_000_000_000;
   const mk = (author: string, body: string): Event =>
     EventSchema.parse({
