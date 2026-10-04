@@ -8,9 +8,9 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import * as vscode from "vscode";
 import { ClaudeCodeAdapter, cleanEnv } from "@flightdeck/agent";
-import { coalesce, nowIso, parseBlocks, parseDrafts, PID_LINE, restoreParagraphIds, reviewOf, sha256, type ConfigPayload, type EpicState, type Thread } from "@flightdeck/core";
+import { coalesce, linesLabel, nowIso, parseBlocks, parseDrafts, PID_LINE, restoreParagraphIds, reviewOf, sha256, type ConfigPayload, type EpicState, type Thread } from "@flightdeck/core";
 import { git, RemoteEventStore } from "@flightdeck/git";
-import { appendEditRecords, readState } from "@flightdeck/hook";
+import { appendEditRecords, readEditLog, readState } from "@flightdeck/hook";
 import { parsePipeline, type EditRecord, type LocalEpicState, type Phase } from "@flightdeck/schema";
 import { ClickUpTracker, type TrackerAdapter } from "@flightdeck/tracker";
 import { cacheConfig, loadCachedConfig, ServerClient, ServerRequestError } from "./server-client.ts";
@@ -428,6 +428,14 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     });
 
   let view: ThreadView | null = null;
+  let human: HumanEdits | null = null;
+  /** 구현 단계 상태 표시 (Step·설명 필요 수). 저장하지 않은 편집이 있으면 계산하지 않고 직전 값을 쓴다 */
+  let implLabel = "";
+  /** 저장하고 사람 편집 기록을 비운다. 그래야 편집 기록 재적용 = 디스크 비교(외부 변경 감지)가 맞다 */
+  const saveAll = async () => {
+    await vscode.workspace.saveAll(false);
+    await human?.flush();
+  };
   /** 부가 동작(일감 멘션·상태, 원격 맞추기)의 경고를 보여 준다 */
   const flushWarnings = () => {
     for (const w of ctx?.wf.warnings.splice(0) ?? []) {
@@ -488,7 +496,12 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     const tier = rv?.current ? `(${rv.current.name})` : "";
     const myTurn = !!rv?.current?.reviewers.includes(me) && !rv.current.approvedBy.includes(me) && s.owner !== me;
     const drafts = (await ctx.wf.drafts(ctx.epic).catch(() => [])).length;
-    status.text = `$(rocket) Flightdeck · ${ctx.epic} · ${s.phase}${tier}${ro}${myTurn ? " · 내 리뷰 차례" : ""}${open ? ` · 열린 쓰레드 ${open}` : ""}${drafts ? ` · 초안 ${drafts}` : ""}${ctx.offline ? " · 서버 연결 안 됨" : ""}`;
+    // 구현 단계 (§9.2): 지금 열린 Step과 설명이 필요한 변경 수
+    if (s.phase === "IMPLEMENTATION" && ctx.role === "owner" && !unsavedIn(ctx.worktree!)) {
+      const st = await ctx.wf.implementationStatus(ctx.epic).catch((e) => (out.appendLine(`[impl] ${e}`), null));
+      if (st) implLabel = ` · Step ${st.step + 1}${st.coverage.unexplained.length ? ` · 설명 필요 ${st.coverage.unexplained.length}` : ""}`;
+    } else if (s.phase !== "IMPLEMENTATION") implLabel = "";
+    status.text = `$(rocket) Flightdeck · ${ctx.epic} · ${s.phase}${tier}${implLabel}${ro}${myTurn ? " · 내 리뷰 차례" : ""}${open ? ` · 열린 쓰레드 ${open}` : ""}${drafts ? ` · 초안 ${drafts}` : ""}${ctx.offline ? " · 서버 연결 안 됨" : ""}`;
     status.tooltip = ctx.role === "viewer" ? "읽기 전용 창: 받은 쓰레드에 답글, 리뷰 차례면 수정 요청·승인" : "Flightdeck: 단계 완료·리뷰 요청 / 초안 / 이어서 작업";
     status.command = "flightdeck.menu";
     status.show();
@@ -566,7 +579,11 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     view = new ThreadView(ctx);
     ext.subscriptions.push(view);
     // 읽기 전용 창은 편집 기록을 남기지 않는다 (§2.4)
-    if (ctx.role === "owner") ext.subscriptions.push(new HumanEdits(ctx, await ctx.wf.eng.dataDir(), ctx.wf.cfg.member, refresh));
+    if (ctx.role === "owner") {
+      human = new HumanEdits(ctx, await ctx.wf.eng.dataDir(), ctx.wf.cfg.member, refresh);
+      ext.subscriptions.push(human);
+      ext.subscriptions.push(checkpointTimers(ctx as Ctx & { epic: string; worktree: string }, out, refresh));
+    }
     // 에이전트가 산출물을 고치면(디스크 변경) 다시 그린다: 담당자 창은 문단 ID·쓰레드, 읽기 전용 창은 초안만 남기고 되돌림
     const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.join(ctx.worktree, ".flightdeck", "epics", ctx.epic), "{analysis,design}.md"));
     let t: NodeJS.Timeout | null = null;
@@ -639,14 +656,82 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
 
     run("flightdeck.completePhase", async () => {
       const c = needOwner();
-      const r = await c.wf.completePhase(c.epic);
+      const impl = (await c.wf.epicState(c.epic)).phase === "IMPLEMENTATION";
+      if (impl) {
+        await saveAll();
+        out.show(true);
+        out.appendLine(`[구현 완료] ${c.epic}: 관문 검사 → 커밋·공유 → 명령 실행 → 보고`);
+      }
+      const r = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Flightdeck: ${c.epic} ${impl ? "구현 완료 (관문 검사·명령 실행)" : "단계 완료"}` }, () =>
+        c.wf.completePhase(c.epic, { onOutput: (s) => out.append(s) }),
+      );
+      flushWarnings();
       if (!r.ok) {
-        vscode.window.showWarningMessage(`아직 단계를 완료할 수 없습니다:\n${r.problems.map((p) => `• ${p}`).join("\n")}`, { modal: true });
+        for (const p of r.problems) out.appendLine(`  • ${p}`);
+        const more = "coverage" in r && r.coverage?.unexplained.length ? "설명 필요 변경 보기" : undefined;
+        const pick = await vscode.window.showWarningMessage(`아직 ${impl ? "구현을 제출할" : "단계를 완료할"} 수 없습니다:\n${r.problems.map((p) => `• ${p}`).join("\n")}`, { modal: true }, ...(more ? [more] : []));
+        if (pick === more) await vscode.commands.executeCommand("flightdeck.unexplained");
+        await refresh();
         return;
       }
       await refresh();
       const pick = await vscode.window.showInformationMessage(`${c.epic}: ${r.phase} 단계로 넘어갔습니다${r.commit ? ` (커밋 ${r.commit.slice(0, 7)})` : ""}.`, r.phase === "DESIGN" ? "설계 초안 작성" : "확인");
       if (pick === "설계 초안 작성") await vscode.commands.executeCommand("flightdeck.draft");
+    }),
+
+    // 설명 필요 변경 (§7.3, §7.4): 메모가 필요한 수정 묶음에 메모를 쓰고, Step 기록이 필요한 에이전트 편집을 알려 준다
+    run("flightdeck.unexplained", async () => {
+      const c = needOwner();
+      await saveAll();
+      const st = await c.wf.implementationStatus(c.epic);
+      if (st.drift.length) vscode.window.showWarningMessage(`Flightdeck 밖에서 바뀐 파일을 외부 변경으로 기록했습니다: ${st.drift.join(", ")}`);
+      const groups = st.coverage.groups;
+      if (!groups.length) {
+        await refresh();
+        return void vscode.window.showInformationMessage(`설명이 필요한 변경이 없습니다 (coverage ${(st.coverage.ratio * 100).toFixed(0)}%).`);
+      }
+      const KIND = { human: "직접 수정", external: "Flightdeck 밖 변경", restore: "복원", agent: "에이전트 편집 (Step 기록 필요)" } as const;
+      const p = await vscode.window.showQuickPick(
+        groups.map((g) => ({
+          label: `${g.kind === "agent" ? "$(hubot)" : "$(edit)"} ${g.file}:${linesLabel(g.lines)}`,
+          description: `${KIND[g.kind]} · ${g.who}`,
+          detail: g.kind === "agent" ? "메모 대신 에이전트에게 flightdeck_log_step으로 Step을 기록하게 하세요" : "골라서 한 줄 메모를 씁니다",
+          g,
+        })),
+        { title: `설명 필요 변경 ${st.coverage.unexplained.length}건 (coverage ${(st.coverage.ratio * 100).toFixed(0)}%)` },
+      );
+      if (!p) return;
+      const line = Math.max(0, p.g.lines[0]![0] - 1);
+      await vscode.window.showTextDocument(vscode.Uri.file(path.join(c.worktree, p.g.file)), { selection: new vscode.Range(line, 0, line, 0), preview: true }).then(undefined, () => undefined);
+      if (p.g.kind === "agent") return;
+      const memo = await vscode.window.showInputBox({ title: `메모: ${p.g.file}:${linesLabel(p.g.lines)} (${KIND[p.g.kind]})`, prompt: "왜 고쳤는지 한 줄 (관련 쓰레드나 design.md#p:xxxx를 적어도 됩니다)", validateInput: (v) => (v.trim() ? null : "한 줄 이상") });
+      if (!memo) return;
+      await c.wf.addMemo(c.epic, p.g, memo);
+      await refresh();
+      vscode.window.showInformationMessage("메모를 남겼습니다 (impl-log의 직접 수정 메모).");
+    }),
+
+    run("flightdeck.restoreCheckpoint", async () => {
+      const c = needOwner();
+      await saveAll();
+      const p = await pickCheckpoint(c.wf, c.epic, "이 시점으로 복원");
+      if (!p) return;
+      const ok = await vscode.window.showWarningMessage(`작업 폴더의 코드를 ${p.sha.slice(0, 7)} 시점으로 되돌립니다. 지금 상태는 체크포인트로 남기므로 복원을 취소할 수 있습니다. 구현 기록(impl-log)은 그대로 둡니다.`, { modal: true }, "복원");
+      if (ok !== "복원") return;
+      const r = await c.wf.restore(c.epic, p.sha);
+      await refresh();
+      vscode.window.showInformationMessage(`복원했습니다 (${r.files.length}개 파일). 복원 직전: ${r.before.slice(0, 7)}`);
+    }),
+
+    run("flightdeck.compareCheckpoint", async () => {
+      const c = needOwner();
+      const a = await pickCheckpoint(c.wf, c.epic, "비교할 체크포인트 (이전)");
+      if (!a) return;
+      const b = await pickCheckpoint(c.wf, c.epic, "비교 대상 (이후)", true);
+      if (!b) return;
+      const diff = await gitOut(["diff", "--stat", "-p", a.sha, ...(b.sha === "WORKTREE" ? [] : [b.sha]), "--", ".", ":(exclude).flightdeck/.runtime"], c.worktree);
+      const doc = await vscode.workspace.openTextDocument({ language: "diff", content: diff || "(차이 없음)" });
+      await vscode.window.showTextDocument(doc, { preview: true });
     }),
 
     run("flightdeck.menu", async () => {
@@ -658,13 +743,21 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       const myTurn = !!cur?.reviewers.includes(ctx!.wf.cfg.member) && !cur.approvedBy.includes(ctx!.wf.cfg.member);
       const drafts = view?.draftCount ?? 0;
       const items = [
-        ...(owner
+        ...(owner && s?.phase === "IMPLEMENTATION"
           ? [
-              reviewPhase ? { label: "$(git-pull-request) 리뷰 요청", cmd: "flightdeck.requestReview" } : { label: "$(check) 단계 완료", cmd: "flightdeck.completePhase" },
-              { label: "$(sparkle) 에이전트 초안 작성", cmd: "flightdeck.draft" },
+              { label: "$(check) 구현 완료 (관문 검사·테스트·제출)", cmd: "flightdeck.completePhase" },
+              { label: "$(note) 설명 필요 변경 (메모 쓰기)", cmd: "flightdeck.unexplained" },
               { label: "$(terminal) 이어서 작업 (Claude Code)", cmd: "flightdeck.resume" },
+              { label: "$(history) 체크포인트로 복원", cmd: "flightdeck.restoreCheckpoint" },
+              { label: "$(diff) 체크포인트 비교", cmd: "flightdeck.compareCheckpoint" },
             ]
-          : []),
+          : owner
+            ? [
+                reviewPhase ? { label: "$(git-pull-request) 리뷰 요청", cmd: "flightdeck.requestReview" } : { label: "$(check) 단계 완료", cmd: "flightdeck.completePhase" },
+                { label: "$(sparkle) 에이전트 초안 작성", cmd: "flightdeck.draft" },
+                { label: "$(terminal) 이어서 작업 (Claude Code)", cmd: "flightdeck.resume" },
+              ]
+            : []),
         ...(ctx?.epic && myTurn ? [{ label: `$(pass) 승인 (${cur!.name} 티어)`, cmd: "flightdeck.approve" }] : []),
         ...(drafts ? [{ label: `$(cloud-upload) 쓰레드 초안 모두 올리기 (${drafts})`, cmd: "flightdeck.postAllDrafts" }] : []),
         ...(ctx?.epic && ctx.role === "viewer" ? [{ label: "$(comment-discussion) 내 에이전트에게 묻기", cmd: "flightdeck.askAgent" }] : []),
@@ -970,6 +1063,93 @@ function samePath(a: string, b: string): boolean {
   } catch {
     return path.resolve(a) === path.resolve(b);
   }
+}
+
+/** 작업 폴더 안에 디스크와 내용이 다른(저장하지 않은) 문서가 있는가. 있으면 외부 변경 감지를 미룬다 */
+function unsavedIn(worktree: string): boolean {
+  return vscode.workspace.textDocuments.some((d) => {
+    if (d.uri.scheme !== "file") return false;
+    const rel = path.relative(worktree, d.uri.fsPath);
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return false;
+    try {
+      return readFileSync(d.uri.fsPath, "utf8") !== d.getText();
+    } catch {
+      return true; // 아직 디스크에 없는 새 파일
+    }
+  });
+}
+
+/**
+ * 체크포인트 시점 (§8.1): 사람은 저장 후 10초(디바운스), 에이전트는 마지막 편집 후 idle_seconds(기본 30초) 유휴.
+ * Step 끝(flightdeck_log_step)과 턴 종료(Stop 훅)의 체크포인트는 훅·MCP가 만든다
+ */
+function checkpointTimers(ctx: Ctx & { epic: string; worktree: string }, out: vscode.OutputChannel, refresh: () => Promise<void>): vscode.Disposable {
+  const wf = ctx.wf;
+  const make = async (why: string, source: "human" | "agent") => {
+    if (unsavedIn(ctx.worktree)) return;
+    try {
+      const sha = await wf.checkpoint(ctx.epic, why, source);
+      if (sha) out.appendLine(`[체크포인트] ${sha.slice(0, 10)} (${why})`);
+      await refresh();
+    } catch (e) {
+      out.appendLine(`[체크포인트] ${(e as Error).message}`);
+    }
+  };
+  let saveTimer: NodeJS.Timeout | null = null;
+  const onSave = vscode.workspace.onDidSaveTextDocument((d) => {
+    const rel = path.relative(ctx.worktree, d.uri.fsPath);
+    if (rel.startsWith("..") || path.isAbsolute(rel)) return;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => void make("저장", "human"), 10_000);
+  });
+  // 에이전트 유휴: 편집 기록 끝이 에이전트 편집이고 idle_seconds 동안 늘지 않으면
+  let lastSeq = -1;
+  let changedAt = 0;
+  let idleMs = 30_000;
+  void wf.epicState(ctx.epic).then((s) => wf.pipelineFor(s.config_version)).then((p) => (idleMs = (p?.checkpoint.idle_seconds ?? 30) * 1000), () => undefined);
+  const poll = setInterval(() => {
+    void (async () => {
+      const log = await readEditLog(await wf.eng.dataDir(), ctx.epic);
+      const last = log.at(-1);
+      const seq = last?.seq ?? 0;
+      if (lastSeq === -1) lastSeq = seq;
+      if (seq !== lastSeq) {
+        lastSeq = seq;
+        changedAt = Date.now();
+        return;
+      }
+      if (changedAt && Date.now() - changedAt >= idleMs && (last?.source.kind === "agent" || last?.source.kind === "agent_shell")) {
+        changedAt = 0;
+        await make("에이전트 유휴", "agent");
+      }
+    })().catch((e) => out.appendLine(`[체크포인트] ${e}`));
+  }, 5_000);
+  return {
+    dispose: () => {
+      onSave.dispose();
+      clearInterval(poll);
+      if (saveTimer) clearTimeout(saveTimer);
+    },
+  };
+}
+
+/** 체크포인트 고르기 (최신부터). withWorktree: 맨 위에 "지금 작업 폴더" */
+async function pickCheckpoint(wf: EpicWorkflow, epic: string, title: string, withWorktree = false): Promise<{ sha: string } | undefined> {
+  const list = await wf.checkpoints(epic);
+  if (!list.length && !withWorktree) {
+    vscode.window.showInformationMessage("아직 체크포인트가 없습니다.");
+    return undefined;
+  }
+  const items = [
+    ...(withWorktree ? [{ label: "$(file-code) 지금 작업 폴더", description: "", detail: undefined, sha: "WORKTREE" }] : []),
+    ...list.map((c) => ({
+      label: `$(git-commit) ${c.message.split("\n")[0]}`,
+      description: `${c.sha.slice(0, 7)}${c.trailers["Flightdeck-Step"] ? ` · Step ${c.trailers["Flightdeck-Step"]}` : ""} · ${c.trailers["Flightdeck-Source"] ?? ""}`,
+      detail: c.trailers["Flightdeck-Run"] ? `실행 ${c.trailers["Flightdeck-Run"]}` : undefined,
+      sha: c.sha,
+    })),
+  ];
+  return vscode.window.showQuickPick(items, { title });
 }
 
 export function deactivate(): void {}
