@@ -40,6 +40,7 @@ const TRACKER_TOKEN_KEY = "flightdeck.trackerToken";
 async function serverSetup(
   ext: vscode.ExtensionContext,
   dataDir: string,
+  retried = false,
 ): Promise<{ server: ServerClient; member: string; config: ConfigPayload; product: string; tracker?: TrackerAdapter; offline: boolean } | { blocked: string }> {
   const cfg = vscode.workspace.getConfiguration("flightdeck");
   const url = cfg.get<string>("serverUrl")!;
@@ -63,6 +64,8 @@ async function serverSetup(
   } catch (e) {
     if (e instanceof ServerRequestError && e.status === 401) {
       await ext.secrets.delete(tokenKey(url));
+      // 저장한 세션이 서버에 없다(서버 재시작 등). 개발용 로그인 멤버가 있으면 한 번 다시 로그인한다
+      if (cfg.get<string>("devLoginMember") && !retried) return serverSetup(ext, dataDir, true);
       return { blocked: `서버 로그인이 필요합니다: ${e.message}` };
     }
     if (!(e instanceof ServerRequestError && e.status === 0)) return { blocked: `서버 설정을 받지 못했습니다: ${(e as Error).message}` };

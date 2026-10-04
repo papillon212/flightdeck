@@ -47,6 +47,14 @@
 | X9 | §6.1 연동 지점, §7.2 | PostToolUse에서 편집 기록·trace | Claude Code는 **실패한 도구 호출**(예: 종료 코드가 0이 아닌 Bash)에는 PostToolUse 대신 `PostToolUseFailure`를 부른다(2.1.287에 있음). 등록하지 않으면 실패한 셸 명령이 바꾼 파일이 기록되지 않고 전 스냅샷이 남는다 | `PostToolUseFailure`도 등록해 `tool.after`(실패 표시)로 처리한다. trace에 실패를 남긴다 |
 | X10 | §6.2 IMPLEMENTATION | `.flightdeck/` 제외 전체 + `impl-log.md`, handoff | X1로 impl-log는 MCP로만 쓴다. trace.jsonl은 훅이 쓴다 | 에이전트 쓰기 허용: `.flightdeck/` 밖 전체 + 이번 실행의 handoff. impl-log·trace는 Flightdeck만 쓴다 |
 
+### 구현 중 발견 (추가 제안)
+
+| # | 절 | 문제 | 제안 |
+|---|---|---|---|
+| X8-2 | §8.1 복원 | Step 체크포인트는 그 Step 기록(impl-log)보다 먼저 만든다(X1). 그래서 Step 1 체크포인트로 복원하면 impl-log의 Step 1 기록까지 사라졌다(workflow 테스트에서 발견) | 복원은 **제품 코드만** 되돌린다. `.flightdeck/` 아래 Flightdeck 기록(impl-log·trace·handoff)은 복원 대상에서 뺀다(구현함) |
+| X11 | §7.3 hunk 단위 | 새 파일은 base가 없어 파일 전체가 hunk 하나다. 실측에서 사람이 새 파일 첫 줄에 주석 하나를 넣었는데 메모 범위가 `src/token.js:1-17`(파일 전체)로 나왔다. 리뷰어가 사람이 고친 줄을 알 수 없다 | 메모 묶음의 줄 범위는 hunk가 아니라 **그 출처의 문자가 있는 줄**로 계산한다(Step `changes`와 같은 방식). hunk 통과 판정은 그대로 둔다. M4에서는 구현하지 않음 |
+| X12 | §7.1 Step | 실측에서 에이전트(haiku)가 두 Step 분량을 한 번에 쓰고 Step 1·2를 이어서 기록했다. Step 2의 `changes`가 비었다 | `changes`가 빈 Step을 형식 오류로 막지는 않되(문서·확인만 하는 Step도 있다) `flightdeck_log_step` 응답에 "이 Step의 코드 편집 없음"을 알려 에이전트가 Step을 나눠 쓰도록 유도한다(응답에는 이미 있음). 룰에 "Step 하나를 끝낼 때마다 기록, 여러 Step을 한 번에 쓰지 않는다"를 더한다 |
+
 ## 결정
 
 (대기)
@@ -55,3 +63,24 @@
 
 | 단계 | 커밋 | 결과 |
 |---|---|---|
+| M4-1 | `a65265a` | impl-log 파서·렌더러·형식 검사, 출처 추적 재적용(문자 단위 출처 + 삭제 표시, 복원 출처 되살리기)·hunk별 coverage·수정 묶음, Step `changes` 계산, 세션 원본 BM25 검색(한글 2-gram), 비밀값 가림, reducer `gate.reported`·`phase.completed(IMPLEMENTATION)` |
+| M4-2 | `6120cab` | 편집 출처에 Step, trace.jsonl, PostToolUseFailure, 턴 종료·세션 종료 때 세션 원본 저장(runs ref, CAS), ckpt·runs ref 백그라운드 push, MCP `flightdeck_log_step`·`flightdeck_submit`·`flightdeck_search_run`, impl-log 직접 쓰기 차단, IMPLEMENTATION 맥락 |
+| M4-3·M4-4 | `cdcd199`, `4eb6e41` | 서버 `gate.reported`(원격 에픽 브랜치에 있는 커밋, 담당자) · `phase.completed(IMPLEMENTATION)`(원격 끝 = 검사한 커밋, impl-log 형식, 통과 보고). workflow 구현 관문(외부 변경 기록 → coverage·impl-log → 커밋(비밀 파일 제외)·공유 → 명령 실행·로그 보관 → 보고 → 완료), 메모, 체크포인트(사람 저장 10초, 에이전트 유휴), 복원(X8-2), 확장 명령(구현 완료, 설명 필요 변경, 복원, 비교)과 상태 표시줄. 테스트 176개 |
+| M4-5 | (이번 커밋) | 실제 VS Code 시나리오(아래). 찾아 고친 것: 서버를 다시 띄우면 저장된 세션이 없어 창이 "로그인 필요"에서 멈춤 → 개발용 로그인 멤버가 있으면 한 번 다시 로그인. Step 제목의 "Step n:" 중복 |
+
+### M4 완료 확인 결과 (2026-10-05)
+
+실제 VS Code 두 창(멤버별 사용자 데이터) + GitHub `test-flightdeck` + 로컬 서버 + 실제 ClickUp. 설정 `sample-m4`: lead 티어 리뷰어가 dh.lee 혼자라 담당자가 스스로 승인(W3), architect 티어는 리뷰어가 없어 건너뜀(W4). 관문 명령은 레포의 `node check.js`. 에이전트는 **실제 claude(haiku)** 두 번(담당자 구현 1회, park 검색 1회). 사람의 경고 창(모달) 대신 그 창이 부르는 함수를 불렀다.
+
+| 단계 | 멤버 | 결과 |
+|---|---|---|
+| 시작 → IMPLEMENTATION | dh.lee | 서버 서명 `epic.started`, `phase.completed(ANALYSIS)`, `review.requested`, lead 자기 승인 → architect 건너뜀 → IMPLEMENTATION (97초, 대부분 GitHub 왕복) |
+| 에이전트 구현 | dh.lee | claude가 훅 아래에서 `src/token.js` 작성, `node check.js`, `flightdeck_log_step` 2회, `flightdeck_submit` "통과 coverage 100%" (46초). 편집 기록의 에이전트 편집에 `step: 1`, 체크포인트 3개(Step 1, Step 2, 턴 종료), trace 4줄, 세션 원본 1개. ckpt·runs ref가 원격(GitHub)에 올라감(백그라운드 push) |
+| 사람 직접 수정·외부 변경 | dh.lee | 에디터로 `src/token.js` 첫 줄에 주석 + 저장(human 편집), 셸로 README.md 수정(기록 없음) |
+| 제출 1차 | dh.lee | **차단**: `coverage 0% < 100%`, `README.md:4-5 — 메모 없는 외부 변경`, `src/token.js:1-17 — 메모 없는 직접 수정 (@dh.lee)`. 커밋하지 않음. 상태 표시줄 `IMPLEMENTATION · Step 3 · 설명 필요 2` |
+| 메모 | dh.lee | 두 묶음에 메모 → 설명 필요 0, impl-log에 "직접 수정 메모" |
+| 제출 2차 | dh.lee | 커밋·공유 → `node check.js` "ok 3 passed" → 서버 서명 `gate.reported`, `phase.completed(IMPLEMENTATION)` → **VERIFICATION**, ClickUp `검증` |
+| 세션 원본 검색 | park | 읽기 전용 창의 claude가 `flightdeck_search_run`(원격 runs ref를 받음)으로 "새 토큰을 어떻게 만들기로 했나"를 찾아 Step 1 결정(`crypto.randomBytes(16).toString('hex')`)을 근거와 함께 답함 (22초) |
+| 세션 원본 내용 | — | 40항목: 사람 프롬프트·에이전트 메시지·도구 결과·Flightdeck 주입 맥락만. 이메일·CLAUDE.md·메모리 내용 없음 |
+
+확인하지 못한 것: 사람이 직접 하는 클릭(메모 입력 창, 경고 창 버튼, 복원 확인 창), 체크포인트 복원·비교 화면(복원은 workflow 테스트로만), 에이전트 유휴 30초 체크포인트, 대화형 Claude Code(시나리오는 headless). 이번 시나리오 서버는 메모리 저장소로 돌렸다(PostgreSQL 컨테이너가 응답하지 않음 — OrbStack 상태 확인 필요).

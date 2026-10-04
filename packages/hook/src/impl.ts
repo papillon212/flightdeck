@@ -144,7 +144,8 @@ export async function logStep(ctx: ImplContext, input: LogStepInput, runId?: str
   const files = await implFiles(ctx, log);
   const step: ImplStep = {
     n,
-    title: input.title.trim(),
+    // 에이전트가 제목에 "Step 1:"을 붙이면 "## Step 1: Step 1: …"이 된다 (M4 실측)
+    title: input.title.trim().replace(/^step\s*\d+\s*[:.)-]\s*/i, "") || input.title.trim(),
     design_ref: input.design_ref.trim(),
     ckpt,
     changes: stepChanges(files, n),

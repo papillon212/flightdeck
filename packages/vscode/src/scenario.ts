@@ -66,6 +66,7 @@ export async function runScenario(h: ScenarioHooks, dir: string): Promise<void> 
   };
   try {
     if (process.env.FLIGHTDECK_SCENARIO_KIND === "m3") return await runM3(h, log);
+    if (process.env.FLIGHTDECK_SCENARIO_KIND === "m4") return await runM4(h, log);
     if (me === "dh.lee" && !h.epic) return await ownerStart(h, log);
     if (me === "dh.lee" && h.role === "owner") return await ownerAsk(h, log);
     if (me === "park" && !h.epic) return await viewerWait(h, log);
@@ -294,4 +295,148 @@ async function m3Architect(h: ScenarioHooks, log: Log) {
   const s = await h.wf.approve(epic);
   await h.refresh();
   await log("architect 승인", { phase: s.phase, status: h.statusText() });
+}
+
+// ---------------------------------------------------------------- M4: 구현·기록 (docs/m4-plan.md)
+// 담당자 dh.lee(설정 sample-m4: lead = dh.lee 혼자라 스스로 승인, architect 없음 → 건너뜀), 질문 대상 park.
+// 담당자의 에이전트(실제 claude haiku 1회)가 2 Step으로 구현한다 → 사람 직접 수정·외부 변경 → 제출 차단 → 메모 → 통과.
+// park의 에이전트(실제 claude haiku 1회)가 읽기 전용 창에서 세션 원본을 검색한다.
+
+const M4_TASK = "[M4 시나리오]";
+const M4_DESIGN = [
+  "## 개요", "src/token.js에 리프레시 토큰 회전 함수 rotate를 만든다. CommonJS 모듈(module.exports)이다.", "",
+  "## 변경 컴포넌트", "- src/token.js: rotate(store, token)", "",
+  "## 인터페이스", "- rotate(store, token) → 새 토큰 문자열. store는 Map(토큰 → { used: boolean }). 새 토큰을 { used: false }로 넣고 이전 토큰을 used: true로 바꾼다", "",
+  "## 데이터 변경", "- 없음 (메모리 Map)", "",
+  "## 테스트 계획", "- 레포의 node check.js", "",
+  "## 리스크", "- 이미 쓴 토큰을 다시 쓰면 Error('reused')를 던진다 (재사용 탐지)", "",
+].join("\n");
+
+async function runM4(h: ScenarioHooks, log: Log) {
+  const me = h.wf.cfg.member;
+  if (me === "dh.lee" && !h.epic) return m4OwnerStart(h, log);
+  if (me === "dh.lee") return m4Owner(h, log);
+  if (me === "park" && !h.epic) return m4ViewerWait(h, log);
+  if (me === "park") return m4Viewer(h, log);
+}
+
+/** 1. [dh.lee] 시작 → 분석 완료 → 설계 → 리뷰 요청 → 스스로 lead 승인(유일한 리뷰어) → IMPLEMENTATION → 작업 폴더 */
+async function m4OwnerStart(h: ScenarioHooks, log: Log) {
+  const t = (await h.wf.assignedEpics()).find((e) => e.title.includes(M4_TASK));
+  if (!t) throw new Error("M4 시나리오 일감이 내 일감에 없다");
+  const r = await h.wf.startFromTracker(t);
+  const dir = path.join(r.worktree, ".flightdeck/epics", t.epicId);
+  await writeFile(path.join(dir, "analysis.md"), ANALYSIS);
+  const done = await h.wf.completePhase(t.epicId);
+  await writeFile(path.join(dir, "design.md"), M4_DESIGN);
+  const req = await h.wf.requestReview(t.epicId);
+  const s = await h.wf.approve(t.epicId);
+  await log("에픽 시작 → IMPLEMENTATION", { epic: t.epicId, config: r.state.config_version, analysis: done.ok, review: req.ok, phase: s.phase, warnings: h.wf.warnings.splice(0) });
+  await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(r.worktree), { forceNewWindow: false });
+}
+
+/** 2~5. [dh.lee] 에이전트 구현(2 Step) → 직접 수정·외부 변경 → 제출 차단 → 메모 → 제출 → VERIFICATION */
+async function m4Owner(h: ScenarioHooks, log: Log) {
+  const epic = h.epic!;
+  const wt = h.worktree!;
+  await h.refresh();
+  const dataDir = await h.wf.eng.dataDir();
+  const { readState, readEditLog } = await import("@flightdeck/hook");
+  const { RunStore } = await import("@flightdeck/git");
+  if ((await readState(dataDir, epic)).impl_step === 0) {
+    const prompt = [
+      `Flightdeck IMPLEMENTATION 단계입니다. .flightdeck/epics/${epic}/design.md의 설계대로 구현하세요. 두 Step으로 나눕니다.`,
+      "Step 1: src/token.js에 rotate(store, token)를 만든다 (새 토큰 발급·저장, 이전 토큰 used 표시). 끝나면 flightdeck_log_step으로 기록 (design_ref는 '## 인터페이스' 아래 문단의 ID).",
+      "Step 2: 이미 쓴 토큰이면 Error('reused')를 던진다. node check.js로 확인하고 flightdeck_log_step으로 기록 (design_ref는 '## 리스크' 아래 문단의 ID).",
+      "새 토큰은 crypto.randomBytes(16).toString('hex')로 만든다. 마지막에 flightdeck_submit으로 검사하고 결과를 한 줄로 알려 주세요. handoff.md는 쓰지 않아도 됩니다.",
+    ].join("\n");
+    const t1 = Date.now();
+    const r = await h.wf.cfg.adapter.headless!(prompt, { cwd: wt, model: "haiku", maxTurns: 30, allowedTools: ["Read", "Grep", "Glob", "Edit", "Write", "Bash", "mcp__flightdeck"] });
+    await sleep(3000); // 백그라운드 push
+    const st = await readState(dataDir, epic);
+    const log0 = await readEditLog(dataDir, epic);
+    const implLog = await readFile(path.join(wt, ".flightdeck/epics", epic, "impl-log.md"), "utf8").catch(() => "");
+    const { parseImplLog } = await import("@flightdeck/core");
+    await log("에이전트 구현", {
+      sec: Math.round((Date.now() - t1) / 1000),
+      result: r.result.slice(0, 400),
+      impl_step: st.impl_step,
+      steps: parseImplLog(implLog).steps.map((x) => ({ n: x.n, title: x.title, design_ref: x.design_ref, ckpt: x.ckpt.slice(0, 10), changes: x.changes })),
+      agentEdits: log0.filter((x) => x.source.kind === "agent" || x.source.kind === "agent_shell").map((x) => `${x.source.kind}:${x.file}:step${"step" in x.source ? x.source.step : "-"}`),
+      checkpoints: (await h.wf.checkpoints(epic)).map((c) => `${c.sha.slice(0, 7)} ${c.message.split("\n")[0]} ${c.trailers["Flightdeck-Step"] ?? ""}`),
+      runs: await new RunStore(h.wf.cfg.repo).files(epic),
+      remoteRefs: (await git(["ls-remote", h.wf.gitRemote], { cwd: h.wf.cfg.repo })).split("\n").filter((l) => l.includes(`refs/flightdeck/`) && l.includes(epic)).map((l) => l.split("\t")[1]),
+      trace: (await readFile(path.join(wt, ".flightdeck/epics", epic, "trace.jsonl"), "utf8").catch(() => "")).trim().split("\n").length,
+    });
+  }
+  await h.refresh();
+  await log("구현 후 상태", { status: h.statusText(), check: await h.wf.implementationStatus(epic).then((s) => ({ unexplained: s.coverage.unexplained.length, implLog: s.implLog })) });
+
+  // 사람 직접 수정: 에디터로 주석 한 줄 넣고 저장 (HumanEdits가 human으로 기록)
+  const doc = await vscode.workspace.openTextDocument(path.join(wt, "src/token.js"));
+  await vscode.window.showTextDocument(doc);
+  const we = new vscode.WorkspaceEdit();
+  we.insert(doc.uri, new vscode.Position(0, 0), "// 리프레시 토큰 회전 (설계 design.md)\n");
+  await vscode.workspace.applyEdit(we);
+  await doc.save();
+  await sleep(1500);
+  // 외부 변경: Flightdeck 밖에서 파일을 고침
+  await writeFile(path.join(wt, "README.md"), (await readFile(path.join(wt, "README.md"), "utf8")) + "\n토큰 회전은 src/token.js\n");
+  await sleep(500);
+
+  // 제출 1차: 막혀야 한다 (명령 대신 그 명령이 부르는 함수. 경고 창은 모달이라 자동 진행이 멈춘다)
+  await vscode.workspace.saveAll(false);
+  const r1 = await h.wf.completePhase(epic);
+  await h.refresh();
+  await log("제출 1차", { ok: r1.ok, problems: r1.ok ? [] : r1.problems, status: h.statusText(), head: (await git(["log", "-1", "--format=%s"], { cwd: wt })).trim() });
+
+  // 메모 (메모 입력 창이 부르는 함수)
+  const st = await h.wf.implementationStatus(epic);
+  const memos: string[] = [];
+  for (const g of st.coverage.groups) {
+    if (g.kind === "agent") {
+      memos.push(`에이전트 편집(Step 기록 필요): ${g.file}`);
+      continue;
+    }
+    await h.wf.addMemo(epic, g, g.kind === "human" ? "모듈 머리 주석을 직접 달았다" : "README에 위치 안내 한 줄");
+    memos.push(`${g.kind}: ${g.file}`);
+  }
+  await log("메모", { memos, after: (await h.wf.implementationStatus(epic)).coverage.unexplained.length });
+
+  // 제출 2차: 관문 → 커밋·공유 → node check.js → gate.reported → phase.completed
+  const out: string[] = [];
+  const r2 = await h.wf.completePhase(epic, { onOutput: (s) => out.push(s) });
+  await h.refresh();
+  const evs = (await h.wf.store.list(epic)).filter((e) => e.type === "gate.reported" || e.type === "phase.completed").map((e) => `${e.type}${"phase" in e.data ? `(${e.data.phase})` : ""}/${e.sig ? "서명" : "서명 없음"}`);
+  const ref = (await h.wf.epicState(epic)).tracker_ref!;
+  await log("제출 2차", { r: r2, output: out.join("").trim().slice(-300), events: evs, status: h.statusText(), tracker: await h.wf.cfg.remote?.tracker?.getEpic(ref).then((x) => x.status, (e) => String(e)), warnings: h.wf.warnings.splice(0) });
+}
+
+/** 6. [park] 담당자가 구현을 제출하면 읽기 전용 창을 연다 */
+async function m4ViewerWait(h: ScenarioHooks, log: Log) {
+  const t1 = Date.now();
+  const epic = await until("M4 에픽 VERIFICATION", async () => {
+    await h.wf.pull();
+    for (const e of await h.wf.store.listEpics()) {
+      const s = await h.wf.epicState(e);
+      if (s.phase === "VERIFICATION" && s.owner === "dh.lee") return e;
+    }
+    return null;
+  }, 20 * 60_000, 10_000);
+  await log("담당자 제출 확인", { epic, waitSec: Math.round((Date.now() - t1) / 1000) });
+  await h.openViewer(epic);
+}
+
+/** 7. [park] 내 에이전트(실제 claude)에게 세션 원본 검색을 시킨다 */
+async function m4Viewer(h: ScenarioHooks, log: Log) {
+  const epic = h.epic!;
+  await h.refresh();
+  const prompt = [
+    "이 에픽의 구현 실행에서 새 토큰을 어떤 방법으로 만들기로 했는지, flightdeck_search_run 도구로 세션 원본을 검색해서 찾아 주세요.",
+    "찾은 근거(세션 원본 발췌)와 함께 두세 줄로 답해 주세요. 파일은 고치지 마세요.",
+  ].join("\n");
+  const t1 = Date.now();
+  const r = await h.wf.cfg.adapter.headless!(prompt, { cwd: h.worktree!, model: "haiku", maxTurns: 8, allowedTools: ["Read", "Grep", "Glob", "mcp__flightdeck"] });
+  const { RunStore } = await import("@flightdeck/git");
+  await log("세션 원본 검색", { sec: Math.round((Date.now() - t1) / 1000), status: h.statusText(), runs: await new RunStore(h.wf.cfg.repo).files(epic), answer: r.result.slice(0, 800) });
 }

@@ -124,7 +124,7 @@ describe("구현 단계 훅·MCP (M4-2)", { timeout: 30_000 }, () => {
     expect(cov.drift).toEqual([]);
     expect(cov.groups.map((g) => [g.file, g.kind])).toEqual([["README.md", "external"], ["src/a.js", "agent"], ["src/a.js", "human"], ["src/gen.js", "agent"]]);
     for (const g of cov.groups.filter((x) => x.kind !== "agent")) await appendMemo(dataDir, { epic: EPIC, file: g.file, seqs: g.seqs, memo: "메모", member: "dh.lee", at: nowIso() });
-    expect((await call("flightdeck_log_step", { ...STEP, title: "c 추가" })).content[0]!.text).toContain("Step 2 기록함");
+    expect((await call("flightdeck_log_step", { ...STEP, title: "Step 2: c 추가" })).content[0]!.text).toContain("Step 2 기록함: c 추가");
     expect((await call("flightdeck_submit")).content[0]!.text).toMatch(/^통과\./);
   });
 
