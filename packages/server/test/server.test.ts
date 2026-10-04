@@ -146,7 +146,8 @@ describe("서버 서명 이벤트 (§3.1, §4.2, §12)", { timeout: 60_000 }, ()
     await ownerStore().append({ v: 1, id: ulid(), type: "thread.resolved", epic: EPIC, author: "dh.lee", at: new Date().toISOString(), data: { thread: "t-AAAAAAAA" } } as Event);
     expect((await done("park")).data.error).toMatch(/담당자만 단계를 완료할 수 있음 \(요청자: park/);
     expect((await done("dh.lee", { artifact_hash: artifactHash("다른 내용") })).data.error).toMatch(/요청한 내용과 다름/);
-    expect((await api("dh.lee", "POST", "/events", { product: "sample", epic: EPIC, type: "review.approved", data: {} })).status).toBe(400);
+    expect((await api("dh.lee", "POST", "/events", { product: "sample", epic: EPIC, type: "review.approved", data: {} })).data.error).toBe("리뷰 요청 전");
+    expect((await api("dh.lee", "POST", "/events", { product: "sample", epic: EPIC, type: "gate.reported", data: {} })).status).toBe(400); // 아직 지원하지 않음
 
     const ok = await done("dh.lee", { artifact_hash: artifactHash(ANALYSIS) });
     expect(ok.status).toBe(200);
@@ -189,6 +190,67 @@ describe("어드민 화면 (§2.5)", () => {
     const cross = await api(null, "POST", "/admin/members", form({ id: "x", email: "x@e.com", active: "on" }), { ...h, origin: "http://evil.example" });
     expect(cross.status).toBe(403);
     expect((await store.audit()).map((a) => a.action)).toContain("config.version");
+  });
+});
+
+describe("티어 리뷰 서명 (§4.2 v0.13)", { timeout: 60_000 }, () => {
+  const E = "CU-50";
+  const DESIGN = "## 개요\n회전\n\n## 변경 컴포넌트\nauth\n\n## 인터페이스\nrefresh()\n\n## 데이터 변경\n없음\n\n## 테스트 계획\n단위\n\n## 리스크\n재사용 탐지\n";
+  let wt: string;
+  const eng = () => new GitEngine(owner);
+  const ev = (who: string, type: string, data: Record<string, unknown> = {}) => api(who, "POST", "/events", { product: "sample", epic: E, type, data });
+  const put = async (file: string, text: string) => {
+    const f = path.join(wt, ".flightdeck/epics", E, file);
+    await mkdir(path.dirname(f), { recursive: true });
+    await writeFile(f, text);
+    await eng().commit(wt, [path.relative(wt, f)], `공유 ${file}`);
+    return eng().pushEpicBranch(E);
+  };
+  const state = async () => {
+    const cfg = (await api("dh.lee", "GET", "/config?product=sample")).data as SignedConfig;
+    const s = ownerStore();
+    await s.sync();
+    const { parsePipeline } = await import("@flightdeck/schema");
+    return reduce(E, await s.list(E), trustFromConfig(cfg.payload), { pipelines: () => parsePipeline(cfg.payload.pipeline_yaml) });
+  };
+
+  beforeAll(async () => {
+    // 티어 리뷰어: lead = park, architect = lee (새 설정 버전, 새 에픽부터)
+    await store.upsertMember({ id: "lee", email: "lee@e.com", active: true, admin: false }, "test");
+    tokens.lee = (await api(null, "POST", "/auth/dev", { member: "lee" })).data.token;
+    const cur = (await store.currentConfig("sample"))!;
+    await store.addConfigVersion({ ...cur, pipeline_yaml: cur.pipeline_yaml.replace(/leads: \[kim\]/, "leads: [park]").replace(/architects: \[park, lee\]/, "architects: [lee]"), created_by: "test", note: "M3 리뷰어" });
+    expect((await ev("dh.lee", "epic.started", { base_sha: base })).status).toBe(200);
+    wt = (await eng().createEpicWorktree(E, base)).path;
+    await put("analysis.md", ANALYSIS);
+    expect((await ev("dh.lee", "phase.completed", { phase: "ANALYSIS" })).status).toBe(200);
+    expect((await state()).phase).toBe("DESIGN");
+  });
+
+  it("리뷰 요청: 담당자만, 원격 design.md 형식 확인, commit·해시는 서버가 채운다", async () => {
+    expect((await ev("dh.lee", "review.requested", { phase: "DESIGN" })).data.error).toMatch(/design.md가 없음/);
+    const c1 = await put("design.md", DESIGN);
+    expect((await ev("park", "review.requested", { phase: "DESIGN" })).data.error).toMatch(/담당자만 리뷰를 요청할 수 있음/);
+    const r = await ev("dh.lee", "review.requested", { phase: "DESIGN", artifact_hash: artifactHash(DESIGN) });
+    expect(r.status).toBe(200);
+    expect(r.data.event.data).toEqual({ phase: "DESIGN", artifact_hash: artifactHash(DESIGN), commit: c1 });
+  });
+
+  it("승인: 서버가 현재 티어를 채우고, 차례·리뷰어·요청 뒤 변경을 확인한다", async () => {
+    expect((await ev("lee", "review.approved")).data.error).toMatch(/lead 티어 리뷰어가 아님/); // 현재 차례는 lead
+    expect((await ev("park", "review.approved", { tier: "architect" })).data.error).toBe("현재 차례는 lead 티어");
+    // 담당자가 요청 뒤 몰래 고치면 승인할 수 없다
+    const changed = DESIGN.replace("재사용 탐지", "재사용 탐지, 토큰 탈취");
+    await put("design.md", changed);
+    expect((await ev("park", "review.approved")).data.error).toMatch(/리뷰 요청 뒤 design.md를 고쳤다/);
+    expect((await ev("dh.lee", "review.requested", { phase: "DESIGN" })).status).toBe(200); // 다시 요청
+    const a1 = await ev("park", "review.approved");
+    expect(a1.status).toBe(200);
+    expect(a1.data.event.data).toEqual({ phase: "DESIGN", tier: "lead", artifact_hash: artifactHash(changed) });
+    expect((await state()).phase).toBe("DESIGN");
+    const a2 = await ev("lee", "review.approved");
+    expect(a2.data.event.data.tier).toBe("architect");
+    expect((await state()).phase).toBe("IMPLEMENTATION"); // 마지막 티어 승인으로 자동 전환
   });
 });
 

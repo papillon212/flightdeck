@@ -1,8 +1,9 @@
 // 에픽 상태 계산 (설계 §1.1, §3.4, §4, §12).
 // 입력: 한 에픽의 메타 이벤트 전부. 순서: ULID(id) 오름차순.
 // 권한이 없거나, 관문 조건을 못 채웠거나, 서버 서명이 필요한데 없거나 틀린 이벤트는 무시하고 ignored에 이유를 남긴다.
-// 범위: INTAKE → ANALYSIS → DESIGN, 쓰레드, 실행 기록, 서버 서명 검증. 티어 승인(§4.2)은 M3.
-import type { Anchor, Event, EventOf, Phase, Trust } from "@flightdeck/schema";
+// 범위: INTAKE → ANALYSIS → DESIGN(티어 리뷰) → IMPLEMENTATION, 쓰레드, 실행 기록, 서버 서명 검증.
+import type { Anchor, Event, EventOf, Phase, Pipeline, Trust } from "@flightdeck/schema";
+import { approvalProblem, reviewConfig, reviewProgress, type ReviewProgress, type ReviewState } from "./review.ts";
 import { needsServerSignature, verifyEvent } from "./sign.ts";
 
 export interface Reply {
@@ -48,6 +49,15 @@ export interface EpicState {
   runs: Map<string, Run>;
   history: { at: string; from: Phase; to: Phase; by: string; event: string }[];
   ignored: { event: string; type: string; reason: string }[];
+  /** 현재 단계의 티어 리뷰 (§4.2). 리뷰가 없는 단계·리뷰 요청 전에도 phase만 담긴 상태로 있다 */
+  review: ReviewState;
+  /** 에픽에 고정된 설정 버전의 파이프라인 (호출하는 쪽이 넘긴 것) */
+  pipeline: Pipeline | undefined;
+}
+
+export interface ReduceOptions {
+  /** 설정 버전 → 파이프라인. epic.started.config_version으로 찾는다. 없으면 티어 리뷰 이벤트를 처리하지 못한다 */
+  pipelines?: ReadonlyMap<string, Pipeline> | ((version: string) => Pipeline | undefined);
 }
 
 export function initialState(epic: string): EpicState {
@@ -62,22 +72,41 @@ export function initialState(epic: string): EpicState {
     runs: new Map(),
     history: [],
     ignored: [],
+    review: { phase: "INTAKE", requested: null, approvals: [] },
+    pipeline: undefined,
   };
 }
 
-/** 다음 단계 (설계 §4.1). M1은 DESIGN까지 */
-const NEXT: Partial<Record<Phase, Phase>> = { ANALYSIS: "DESIGN" };
+/** 다음 단계 (설계 §4.1). ANALYSIS는 phase.completed로, DESIGN은 마지막 티어 승인으로 넘어간다 */
+const NEXT: Partial<Record<Phase, Phase>> = { ANALYSIS: "DESIGN", DESIGN: "IMPLEMENTATION" };
 
-export function reduce(epic: string, events: Event[], trust: Trust): EpicState {
+export function reduce(epic: string, events: Event[], trust: Trust, opts: ReduceOptions = {}): EpicState {
   const s = initialState(epic);
+  const lookup = opts.pipelines;
+  const find = (v: string) => (typeof lookup === "function" ? lookup(v) : lookup?.get(v));
   const sorted = [...events].filter((e) => e.epic === epic).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   for (const e of sorted) {
     const reason = trustProblem(e, trust);
     if (reason) s.ignored.push({ event: e.id, type: e.type, reason });
-    else apply(s, e);
+    else apply(s, e, find);
   }
   return s;
 }
+
+/** 이 에픽이 고정한 설정 버전 (epic.started). 파이프라인을 미리 불러올 때 쓴다 */
+export function configVersionOf(events: Event[], epic: string): string | null {
+  const e = events.find((x) => x.epic === epic && x.type === "epic.started") as EventOf<"epic.started"> | undefined;
+  return e?.data.config_version ?? null;
+}
+
+/** 현재 단계의 리뷰 진행 (리뷰가 없는 단계·파이프라인이 없으면 null) */
+export function reviewOf(s: EpicState): ReviewProgress | null {
+  const cfg = reviewConfig(s.pipeline, s.phase);
+  if (!cfg || !s.pipeline || !s.owner) return null;
+  return reviewProgress(s.pipeline, cfg, s.review, s.owner);
+}
+
+const openThreads = (s: EpicState) => [...s.threads.values()].filter((t) => t.phase === s.phase && t.status === "open");
 
 /** 서명·멤버 상태로 보아 받아들일 수 없으면 이유 (§12) */
 export function trustProblem(e: Event, trust: Trust): string | null {
@@ -92,13 +121,14 @@ export function trustProblem(e: Event, trust: Trust): string | null {
   return null;
 }
 
-function apply(s: EpicState, e: Event): void {
+function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | undefined): void {
   const ignore = (reason: string): void => {
     s.ignored.push({ event: e.id, type: e.type, reason });
   };
   const move = (to: Phase) => {
     s.history.push({ at: e.at, from: s.phase, to, by: e.author, event: e.id });
     s.phase = to;
+    s.review = { phase: to, requested: null, approvals: [] }; // 단계가 바뀌면 리뷰는 새로
   };
 
   if (e.type !== "epic.started" && s.owner === null) return ignore("epic.started 이전 이벤트");
@@ -109,6 +139,7 @@ function apply(s: EpicState, e: Event): void {
       s.owner = e.data.owner;
       s.base_sha = e.data.base_sha;
       s.config_version = e.data.config_version;
+      s.pipeline = findPipeline(e.data.config_version);
       s.tracker_ref = e.data.tracker_ref;
       move("ANALYSIS"); // INTAKE는 자동으로 지나간다 (§4.1)
       return;
@@ -117,8 +148,11 @@ function apply(s: EpicState, e: Event): void {
     case "thread.created": {
       const d = e.data;
       if (s.threads.has(d.thread)) return ignore("이미 있는 쓰레드 ID");
-      // 생성 권한 (§3.4): 해당 단계 담당자 / 현재 티어 리뷰어. M1에는 티어가 없어 담당자만
-      if (e.author !== s.owner) return ignore("쓰레드 생성 권한 없음");
+      // 생성 권한 (§3.4): 해당 단계 담당자 / 현재 티어 리뷰어 (리뷰 요청 이후)
+      if (e.author !== s.owner) {
+        const cur = s.review.requested ? reviewOf(s)?.current : null;
+        if (!cur?.reviewers.includes(e.author)) return ignore("쓰레드 생성 권한 없음");
+      }
       s.threads.set(d.thread, {
         id: d.thread,
         phase: d.phase,
@@ -168,12 +202,32 @@ function apply(s: EpicState, e: Event): void {
     case "phase.completed": {
       if (e.data.phase !== s.phase) return ignore(`현재 단계(${s.phase})가 아님`);
       if (e.author !== s.owner) return ignore("담당자만 단계를 완료할 수 있음");
-      const next = NEXT[s.phase];
-      if (!next) return ignore(`${s.phase} 완료는 M1 범위 밖`);
+      if (s.phase !== "ANALYSIS") return ignore(`${s.phase}는 단계 완료가 아니라 티어 리뷰로 넘어간다 (§4.2)`);
       // ANALYSIS 관문 (§4.1): 그 단계의 쓰레드 전부 resolved
-      const open = [...s.threads.values()].filter((t) => t.phase === s.phase && t.status === "open");
+      const open = openThreads(s);
       if (open.length) return ignore(`열린 쓰레드 ${open.length}개`);
-      move(next);
+      move(NEXT.ANALYSIS!);
+      return;
+    }
+
+    case "review.requested": {
+      if (e.data.phase !== s.phase) return ignore(`현재 단계(${s.phase})가 아님`);
+      if (e.author !== s.owner) return ignore("담당자만 리뷰를 요청할 수 있음");
+      if (!reviewConfig(s.pipeline, s.phase)) return ignore(s.pipeline ? `${s.phase}는 티어 리뷰가 없는 단계` : "파이프라인 없음 (설정 버전을 찾지 못함)");
+      s.review.requested = { hash: e.data.artifact_hash, commit: e.data.commit, at: e.at, event: e.id };
+      finishReview(s, e, move);
+      return;
+    }
+
+    case "review.approved": {
+      if (e.data.phase !== s.phase) return ignore(`현재 단계(${s.phase})가 아님`);
+      const cfg = reviewConfig(s.pipeline, s.phase);
+      if (!cfg || !s.pipeline) return ignore(s.pipeline ? `${s.phase}는 티어 리뷰가 없는 단계` : "파이프라인 없음 (설정 버전을 찾지 못함)");
+      const open = openThreads(s);
+      const problem = approvalProblem(s.pipeline, cfg, s.review, s.owner!, { tier: e.data.tier, author: e.author, hash: e.data.artifact_hash }, { byAuthor: open.filter((t) => t.author === e.author).length, all: open.length });
+      if (problem) return ignore(problem);
+      s.review.approvals.push({ event: e.id, tier: e.data.tier, author: e.author, hash: e.data.artifact_hash, at: e.at });
+      finishReview(s, e, move);
       return;
     }
 
@@ -203,6 +257,13 @@ function apply(s: EpicState, e: Event): void {
     default:
       return ignore("M1에서 처리하지 않는 이벤트");
   }
+}
+
+/** 리뷰어가 있는 모든 티어가 승인했고 열린 쓰레드가 없으면 다음 단계로 (§4.1: 마지막 티어 승인으로 자동 전환) */
+function finishReview(s: EpicState, e: Event, move: (to: Phase) => void): void {
+  const p = reviewOf(s);
+  const next = NEXT[s.phase];
+  if (p?.done && next && openThreads(s).length === 0) move(next);
 }
 
 function pick(e: EventOf<"run.started">): Omit<Run, "finished"> {

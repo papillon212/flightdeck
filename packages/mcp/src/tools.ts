@@ -3,7 +3,7 @@
 import { existsSync, readdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { reduce } from "@flightdeck/core";
+import { pipelineFromDir, reduce } from "@flightdeck/core";
 import { LocalEventStore } from "@flightdeck/git";
 import { LocalEpicState } from "@flightdeck/schema";
 
@@ -20,7 +20,8 @@ export interface ToolContext {
 
 async function load(ctx: ToolContext) {
   const state = LocalEpicState.parse(JSON.parse(await readFile(ctx.statePath, "utf8")));
-  const epicState = reduce(state.epic, await new LocalEventStore(state.repo).list(state.epic), state.trust);
+  const p = pipelineFromDir(state.configDir);
+  const epicState = reduce(state.epic, await new LocalEventStore(state.repo).list(state.epic), state.trust, { pipelines: () => p });
   return { state, epicState, epicDir: path.join(state.worktree, ".flightdeck", "epics", state.epic) };
 }
 

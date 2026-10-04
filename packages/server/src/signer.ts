@@ -4,7 +4,7 @@
 import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import { artifactHash, checkSections, nowIso, reduce, signEvent, ulid } from "@flightdeck/core";
+import { artifactHash, checkSections, configVersionOf, nowIso, reduce, reviewOf, signEvent, ulid } from "@flightdeck/core";
 import { git, GitEngine, GitError, RemoteEventStore } from "@flightdeck/git";
 import { Event as EventSchema, parsePipeline, PHASE_ARTIFACT, type Event, type Phase, type Trust } from "@flightdeck/schema";
 import type { Member, ServerStore } from "./store.ts";
@@ -73,8 +73,28 @@ export class EventSigner {
     }
     const trust = await this.trust();
     const events = await store.list(req.epic);
-    const state = reduce(req.epic, events, trust);
+    // 에픽에 고정된 설정 버전의 파이프라인 (티어 리뷰 판정, §2.5 버전 고정)
+    const version = configVersionOf(events, req.epic);
+    const cv = version ? await this.deps.store.getConfigVersion(req.product, version) : null;
+    const pipeline = cv ? parsePipeline(cv.pipeline_yaml) : undefined;
+    const opts = { pipelines: () => pipeline };
+    const state = reduce(req.epic, events, trust, opts);
     const eng = new GitEngine(dir);
+
+    /** 원격 에픽 브랜치의 단계 산출물: 형식 검사(§6.3) 후 해시 */
+    const remoteArtifact = async (phase: Phase) => {
+      const artifact = PHASE_ARTIFACT[phase as keyof typeof PHASE_ARTIFACT];
+      if (!artifact) throw new RequestError(400, `산출물이 없는 단계: ${phase}`);
+      const head = await eng.fetchEpicBranch(req.epic).catch((e) => {
+        throw new RequestError(503, `에픽 브랜치를 받지 못함: ${e instanceof Error ? e.message : e}`);
+      });
+      if (!head) throw new RequestError(409, "에픽 브랜치가 원격에 없음. 산출물을 먼저 공유해야 한다");
+      const text = await git(["show", `${head}:.flightdeck/epics/${req.epic}/${artifact.file}`], { cwd: dir }).catch(() => null);
+      if (text === null) throw new RequestError(409, `에픽 브랜치에 ${artifact.file}가 없음`);
+      const sections = checkSections(text, artifact.sections);
+      if (!sections.ok) throw new RequestError(409, `${artifact.file} 형식 문제: ${JSON.stringify({ missing: sections.missing, outOfOrder: sections.outOfOrder, empty: sections.empty })}`);
+      return { file: artifact.file, head, hash: artifactHash(text) };
+    };
 
     let data: Record<string, unknown>;
     switch (req.type) {
@@ -88,24 +108,28 @@ export class EventSigner {
         data = { tracker_ref: String(req.data.tracker_ref ?? req.epic), owner: member.id, base_sha: base, config_version: cfg.version };
         break;
       }
-      case "phase.completed": {
+      case "phase.completed":
+      case "review.requested": {
         const phase = String(req.data.phase ?? "") as Phase;
-        const artifact = PHASE_ARTIFACT[phase as keyof typeof PHASE_ARTIFACT];
-        if (!artifact) throw new RequestError(400, `산출물이 없는 단계: ${phase}`);
-        const head = await eng.fetchEpicBranch(req.epic).catch((e) => {
-          throw new RequestError(503, `에픽 브랜치를 받지 못함: ${e instanceof Error ? e.message : e}`);
-        });
-        if (!head) throw new RequestError(409, "에픽 브랜치가 원격에 없음. 산출물을 먼저 공유해야 한다");
-        const file = `.flightdeck/epics/${req.epic}/${artifact.file}`;
-        const text = await git(["show", `${head}:${file}`], { cwd: dir }).catch(() => null);
-        if (text === null) throw new RequestError(409, `에픽 브랜치에 ${artifact.file}가 없음`);
-        const sections = checkSections(text, artifact.sections);
-        if (!sections.ok) throw new RequestError(409, `${artifact.file} 형식 문제: ${JSON.stringify({ missing: sections.missing, outOfOrder: sections.outOfOrder, empty: sections.empty })}`);
-        const hash = artifactHash(text);
-        if (req.data.artifact_hash !== undefined && req.data.artifact_hash !== hash) {
-          throw new RequestError(409, `에픽 브랜치에 올라간 ${artifact.file}가 요청한 내용과 다름. 먼저 공유해야 한다`);
+        const a = await remoteArtifact(phase);
+        if (req.data.artifact_hash !== undefined && req.data.artifact_hash !== a.hash) {
+          throw new RequestError(409, `에픽 브랜치에 올라간 ${a.file}가 요청한 내용과 다름. 먼저 공유해야 한다`);
         }
-        data = { phase, artifact_hash: hash };
+        data = req.type === "review.requested" ? { phase, artifact_hash: a.hash, commit: a.head } : { phase, artifact_hash: a.hash };
+        break;
+      }
+      case "review.approved": {
+        // 승인하는 것 = 마지막 리뷰 요청의 문서 (§4.2). 요청 뒤 원격 문서가 바뀌었으면 다시 요청을 기다린다
+        const phase = String(req.data.phase ?? state.phase) as Phase;
+        const requested = state.review.requested;
+        if (!requested) throw new RequestError(409, "리뷰 요청 전");
+        const a = await remoteArtifact(phase);
+        if (a.hash !== requested.hash) throw new RequestError(409, `담당자가 리뷰 요청 뒤 ${a.file}를 고쳤다. 다시 요청할 때까지 승인할 수 없다`);
+        if (req.data.artifact_hash !== undefined && req.data.artifact_hash !== requested.hash) throw new RequestError(409, "승인하려는 문서가 리뷰 요청된 문서와 다름 (창을 새로 고쳐 주세요)");
+        const tier = reviewOf(state)?.current?.name;
+        if (!tier) throw new RequestError(409, "승인할 차례의 티어가 없음");
+        if (req.data.tier !== undefined && req.data.tier !== tier) throw new RequestError(409, `현재 차례는 ${tier} 티어`);
+        data = { phase, tier, artifact_hash: requested.hash };
         break;
       }
       default:
@@ -114,7 +138,7 @@ export class EventSigner {
 
     const unsigned = EventSchema.parse({ v: 1, id: ulid(), type: req.type, epic: req.epic, author: member.id, at: nowIso(), data }) as Event;
     const event = signEvent(unsigned, this.deps.privateKeyPem);
-    const ignored = reduce(req.epic, [...events, event], trust).ignored.find((i) => i.event === event.id);
+    const ignored = reduce(req.epic, [...events, event], trust, opts).ignored.find((i) => i.event === event.id);
     if (ignored) throw new RequestError(409, `${req.type} 거부: ${ignored.reason} (요청자: ${member.id}, 현재 단계: ${state.phase})`);
 
     await store.append(event); // 로컬 커밋 후 push. push 실패분은 다음 요청·주기에 다시 보낸다

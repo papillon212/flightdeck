@@ -47,7 +47,8 @@ afterAll(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
-describe("RemoteEventStore", () => {
+// git 원격 왕복이 많아 전체 테스트를 함께 돌리면 느려진다
+describe("RemoteEventStore", { timeout: 60_000 }, () => {
   it("A가 추가한 이벤트를 B가 sync로 받는다", async () => {
     const e = reply("dh.lee", "첫 이벤트");
     await store(a).append(e);
@@ -118,7 +119,7 @@ describe("RemoteEventStore", () => {
     try {
       await store(a).append(reply("dh.lee", "watch"));
       const t0 = Date.now();
-      while (!seen.length && Date.now() - t0 < 5000) await new Promise((r) => setTimeout(r, 25));
+      while (!seen.length && Date.now() - t0 < 20_000) await new Promise((r) => setTimeout(r, 25));
       expect(seen.length).toBeGreaterThan(0);
       expect((await sb.list(EPIC)).some((x) => x.type === "thread.replied" && x.data.body === "watch")).toBe(true);
     } finally {
