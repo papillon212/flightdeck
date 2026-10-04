@@ -30,7 +30,8 @@ export const LocalEpicState = z.object({
    * owner: 에픽 작업 폴더 (담당자). viewer: 질문 대상의 읽기 전용 창 (§2.4). viewer에는 에이전트 설정을 넣지 않고,
    * 쓰레드 렌더링을 편집 기록에 남기지 않는다
    */
-  role: z.enum(["owner", "viewer"]).default("owner"),
+  /** review: VERIFICATION 리뷰어의 쓰기 가능한 리뷰 사본 (M5 Y3). 고쳐도 기록하지 않고, 바꾼 것은 수정 제안(패치)으로만 나간다 */
+  role: z.enum(["owner", "viewer", "review"]).default("owner"),
   /** 서버 모드의 제품 ID (설정·서명 요청) */
   product: z.string().optional(),
   phase: Phase,

@@ -15,8 +15,11 @@ export interface PolicyInput {
   protectedPaths: string[];
   /** VERIFICATION에서 허용할 테스트 명령 (pipeline gate.commands) */
   testCommands?: string[];
-  /** viewer: 질문 대상·리뷰어의 읽기 전용 창 (§6.2 v0.13). 단계와 무관하게 산출물 문서(쓰레드 초안용)만 쓰고, 셸은 읽기 전용 */
-  role?: "owner" | "viewer";
+  /**
+   * viewer: 질문 대상·리뷰어의 읽기 전용 창 (§6.2 v0.13). 단계와 무관하게 산출물 문서(쓰레드 초안용)만 쓰고, 셸은 읽기 전용.
+   * review: VERIFICATION 리뷰 사본 (M5 Y3). .flightdeck/ 밖은 자유롭게 고치고 셸도 쓴다(git 제외). 기록하지 않는다
+   */
+  role?: "owner" | "viewer" | "review";
 }
 
 export type Decision = { allow: true } | { allow: false; reason: string };
@@ -68,6 +71,24 @@ export function decide(p: PolicyInput): Decision {
       return ALLOW; // 초안 블록 밖의 변경은 확장이 되돌린다
     }
     if (p.tool.kind === "shell") return readOnlyShell(p.tool.command ?? "", "읽기 전용 창");
+    return ALLOW;
+  }
+
+  if (p.role === "review") {
+    if (p.tool.kind === "write") {
+      for (const abs of p.tool.paths) {
+        if (!inside(abs)) return deny(`리뷰 사본 밖(${abs})에는 쓸 수 없습니다.`);
+        const r = rel(abs);
+        if (r.startsWith(".flightdeck/")) return deny(`리뷰 사본에서는 Flightdeck 기록(${r})을 고치지 않습니다. 코드만 고치고, 고친 것은 사용자가 수정 제안으로 올립니다.`);
+      }
+      return ALLOW;
+    }
+    if (p.tool.kind === "shell") {
+      const segments = splitCommand(p.tool.command ?? "");
+      if (segments.some((s) => s.prog === "git")) return deny("git 명령은 쓸 수 없습니다. 수정 제안(diff)은 Flightdeck이 만듭니다.");
+      if (segments.some((s) => s.prog === "rm" && /\s-[a-zA-Z]*r[a-zA-Z]*f|\s-[a-zA-Z]*f[a-zA-Z]*r|--recursive.*--force/.test(s.text))) return deny("rm -rf는 쓸 수 없습니다.");
+      return ALLOW;
+    }
     return ALLOW;
   }
 

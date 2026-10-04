@@ -70,7 +70,7 @@ describe("쓰레드 초안 블록", () => {
   });
 
   it("쓰레드 렌더링은 초안을 건드리지 않는다", () => {
-    const t: Thread = { id: "t-01JB2X4K", phase: "DESIGN", file: "design.md", anchor: { type: "paragraph", pid: "p:2222" }, kind: "question", author: "dh.lee", to: ["park"], at: "2026-10-04T10:00:00+09:00", body: "TTL?", status: "open", replies: [] };
+    const t: Thread = { id: "t-01JB2X4K", phase: "DESIGN", file: "design.md", anchor: { type: "paragraph", pid: "p:2222" }, kind: "question", author: "dh.lee", to: ["park"], at: "2026-10-04T10:00:00+09:00", body: "TTL?", status: "open", replies: [], applied: [] };
     const out = renderThreads(DOC, "design.md", [t]);
     expect(parseDrafts(out).map((d) => d.body)).toEqual(["재사용 탐지 시 모든 세션을 끊는 근거는?"]);
     expect(parseDrafts(out)[0]!.anchor).toBe("p:2222"); // 쓰레드 블록이 사이에 들어와도 앵커는 그대로

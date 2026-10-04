@@ -87,6 +87,8 @@ export const Pipeline = z.object({
       keep: z.array(z.string()).default([]),
       drop: z.array(z.string()).default([]),
     }),
+    /** main 감사(§11.4)에서 어드민이 확인해 예외로 둔 커밋 (M5 제안 Y8) */
+    audit_allow: z.array(z.string()).default([]),
   }),
 
   pilot: z.object({

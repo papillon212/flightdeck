@@ -91,17 +91,27 @@ const DRAFT_LINES = [
 ];
 
 /** 질문 대상·리뷰어의 읽기 전용 창 (§3.6, §6.2 v0.13): 기록하지 않는 개인 질문 세션 */
-export async function viewerContext(c: { epic: string; phase: Phase; member: string; worktree: string; state: EpicState; review?: string }): Promise<string> {
+export async function viewerContext(c: { epic: string; phase: Phase; member: string; worktree: string; state: EpicState; review?: string; copy?: boolean; rev?: string }): Promise<string> {
   const epicDir = `.flightdeck/epics/${c.epic}`;
-  const out = [
-    `[Flightdeck] 에픽 ${c.epic} · 단계 ${c.phase} · @${c.member}의 **읽기 전용 창**(질문 대상·리뷰). 이 세션은 기록하지 않습니다.`,
-    [
-      "- 문서 내용·코드는 고칠 수 없습니다. 고쳐도 확장이 되돌립니다.",
-      `- 쓸 수 있는 것: ${epicDir}/analysis.md·design.md 안의 **쓰레드 초안 블록**뿐 (아래 문법).`,
-      "- 셸은 읽기 전용 명령만 됩니다.",
-      "- 사용자가 문서를 검사해 달라고 하면 문서·쓰레드·인수인계 기록을 읽고 답하세요. 질문·답글·코멘트를 달라고 하면 초안 블록으로 쓰세요.",
-    ].join("\n"),
-  ];
+  const out = c.copy
+    ? [
+        `[Flightdeck] 에픽 ${c.epic} · 단계 ${c.phase} · @${c.member}의 **리뷰 사본**(리뷰 요청 커밋 ${c.rev?.slice(0, 10) ?? "?"}). 이 세션은 기록하지 않습니다.`,
+        [
+          "- 코드를 자유롭게 읽고, 실행하고, 고칠 수 있습니다. 담당자의 작업 폴더에는 영향이 없습니다.",
+          "- 고친 내용은 사용자가 확장에서 \"수정 제안 만들기\"를 누르면 이 커밋 대비 diff가 수정 요청 쓰레드에 붙어 담당자에게 갑니다. 하나의 제안에는 한 가지 수정만 담으세요.",
+          `- ${epicDir}/ 아래 기록(impl-log 등)은 고치지 않습니다. git 명령은 쓸 수 없습니다.`,
+          `- 구현 기록: ${epicDir}/impl-log.md (Step별 의도·결정·리뷰 포인트), 설계: ${epicDir}/design.md. "왜 이렇게 했나"는 flightdeck_search_run으로 세션 원본을 검색하세요.`,
+        ].join("\n"),
+      ]
+    : [
+        `[Flightdeck] 에픽 ${c.epic} · 단계 ${c.phase} · @${c.member}의 **읽기 전용 창**(질문 대상·리뷰). 이 세션은 기록하지 않습니다.`,
+        [
+          "- 문서 내용·코드는 고칠 수 없습니다. 고쳐도 확장이 되돌립니다.",
+          `- 쓸 수 있는 것: ${epicDir}/analysis.md·design.md 안의 **쓰레드 초안 블록**뿐 (아래 문법).`,
+          "- 셸은 읽기 전용 명령만 됩니다.",
+          "- 사용자가 문서를 검사해 달라고 하면 문서·쓰레드·인수인계 기록을 읽고 답하세요. 질문·답글·코멘트를 달라고 하면 초안 블록으로 쓰세요.",
+        ].join("\n"),
+      ];
   if (c.review) out.push("## 리뷰", c.review);
   const open = [...c.state.threads.values()].filter((t) => t.status === "open");
   if (open.length) {

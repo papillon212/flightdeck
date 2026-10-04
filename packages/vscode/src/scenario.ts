@@ -15,7 +15,7 @@ export interface ScenarioHooks {
   wf: EpicWorkflow;
   epic: string | null;
   worktree: string | null;
-  role: "owner" | "viewer";
+  role: "owner" | "viewer" | "review";
   /** 이 창에 그려진 쓰레드 (Comments API) */
   commentThread(id: string): vscode.CommentThread | undefined;
   /** 이 창에 그려진 쓰레드 초안 (Comments API) */

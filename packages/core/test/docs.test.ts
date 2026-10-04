@@ -119,6 +119,7 @@ const thread = (over: Partial<Thread> = {}): Thread => ({
   body: "TTL은 요구사항상 몇 분인가요?",
   status: "resolved",
   replies: [{ id: "x", author: "park", at: "2026-10-01T11:03:00+09:00", body: "30분, 슬라이딩 갱신입니다.", source: "human" }],
+  applied: [],
   ...over,
 });
 

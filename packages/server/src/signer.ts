@@ -7,6 +7,7 @@ import path from "node:path";
 import { artifactHash, checkImplLog, checkSections, configVersionOf, nowIso, reduce, reviewOf, signEvent, ulid } from "@flightdeck/core";
 import { git, GitEngine, GitError, RemoteEventStore } from "@flightdeck/git";
 import { Event as EventSchema, GateCommands, parsePipeline, PHASE_ARTIFACT, type Event, type Phase, type Trust } from "@flightdeck/schema";
+import { landEpic, type LandDeps } from "./landing.ts";
 import type { Member, ServerStore } from "./store.ts";
 
 export class RequestError extends Error {
@@ -26,6 +27,19 @@ export interface EventRequest {
 }
 
 export const SERVER_IDENTITY = { name: "flightdeck-server", email: "flightdeck-server@localhost" };
+
+export interface LandJob {
+  id: string;
+  product: string;
+  epic: string;
+  status: "queued" | "running" | "landed" | "rejected" | "error" | "skipped";
+  at: string;
+  /** landed: main 커밋 */
+  main_commit?: string;
+  /** rejected: 거부 이유 (conflict | needs_report | invalid) */
+  reason?: string;
+  message?: string;
+}
 
 export class EventSigner {
   private queues = new Map<string, Promise<unknown>>();
@@ -55,11 +69,78 @@ export class EventSigner {
   }
 
   /** 제품별로 한 번에 하나씩 처리한다 (같은 사본·메타 브랜치를 쓰므로) */
-  request(member: Member, req: EventRequest): Promise<{ event: Event; pushed: boolean }> {
-    const prev = this.queues.get(req.product) ?? Promise.resolve();
-    const run = prev.catch(() => undefined).then(() => this.handle(member, req));
-    this.queues.set(req.product, run);
+  private enqueue<T>(product: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.queues.get(product) ?? Promise.resolve();
+    const run = prev.catch(() => undefined).then(fn);
+    this.queues.set(product, run);
     return run;
+  }
+
+  request(member: Member, req: EventRequest): Promise<{ event: Event; pushed: boolean }> {
+    return this.enqueue(req.product, () => this.handle(member, req));
+  }
+
+  // ---- 반영 (§11, M5 Y5·Y6·Y7·Y9) ----
+
+  private jobs = new Map<string, LandJob>();
+
+  /** 반영 작업 등록. 같은 에픽의 작업이 대기·진행 중이면 그것을 돌려준다 */
+  land(product: string, epic: string): LandJob {
+    const running = [...this.jobs.values()].find((j) => j.product === product && j.epic === epic && (j.status === "queued" || j.status === "running"));
+    if (running) return running;
+    const job: LandJob = { id: ulid(), product, epic, status: "queued", at: nowIso() };
+    this.jobs.set(job.id, job);
+    void this.enqueue(product, async () => {
+      job.status = "running";
+      try {
+        Object.assign(job, await landEpic(this.landDeps(), product, epic));
+      } catch (e) {
+        Object.assign(job, { status: "error", message: e instanceof Error ? e.message : String(e) });
+      }
+    });
+    return job;
+  }
+
+  job(id: string): LandJob | undefined {
+    return this.jobs.get(id);
+  }
+
+  /** 재시작 복구·누락 대비 (§11.1 보조 경로): 반영 대기(pending)인 에픽을 찾아 작업을 등록한다 */
+  async scanLanding(): Promise<LandJob[]> {
+    const out: LandJob[] = [];
+    for (const { product } of await this.deps.store.listProducts()) {
+      const ctx = await this.loadProduct(product).catch(() => null);
+      if (!ctx) continue;
+      for (const epic of await ctx.store.listEpics()) {
+        const s = await ctx.state(epic);
+        if (s.phase === "LANDING" && s.landing?.status === "pending") out.push(this.land(product, epic));
+      }
+    }
+    return out;
+  }
+
+  /** 제품의 서버 쪽 사본·메타 브랜치·신뢰 기준을 맞추고, 에픽 상태 계산기를 돌려준다 */
+  private async loadProduct(product: string) {
+    const { dir, target } = await this.mirror(product);
+    const store = new RemoteEventStore(dir, "origin", { author: SERVER_IDENTITY });
+    await store.sync();
+    const trust = await this.trust();
+    const state = async (epic: string) => {
+      const events = await store.list(epic);
+      const version = configVersionOf(events, epic);
+      const cv = version ? await this.deps.store.getConfigVersion(product, version) : null;
+      const pipeline = cv ? parsePipeline(cv.pipeline_yaml) : undefined;
+      return Object.assign(reduce(epic, events, trust, { pipelines: () => pipeline }), { events });
+    };
+    return { dir, target, store, trust, state };
+  }
+
+  private landDeps(): LandDeps {
+    return {
+      load: (product) => this.loadProduct(product),
+      sign: (e) => signEvent(e, this.deps.privateKeyPem),
+      config: (product, version) => this.deps.store.getConfigVersion(product, version),
+    };
   }
 
   private async handle(member: Member, req: EventRequest): Promise<{ event: Event; pushed: boolean }> {
@@ -83,6 +164,11 @@ export class EventSigner {
 
     /** 원격 에픽 브랜치의 단계 산출물: 형식 검사(§6.3) 후 해시 */
     const remoteArtifact = async (phase: Phase) => {
+      if (phase === "VERIFICATION") {
+        // 검증 단계의 산출물 = 에픽 브랜치 전체 (§4.2: tree 해시). 테스트 통과 보고는 reducer가 본다 (M5 Y1)
+        const head = await remoteHead();
+        return { file: "에픽 브랜치", head, hash: `tree:${(await git(["rev-parse", `${head}^{tree}`], { cwd: dir })).trim()}` };
+      }
       const artifact = PHASE_ARTIFACT[phase as keyof typeof PHASE_ARTIFACT];
       if (!artifact) throw new RequestError(400, `산출물이 없는 단계: ${phase}`);
       const head = await eng.fetchEpicBranch(req.epic).catch((e) => {
@@ -168,11 +254,14 @@ export class EventSigner {
 
     const unsigned = EventSchema.parse({ v: 1, id: ulid(), type: req.type, epic: req.epic, author: member.id, at: nowIso(), data }) as Event;
     const event = signEvent(unsigned, this.deps.privateKeyPem);
-    const ignored = reduce(req.epic, [...events, event], trust, opts).ignored.find((i) => i.event === event.id);
+    const after = reduce(req.epic, [...events, event], trust, opts);
+    const ignored = after.ignored.find((i) => i.event === event.id);
     if (ignored) throw new RequestError(409, `${req.type} 거부: ${ignored.reason} (요청자: ${member.id}, 현재 단계: ${state.phase})`);
 
     await store.append(event); // 로컬 커밋 후 push. push 실패분은 다음 요청·주기에 다시 보낸다
     const r = await store.sync().catch(() => ({ pending: 1 }));
+    // 마지막 검증 승인, 또는 main 이동 뒤 재보고로 반영 대기가 되면 바로 반영 작업을 건다 (Y5). 이 처리 뒤 차례로 돈다
+    if (after.phase === "LANDING" && after.landing?.status === "pending" && (state.phase !== "LANDING" || state.landing?.status !== "pending")) this.land(req.product, req.epic);
     return { event, pushed: r.pending === 0 };
   }
 }

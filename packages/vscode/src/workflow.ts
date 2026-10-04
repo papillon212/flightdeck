@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
-import { applyTextEdit, artifactHash, checkSections, configVersionOf, diffToEdits, draftText, ensureParagraphIds, insertDrafts, linesLabel, myOpenThreads, needsServerSignature, nowIso, parseDrafts, parseImplLog, pipelineFromDir, reduce, removeDrafts, renderThreads, replay, restoreParagraphIds, reviewOf, sha256, stripThreads, threadIdFrom, trustFromConfig, ulid, type ConfigPayload, type CoverageReport, type Draft, type EpicState, type MemoGroup, type Thread } from "@flightdeck/core";
+import { applyTextEdit, artifactHash, auditMain, checkSections, configVersionOf, diffRecords, diffToEdits, draftText, ensureParagraphIds, insertDrafts, linesLabel, mapLines, myOpenThreads, type AuditFinding, type MainCommit, needsServerSignature, nowIso, parseDrafts, parseImplLog, pipelineFromDir, reduce, removeDrafts, renderThreads, replay, restoreParagraphIds, reviewOf, sha256, stripThreads, threadIdFrom, trustFromConfig, ulid, type ConfigPayload, type CoverageReport, type Draft, type EpicState, type MemoGroup, type Thread } from "@flightdeck/core";
 import { git, GitEngine, LocalEventStore, MetaRewriteError, RAW_ARGS, RAW_ENV, RemoteEventStore, RunStore } from "@flightdeck/git";
 import { DEV_TRUST, HANDOFF_SECTIONS, parsePipeline, PHASE_ARTIFACT, type Anchor, type EditMemo, type EditRecord, type EditSource, type Event, type EventOf, type EventType, type LocalEpicStateInput, type Phase, type Pipeline, type Trust } from "@flightdeck/schema";
 import type { AgentAdapter } from "@flightdeck/agent";
@@ -291,11 +291,23 @@ export class EpicWorkflow {
       const ds = parseDrafts(md).map((d) => ({ draft: d, text: draftText(md, d) }));
       if (ds.length) kept.set(name, ds);
     }
+    // 검증 단계 리뷰어의 창은 쓰기 가능한 리뷰 사본이다 (M5 Y3). 아직 제안하지 않은 고친 내용은 새 커밋으로 옮겨도 남긴다
+    const role = s0.phase === "VERIFICATION" ? "review" : "viewer";
+    const prevState = existsSync(statePath(dataDir, epic)) ? await readState(dataDir, epic).catch(() => null) : null;
+    const carry = prevState?.role === "review" && existsSync(prevWt) ? await this.copyDiff(prevWt) : "";
     // 리뷰 중이면 리뷰 요청된 커밋을 본다 (요청 뒤 담당자가 고친 것은 다시 요청할 때까지 보지 않는다, §4.2)
     const v = await this.eng.openViewWorktree(epic, commit ?? s0.review.requested?.commit, this.gitRemote);
+    if (role === "review") await git(["clean", "-fdq", "-e", ".flightdeck/.runtime"], { cwd: v.path }).catch(() => undefined);
     for (const [name, ds] of kept) {
       const f = path.join(this.epicDir(v.path, epic), name);
       if (existsSync(f)) await writeFile(f, insertDrafts(await readFile(f, "utf8"), ds));
+    }
+    if (carry) {
+      await git(["apply", "--whitespace=nowarn", "-"], { cwd: v.path, input: carry }).catch(async () => {
+        const keep = path.join(dataDir, `review-${epic}.patch`);
+        await writeFile(keep, carry);
+        this.warnings.push(`리뷰 사본에서 고친 내용이 새 리뷰 커밋에 맞지 않아 옮기지 못했다. ${keep}에 남겼다`);
+      });
     }
     // 단계 룰·파이프라인은 에픽에 고정된 설정 버전 (훅·MCP가 읽는다)
     const version = s0.config_version;
@@ -305,7 +317,7 @@ export class EpicWorkflow {
       repo: this.cfg.repo,
       worktree: v.path,
       member: this.cfg.member,
-      role: "viewer",
+      role,
       ...(this.cfg.remote ? { product: this.cfg.remote.product, gitRemote: this.gitRemote } : {}),
       phase: s0.phase,
       configDir,
@@ -323,7 +335,7 @@ export class EpicWorkflow {
     return { worktree: v.path, state: await this.sync(epic) };
   }
 
-  async role(epic: string): Promise<"owner" | "viewer"> {
+  async role(epic: string): Promise<"owner" | "viewer" | "review"> {
     return (await readState(await this.eng.dataDir(), epic)).role;
   }
 
@@ -391,7 +403,7 @@ export class EpicWorkflow {
     const state = await this.epicState(epic);
     const wt = await this.worktree(epic);
     const dataDir = await this.eng.dataDir();
-    if ((await readState(dataDir, epic)).role === "viewer") {
+    if ((await readState(dataDir, epic)).role !== "owner") {
       // 읽기 전용 창 (§2.4, §6.2 v0.13): 공유 커밋 내용 위에 쓰레드를 그리고, 쓰레드 초안만 남긴다.
       // 초안 밖의 변경(에이전트·사람)은 버린다. 편집 기록에 남기지 않는다
       const changed: string[] = [];
@@ -479,7 +491,7 @@ export class EpicWorkflow {
 
   async createThread(epic: string, t: { file: string; pid: string; kind: "question" | "change_request" | "note"; to: string[]; body: string; source?: "human" | "agent" }): Promise<string> {
     const s = await this.epicState(epic);
-    const viewer = (await this.role(epic)) === "viewer";
+    const viewer = (await this.role(epic)) !== "owner";
     const unknown = this.cfg.remote ? t.to.filter((m) => !this.cfg.remote!.config.members.some((x) => x.id === m && x.active)) : [];
     if (unknown.length) throw new Error(`등록되지 않았거나 비활성인 멤버: ${unknown.map((m) => "@" + m).join(", ")}`);
     const id = ulid();
@@ -604,10 +616,10 @@ export class EpicWorkflow {
   /** 리뷰 차례 멘션 (§3.7, §4.2): 현재 티어 리뷰어 중 아직 승인하지 않은 사람 */
   private async mentionReviewTurn(epic: string, s: EpicState): Promise<void> {
     const cur = reviewOf(s)?.current;
-    if (!cur || s.phase !== "DESIGN") return;
-    const a = PHASE_ARTIFACT[s.phase as keyof typeof PHASE_ARTIFACT];
+    if (!cur || (s.phase !== "DESIGN" && s.phase !== "VERIFICATION")) return;
+    const what = s.phase === "DESIGN" ? PHASE_ARTIFACT.DESIGN.file : "구현 검증";
     const to = cur.reviewers.filter((m) => m !== this.cfg.member && !cur.approvedBy.includes(m));
-    await this.mention(epic, to, `리뷰 차례(${cur.name}) · ${a.file}`);
+    await this.mention(epic, to, `리뷰 차례(${cur.name}) · ${what}`);
   }
 
   /** 내 리뷰 차례: 리뷰 요청된 에픽 중 현재 티어 리뷰어인데 아직 승인하지 않은 것 */
@@ -819,28 +831,244 @@ export class EpicWorkflow {
     const s0 = await this.epicState(epic);
     if (s0.owner !== this.cfg.member) return { ok: false, problems: [`담당자(@${s0.owner})만 제출할 수 있습니다`] };
     if (s0.phase !== "IMPLEMENTATION") return { ok: false, problems: [`지금은 ${s0.phase} 단계입니다`] };
+    const open = [...s0.threads.values()].filter((t) => t.phase === s0.phase && t.status === "open");
+    const r = await this.commitAndReport(epic, "구현 제출", "IMPLEMENTATION", opts, open.length ? [`열린 쓰레드 ${open.length}개`] : []);
+    if (!r.ok) return r;
+    await this.passEvent(epic, "phase.completed", { phase: "IMPLEMENTATION", commit: r.commit });
+    // 검증 티어 리뷰를 바로 요청한다 (M5 Y1: 같은 커밋, 통과 보고가 있으므로)
+    const s1 = await this.sync(epic);
+    if (s1.phase === "VERIFICATION" && reviewOf(s1)) await this.passEvent(epic, "review.requested", await this.verificationData(epic, r.commit));
+    const s = await this.sync(epic);
+    if (this.cfg.remote) await this.trackerPhase(epic, s.phase);
+    await this.mentionReviewTurn(epic, s);
+    return { ok: true, commit: r.commit, phase: s.phase };
+  }
+
+  /**
+   * 관문 검사 → 에픽 브랜치 커밋·공유 → 관문 명령 실행 → 테스트 보고 (§7.5). 구현 제출과 검증 중 다시 요청이 같이 쓴다.
+   * 설명 없는 변경·impl-log 문제가 있으면 커밋하지 않는다
+   */
+  private async commitAndReport(
+    epic: string,
+    label: string,
+    phase: Phase,
+    opts: { onOutput?: (s: string) => void },
+    extra: string[] = [],
+  ): Promise<{ ok: true; commit: string } | { ok: false; problems: string[]; coverage?: CoverageReport }> {
     const st = await this.implementationStatus(epic);
     const problems: string[] = [];
     for (const h of st.coverage.unexplained) {
       problems.push(`설명 없는 변경 ${h.file}:${linesLabel([h.newLines])} — ${h.sources.filter((x) => !x.explained).map((x) => x.why).join(", ") || "출처 없음"}`);
     }
     if (st.coverage.ratio < st.threshold) problems.unshift(`coverage ${(st.coverage.ratio * 100).toFixed(0)}% < ${(st.threshold * 100).toFixed(0)}%`);
-    problems.push(...st.implLog.map((p) => `impl-log: ${p}`));
-    const open = [...s0.threads.values()].filter((t) => t.phase === s0.phase && t.status === "open");
-    if (open.length) problems.push(`열린 쓰레드 ${open.length}개`);
+    problems.push(...st.implLog.map((p) => `impl-log: ${p}`), ...extra);
     if (problems.length) return { ok: false, problems, coverage: st.coverage };
 
     const wt = await this.worktree(epic);
-    await this.eng.commitAll(wt, `${epic}: 구현 제출 (Step ${st.step})`, { "Flightdeck-Epic": epic, "Flightdeck-Phase": "IMPLEMENTATION" });
+    await this.eng.commitAll(wt, `${epic}: ${label} (Step ${st.step})`, { "Flightdeck-Epic": epic, "Flightdeck-Phase": phase });
     const commit = this.cfg.remote ? await this.eng.pushEpicBranch(epic, this.gitRemote) : await this.eng.revParse("HEAD", wt);
     const commands = await this.runGateCommands(epic, commit, opts.onOutput);
     await this.passEvent(epic, "gate.reported", { commit, commands });
     const failed = commands.filter((c) => c.exit !== 0);
     if (failed.length) return { ok: false, problems: failed.map((c) => `명령 실패 (종료 코드 ${c.exit}): ${c.cmd} — ${c.summary}`) };
-    await this.passEvent(epic, "phase.completed", { phase: "IMPLEMENTATION", commit });
+    return { ok: true, commit };
+  }
+
+  // ---- 검증 (§4.2 VERIFICATION, §9.3, M5) ----
+
+  /** 검증 중 다시 요청 (Y1): 수정 제안을 반영한 뒤. 관문 검사 → 커밋 → 테스트 보고 → 리뷰 요청 (재승인은 reapproval대로) */
+  async requestVerification(epic: string, opts: { onOutput?: (s: string) => void } = {}): Promise<{ ok: true; state: EpicState } | { ok: false; problems: string[]; coverage?: CoverageReport }> {
+    const s0 = await this.epicState(epic);
+    if (s0.owner !== this.cfg.member) return { ok: false, problems: [`담당자(@${s0.owner})만 리뷰를 요청할 수 있습니다`] };
+    if (s0.phase !== "VERIFICATION") return { ok: false, problems: [`지금은 ${s0.phase} 단계입니다`] };
+    const r = await this.commitAndReport(epic, "검증 다시 요청", "VERIFICATION", opts);
+    if (!r.ok) return r;
+    await this.passEvent(epic, "review.requested", await this.verificationData(epic, r.commit));
+    const s = await this.sync(epic);
+    await this.mentionReviewTurn(epic, s);
+    return { ok: true, state: s };
+  }
+
+  /** 검증 리뷰 요청의 data: 산출물 = 그 커밋의 tree (§4.2). 서버는 원격 에픽 브랜치 끝과 같은지 다시 본다 */
+  private async verificationData(epic: string, commit: string) {
+    const tree = (await git(["rev-parse", `${commit}^{tree}`], { cwd: await this.worktree(epic) })).trim();
+    return { phase: "VERIFICATION", artifact_hash: `tree:${tree}`, commit };
+  }
+
+  /** 리뷰 사본에서 고친 내용 (리뷰 커밋 대비, .flightdeck/ 제외, 새 파일 포함) */
+  async copyDiff(wt: string): Promise<string> {
+    const tmp = path.join(await this.eng.dataDir(), `copy-index-${process.pid}`);
+    const env = { GIT_INDEX_FILE: tmp };
+    try {
+      await git(["read-tree", "HEAD"], { cwd: wt, env });
+      await git(["add", "-A", "--", ".", ":(exclude).flightdeck"], { cwd: wt, env });
+      return await git(["diff", "--cached", "--binary", "HEAD", "--", ".", ":(exclude).flightdeck"], { cwd: wt, env });
+    } finally {
+      await rm(tmp, { force: true });
+    }
+  }
+
+  /**
+   * 수정 제안 (§9.3, Y3): 리뷰 사본에서 고친 내용을 수정 요청 쓰레드에 붙인다. 위치는 file:range(리뷰 커밋 기준).
+   * 붙인 뒤 사본을 리뷰 커밋으로 되돌린다. 쓰레드 ID를 돌려준다
+   */
+  async suggestFix(epic: string, t: { file: string; range: [number, number]; body: string; to?: string[] }): Promise<string> {
+    if ((await this.role(epic)) !== "review") throw new Error("수정 제안은 검증 단계 리뷰 사본에서 만든다");
+    const wt = await this.worktree(epic);
+    const patch = await this.copyDiff(wt);
+    if (!patch.trim()) throw new Error("리뷰 사본에서 고친 내용이 없습니다");
+    const s = await this.epicState(epic);
+    const thread = await this.createCodeThread(epic, { ...t, kind: "change_request", to: t.to ?? (s.owner ? [s.owner] : []), patch });
+    await git(["checkout", "-q", "-f", "HEAD", "--", "."], { cwd: wt });
+    await git(["clean", "-fdq", "-e", ".flightdeck/.runtime"], { cwd: wt });
+    return thread;
+  }
+
+  /** 코드 쓰레드 (§3.3, Y2): 앵커 = 리뷰 커밋(또는 담당자 작업 폴더의 HEAD) 기준 줄 범위와 앞뒤 3줄 */
+  async createCodeThread(epic: string, t: { file: string; range: [number, number]; kind: "question" | "change_request" | "note"; to: string[]; body: string; patch?: string }): Promise<string> {
+    const s = await this.epicState(epic);
+    const wt = await this.worktree(epic);
+    const role = await this.role(epic);
+    const rev = role === "owner" ? await this.eng.revParse("HEAD", wt) : (s.review.requested?.commit ?? (await this.eng.revParse("HEAD", wt)));
+    const text = await git(["show", `${rev}:${t.file}`], { cwd: wt }).catch(() => "");
+    const lines = text.split("\n");
+    const [a, b] = t.range;
+    const context = [...lines.slice(Math.max(0, a - 4), a - 1), ...lines.slice(b, b + 3)].slice(0, 6);
+    const id = ulid();
+    const thread = threadIdFrom(id);
+    const anchor: Anchor = { type: "code", file: t.file, rev, range: [a, Math.max(a, b)], context };
+    await this.emit(epic, "thread.created", { thread, phase: s.phase, file: t.file, anchor, kind: t.kind, to: t.to, body: t.body, commit: rev, ...(t.patch ? { patch: t.patch } : {}) }, this.cfg.member, id);
+    await this.sync(epic);
+    await this.mention(epic, t.to, `${t.kind === "change_request" ? (t.patch ? "수정 제안" : "수정 요청") : t.kind === "question" ? "질문" : "메모"} 1건 · ${t.file}`, thread);
+    return thread;
+  }
+
+  /** 코드 쓰레드의 지금 위치 (Y2): 앵커 커밋 → 이 창의 작업 트리 diff로 줄을 옮긴다 */
+  async codeThreadPositions(epic: string): Promise<{ thread: Thread; file: string; range: [number, number]; lost: boolean }[]> {
+    const s = await this.epicState(epic);
+    const wt = await this.worktree(epic);
+    const out: { thread: Thread; file: string; range: [number, number]; lost: boolean }[] = [];
+    for (const t of s.threads.values()) {
+      if (t.anchor.type !== "code") continue;
+      const diff = await git(["diff", "-U0", "--no-color", t.anchor.rev, "--", t.anchor.file], { cwd: wt }).catch(() => "");
+      const m = mapLines(diff, t.anchor.range);
+      out.push({ thread: t, file: t.anchor.file, ...m });
+    }
+    return out;
+  }
+
+  /**
+   * 수정 제안 반영 (§9.3, Y4): 담당자 작업 폴더에 패치를 적용하고, 바뀐 파일을 출처 patch로 편집 기록에 남긴 뒤 patch.applied.
+   * 반영 뒤에는 requestVerification으로 다시 요청한다
+   */
+  async applyPatch(epic: string, threadId: string): Promise<string[]> {
+    const s = await this.epicState(epic);
+    if (s.owner !== this.cfg.member || (await this.role(epic)) !== "owner") throw new Error("수정 제안은 담당자의 작업 폴더에서 반영한다");
+    const t = s.threads.get(threadId);
+    const patch = t?.replies.filter((r) => r.patch).at(-1)?.patch ?? t?.patch;
+    if (!t || !patch) throw new Error("수정 제안이 없는 쓰레드");
+    const wt = await this.worktree(epic);
+    const files = (await git(["apply", "--numstat", "-"], { cwd: wt, input: patch })).trim().split("\n").map((l) => l.split("\t")[2]!).filter(Boolean);
+    const ctx = await this.implContext(epic);
+    await recordDrift(ctx); // 반영 전 편집 기록 = 디스크
+    const before = new Map<string, string | null>();
+    for (const f of files) before.set(f, existsSync(path.join(wt, f)) ? await readFile(path.join(wt, f), "utf8") : null);
+    try {
+      await git(["apply", "--whitespace=nowarn", "-"], { cwd: wt, input: patch });
+    } catch (e) {
+      throw new Error(`수정 제안이 지금 코드에 맞지 않아 반영하지 못했습니다. 제안자에게 다시 만들어 달라고 답글을 남기세요 (${e instanceof Error ? e.message.split("\n").at(-1) : e})`);
+    }
+    const ts = nowIso();
+    const source = { kind: "patch" as const, member: this.cfg.member, thread: threadId };
+    for (const f of files) {
+      const after = existsSync(path.join(wt, f)) ? await readFile(path.join(wt, f), "utf8") : null;
+      await appendEditRecords(ctx.dataDir, epic, diffRecords(epic, f, before.get(f) ?? null, after, source, ts));
+    }
+    await this.emit(epic, "patch.applied", { thread: threadId, commit: t.anchor.type === "code" ? t.anchor.rev : await this.eng.revParse("HEAD", wt) });
+    await this.sync(epic);
+    return files;
+  }
+
+  /** 구현 재개 (§4.3): VERIFICATION → IMPLEMENTATION. 수정 요청을 에이전트로 반영할 때 */
+  async resumeImplementation(epic: string, reason: string): Promise<EpicState> {
+    await this.emit(epic, "phase.reverted", { from: "VERIFICATION", to: "IMPLEMENTATION", reason });
     const s = await this.sync(epic);
     if (this.cfg.remote) await this.trackerPhase(epic, s.phase);
-    return { ok: true, commit, phase: s.phase };
+    return s;
+  }
+
+  /**
+   * 반영 따라가기 (§11, Y6·Y9). 담당자 창의 동기화에서 부른다.
+   * needs_report: 서버가 main을 병합한 커밋으로 작업 폴더를 fast-forward하고, 테스트를 다시 실행·보고한다(서버가 그 서명 뒤 반영을 다시 건다)
+   */
+  async followLanding(epic: string, s: EpicState, opts: { onOutput?: (s: string) => void } = {}): Promise<"reported" | "waiting" | null> {
+    if (s.phase !== "LANDING" || !s.landing || s.owner !== this.cfg.member) return null;
+    if (s.landing.status !== "needs_report") return "waiting";
+    const commit = s.landing.commit;
+    if (s.gates.has(commit)) return "waiting";
+    if (this.following.has(epic)) return "waiting";
+    this.following.add(epic);
+    try {
+      const wt = await this.worktree(epic);
+      await this.eng.fetchEpicBranch(epic, this.gitRemote);
+      const ctx = await this.implContext(epic);
+      await recordDrift(ctx);
+      const before = await this.eng.revParse("HEAD", wt);
+      await git(["merge", "-q", "--ff-only", commit], { cwd: wt });
+      // 바뀐 파일은 main에서 온 것이다 (external:<commit>)
+      const changed = (await git(["diff", "--name-only", "-z", before, commit], { cwd: wt })).split("\0").filter(Boolean);
+      for (const f of changed) {
+        const prev = await git([...RAW_ARGS, "cat-file", "blob", `${before}:${f}`], { cwd: wt, env: RAW_ENV }).catch(() => null);
+        const next = existsSync(path.join(wt, f)) ? await readFile(path.join(wt, f), "utf8") : null;
+        await appendEditRecords(ctx.dataDir, epic, diffRecords(epic, f, prev, next, { kind: "external", commit }, nowIso()));
+      }
+      const commands = await this.runGateCommands(epic, commit, opts.onOutput);
+      await this.passEvent(epic, "gate.reported", { commit, commands });
+      return "reported";
+    } finally {
+      this.following.delete(epic);
+    }
+  }
+
+  private following = new Set<string>();
+
+  /**
+   * main 감사 (§11.4, Y8): 감사 시작점(가장 오래된 에픽의 base) 뒤 main first-parent 커밋 중
+   * 서명된 반영(epic.landed)이 아닌 것
+   */
+  async auditMain(): Promise<AuditFinding[]> {
+    const r = this.cfg.remote;
+    if (!r) return [];
+    await this.pull();
+    const p = parsePipeline(r.config.pipeline_yaml);
+    const target = p.landing.target;
+    await git(["fetch", "-q", "--no-tags", this.gitRemote, `+refs/heads/${target}:refs/remotes/${this.gitRemote}/${target}`], { cwd: this.cfg.repo });
+    const landed = new Map<string, string>();
+    const bases: string[] = [];
+    for (const epic of await this.store.listEpics()) {
+      const s = await this.epicState(epic);
+      if (s.base_sha) bases.push(s.base_sha);
+      if (s.landed) landed.set(epic, s.landed.main_commit);
+    }
+    if (!bases.length) return [];
+    // 가장 오래된 base: 다른 base들의 조상
+    let start = bases[0]!;
+    for (const b of bases.slice(1)) {
+      const isAnc = await git(["merge-base", "--is-ancestor", b, start], { cwd: this.cfg.repo }).then(() => true, () => false);
+      if (isAnc) start = b;
+    }
+    const log = await git(["log", "--first-parent", "--format=%H%x00%s%x00%(trailers:only,unfold)%x01", `${start}..refs/remotes/${this.gitRemote}/${target}`], { cwd: this.cfg.repo }).catch(() => "");
+    const commits: MainCommit[] = log
+      .split("\x01")
+      .map((x) => x.replace(/^\n/, ""))
+      .filter(Boolean)
+      .map((rec) => {
+        const [sha, subject, tr] = rec.split("\0") as [string, string, string];
+        const trailers: Record<string, string> = {};
+        for (const m of (tr ?? "").matchAll(/^([A-Za-z-]+): (.+)$/gm)) trailers[m[1]!] = m[2]!;
+        return { sha, subject, trailers };
+      });
+    return auditMain(commits, landed, p.landing.audit_allow);
   }
 
   /** 자동 초안 (§6.1 headless): 백그라운드 claude -p. 끝나면 세션 ID로 이어서 작업(resume)한다 */

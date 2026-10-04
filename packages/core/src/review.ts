@@ -56,10 +56,11 @@ export interface ReviewProgress {
 
 type ReviewConfig = Pipeline["phases"]["design"]["review"];
 
-/** 단계별 리뷰 설정. DESIGN만 (VERIFICATION은 M5) */
+/** 단계별 리뷰 설정 (DESIGN, VERIFICATION) */
 export function reviewConfig(pipeline: Pipeline | undefined, phase: Phase): ReviewConfig | null {
   if (!pipeline) return null;
   if (phase === "DESIGN") return pipeline.phases.design.review;
+  if (phase === "VERIFICATION") return pipeline.phases.verification.review;
   return null;
 }
 

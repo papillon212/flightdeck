@@ -25,7 +25,7 @@ export interface HandlerDeps {
 }
 
 export async function handle(ev: HookEvent, d: HandlerDeps): Promise<HookResponse> {
-  if (d.state.role === "viewer") return handleViewer(ev, d);
+  if (d.state.role !== "owner") return handleViewer(ev, d);
   switch (ev.kind) {
     case "session.start":
       return onSessionStart(ev, d);
@@ -58,7 +58,8 @@ async function handleViewer(ev: HookEvent, d: HandlerDeps): Promise<HookResponse
     const review = rv?.current?.reviewers.includes(s.member)
       ? `지금은 @${s.member}의 리뷰 차례입니다(${rv.current.name} 티어). 사용자가 승인 여부를 판단할 수 있게 문서를 검사해 주세요. 승인은 사용자가 직접 합니다.`
       : undefined;
-    return { kind: "context", text: await viewerContext({ epic: s.epic, phase: st.phase, member: s.member, worktree: s.worktree, state: st, ...(review ? { review } : {}) }) };
+    const copy = s.role === "review" ? { copy: true, rev: st.review.requested?.commit } : {};
+    return { kind: "context", text: await viewerContext({ epic: s.epic, phase: st.phase, member: s.member, worktree: s.worktree, state: st, ...(review ? { review } : {}), ...copy }) };
   }
   if (ev.kind !== "tool.before") return { kind: "allow" };
   const t = ev.tool!;
@@ -69,7 +70,7 @@ async function handleViewer(ev: HookEvent, d: HandlerDeps): Promise<HookResponse
     worktree: realpathLoose(s.worktree),
     tool: { name: t.name, kind: t.kind, paths: t.paths.map(realpathLoose), command: t.command },
     protectedPaths: d.adapter.protectedPaths(),
-    role: "viewer",
+    role: s.role === "review" ? "review" : "viewer",
   });
   return decision.allow ? { kind: "allow" } : { kind: "deny", reason: decision.reason };
 }
@@ -145,6 +146,8 @@ async function onToolBefore(ev: HookEvent, d: HandlerDeps): Promise<HookResponse
     worktree,
     tool: { name: t.name, kind: t.kind, paths, command: t.command },
     protectedPaths: d.adapter.protectedPaths(),
+    // VERIFICATION의 에이전트 셸은 구현 관문 명령만 (§6.2)
+    testCommands: pipelineFromDir(s.configDir)?.phases.implementation.gate.commands ?? [],
   });
   if (!decision.allow) {
     await hookLog(d.dataDir, s.epic, { kind: "deny", tool: t.name, paths, command: t.command, reason: decision.reason });

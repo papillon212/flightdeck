@@ -12,6 +12,8 @@ export interface Reply {
   at: string;
   body: string;
   source: "human" | "agent" | "session";
+  /** 수정 제안 (§9.3) */
+  patch?: string;
 }
 
 export interface Thread {
@@ -26,6 +28,19 @@ export interface Thread {
   body: string;
   status: "open" | "resolved";
   replies: Reply[];
+  /** 수정 제안 (M5 Y3): 쓰레드를 만들 때 붙인 패치 */
+  patch?: string;
+  /** 반영한 수정 제안: 패치를 담은 이벤트(쓰레드 생성 또는 답글) ID */
+  applied: string[];
+}
+
+/** 반영 진행 (§11, LANDING) */
+export interface LandingState {
+  /** pending: 서버 작업 대기·진행. needs_report: main이 움직여 rebase함 → 그 커밋으로 테스트를 다시 보고해야 한다 */
+  status: "pending" | "needs_report";
+  /** 반영할 에픽 브랜치 커밋 (마지막 리뷰 요청 커밋 또는 rebase 결과) */
+  commit: string;
+  last_rejection?: { reason: string; at: string };
 }
 
 export interface Run {
@@ -55,6 +70,12 @@ export interface EpicState {
   pipeline: Pipeline | undefined;
   /** 테스트 결과 보고 (§7.5): 커밋 → 마지막 보고. ok = 모든 명령 종료 코드 0 */
   gates: Map<string, { ok: boolean; event: string; author: string; at: string }>;
+  /** LANDING 단계의 반영 진행 */
+  landing: LandingState | null;
+  /** 반영 결과 (epic.landed) */
+  landed: { main_commit: string; event: string; at: string } | null;
+  /** VERIFICATION을 통과시킨 승인 이벤트 ID (squash trailer Flightdeck-Approvals) */
+  verifiedApprovals: string[];
 }
 
 export interface ReduceOptions {
@@ -77,11 +98,14 @@ export function initialState(epic: string): EpicState {
     review: { phase: "INTAKE", requested: null, approvals: [] },
     pipeline: undefined,
     gates: new Map(),
+    landing: null,
+    landed: null,
+    verifiedApprovals: [],
   };
 }
 
 /** 다음 단계 (설계 §4.1). ANALYSIS·IMPLEMENTATION은 phase.completed로, DESIGN은 마지막 티어 승인으로 넘어간다 */
-const NEXT: Partial<Record<Phase, Phase>> = { ANALYSIS: "DESIGN", DESIGN: "IMPLEMENTATION", IMPLEMENTATION: "VERIFICATION" };
+const NEXT: Partial<Record<Phase, Phase>> = { ANALYSIS: "DESIGN", DESIGN: "IMPLEMENTATION", IMPLEMENTATION: "VERIFICATION", VERIFICATION: "LANDING" };
 /** phase.completed로 넘어가는 단계 */
 const COMPLETABLE: ReadonlySet<Phase> = new Set(["ANALYSIS", "IMPLEMENTATION"]);
 
@@ -153,6 +177,7 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
     case "thread.created": {
       const d = e.data;
       if (s.threads.has(d.thread)) return ignore("이미 있는 쓰레드 ID");
+      if (d.patch && d.kind !== "change_request") return ignore("수정 제안은 수정 요청 쓰레드에만 붙인다");
       // 생성 권한 (§3.4): 해당 단계 담당자 / 현재 티어 리뷰어 (리뷰 요청 이후)
       if (e.author !== s.owner) {
         const cur = s.review.requested ? reviewOf(s)?.current : null;
@@ -170,6 +195,8 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
         body: d.body,
         status: "open",
         replies: [],
+        ...(d.patch ? { patch: d.patch } : {}),
+        applied: [],
       });
       return;
     }
@@ -179,7 +206,17 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
       if (!t) return ignore("없는 쓰레드");
       // 답글 권한 (§3.4): 쓰레드 참여자 + 멘션 대상. 담당자의 에이전트 답글은 담당자 이름으로 온다
       if (!threadMembers(t, s).has(e.author)) return ignore("답글 권한 없음");
-      t.replies.push({ id: e.id, author: e.author, at: e.at, body: e.data.body, source: e.data.source });
+      t.replies.push({ id: e.id, author: e.author, at: e.at, body: e.data.body, source: e.data.source, ...(e.data.patch ? { patch: e.data.patch } : {}) });
+      return;
+    }
+
+    case "patch.applied": {
+      // 수정 제안 반영 (§9.3, M5 Y4): 조종수(M5는 담당자)가 반영한다
+      const t = s.threads.get(e.data.thread);
+      if (!t) return ignore("없는 쓰레드");
+      if (e.author !== s.owner) return ignore("담당자만 수정 제안을 반영할 수 있음");
+      if (!t.patch && !t.replies.some((r) => r.patch)) return ignore("수정 제안이 없는 쓰레드");
+      t.applied.push(e.id);
       return;
     }
 
@@ -224,9 +261,33 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
 
     case "gate.reported": {
       // 구현 관문의 명령 결과 (§7.5): 담당자의 확장이 실행해 보고한다
-      if (s.phase !== "IMPLEMENTATION") return ignore(`${s.phase} 단계에서는 테스트 결과를 보고하지 않음`);
+      // 구현 제출, 검증 중 다시 요청(Y1), 반영 중 main 이동 후 재보고(Y6)
+      if (!["IMPLEMENTATION", "VERIFICATION", "LANDING"].includes(s.phase)) return ignore(`${s.phase} 단계에서는 테스트 결과를 보고하지 않음`);
       if (e.author !== s.owner) return ignore("담당자만 테스트 결과를 보고할 수 있음");
       s.gates.set(e.data.commit, { ok: e.data.commands.every((c) => c.exit === 0), event: e.id, author: e.author, at: e.at });
+      if (s.phase === "LANDING" && s.landing?.status === "needs_report" && s.landing.commit === e.data.commit && s.gates.get(e.data.commit)!.ok) s.landing.status = "pending";
+      return;
+    }
+
+    case "epic.landed": {
+      if (s.phase !== "LANDING") return ignore(`${s.phase} 단계에서는 반영 결과를 받지 않음`);
+      s.landed = { main_commit: e.data.main_commit, event: e.id, at: e.at };
+      s.landing = null;
+      move("DONE");
+      return;
+    }
+
+    case "land.rejected": {
+      if (s.phase !== "LANDING") return ignore(`${s.phase} 단계에서는 반영 거부를 받지 않음`);
+      const rejection = { reason: e.data.reason, at: e.at };
+      if (e.data.reason === "needs_report") {
+        if (!e.data.rebased_sha) return ignore("rebased_sha 없음");
+        s.landing = { status: "needs_report", commit: e.data.rebased_sha, last_rejection: rejection };
+        return;
+      }
+      // 충돌·재검증 실패: 구현으로 되돌린다 (§4.3, §11.3)
+      s.landing = null;
+      move("IMPLEMENTATION");
       return;
     }
 
@@ -234,6 +295,12 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
       if (e.data.phase !== s.phase) return ignore(`현재 단계(${s.phase})가 아님`);
       if (e.author !== s.owner) return ignore("담당자만 리뷰를 요청할 수 있음");
       if (!reviewConfig(s.pipeline, s.phase)) return ignore(s.pipeline ? `${s.phase}는 티어 리뷰가 없는 단계` : "파이프라인 없음 (설정 버전을 찾지 못함)");
+      // VERIFICATION 리뷰는 테스트가 통과한 커밋만 (M5 Y1)
+      if (s.phase === "VERIFICATION") {
+        const g = s.gates.get(e.data.commit);
+        if (!g) return ignore("이 커밋의 테스트 결과 보고(gate.reported)가 없음");
+        if (!g.ok) return ignore("이 커밋의 테스트 결과 보고에 실패한 명령이 있음");
+      }
       s.review.requested = { hash: e.data.artifact_hash, commit: e.data.commit, at: e.at, event: e.id };
       finishReview(s, e, move);
       return;
@@ -254,9 +321,10 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
     case "phase.reverted": {
       if (e.data.from !== s.phase) return ignore(`현재 단계(${s.phase})가 아님`);
       if (e.author !== s.owner) return ignore("담당자만 되돌릴 수 있음");
-      // §4.3: DESIGN → ANALYSIS (M1 범위)
-      if (!(e.data.from === "DESIGN" && e.data.to === "ANALYSIS")) return ignore("M1에서 허용하지 않는 되돌림");
-      move("ANALYSIS");
+      // §4.3: DESIGN → ANALYSIS, VERIFICATION → IMPLEMENTATION (구현 재개)
+      const ok = (e.data.from === "DESIGN" && e.data.to === "ANALYSIS") || (e.data.from === "VERIFICATION" && e.data.to === "IMPLEMENTATION");
+      if (!ok) return ignore("허용하지 않는 되돌림");
+      move(e.data.to);
       return;
     }
 
@@ -283,7 +351,17 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
 function finishReview(s: EpicState, e: Event, move: (to: Phase) => void): void {
   const p = reviewOf(s);
   const next = NEXT[s.phase];
-  if (p?.done && next && openThreads(s).length === 0) move(next);
+  if (!p?.done || !next || openThreads(s).length > 0) return;
+  if (next === "LANDING") {
+    // 검증 통과 → 반영 (§11): 리뷰 요청 커밋을 반영한다. 통과시킨 승인은 squash trailer에 남는다
+    const valid = new Set(p.tiers.flatMap((t) => t.approvedBy));
+    s.verifiedApprovals = s.review.approvals.filter((a) => a.hash === s.review.requested!.hash && valid.has(a.author)).map((a) => a.event);
+    const commit = s.review.requested!.commit;
+    move(next);
+    s.landing = { status: "pending", commit };
+    return;
+  }
+  move(next);
 }
 
 function pick(e: EventOf<"run.started">): Omit<Run, "finished"> {

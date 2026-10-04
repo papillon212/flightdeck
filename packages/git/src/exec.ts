@@ -5,6 +5,8 @@ export class GitError extends Error {
     readonly args: string[],
     readonly code: number | null,
     readonly stderr: string,
+    /** 실패해도 표준 출력을 쓰는 명령이 있다 (merge-tree의 충돌 목록) */
+    readonly stdout = "",
   ) {
     super(`git ${args.join(" ")} 실패 (${code}): ${stderr.trim()}`);
   }
@@ -29,7 +31,7 @@ export function git(args: string[], opts: GitOptions): Promise<string> {
       args,
       { cwd: opts.cwd, env: { ...process.env, ...opts.env }, maxBuffer: 1 << 28, encoding: "utf8" },
       (err, stdout, stderr) => {
-        if (err) reject(new GitError(args, typeof err.code === "number" ? err.code : null, stderr));
+        if (err) reject(new GitError(args, typeof err.code === "number" ? err.code : null, stderr, stdout));
         else resolve(stdout);
       },
     );

@@ -135,6 +135,18 @@ export function createApp(opts: AppOptions) {
         const r = await opts.signer.request(ctx.member, { product: body.product, epic: body.epic, type: body.type, data: body.data ?? {} });
         return json(res, 200, r);
       }
+      // 반영 (§11.2). 서버가 마지막 승인·재보고 때 스스로 작업을 걸므로(M5 Y5) 이것은 재시도용이다. 검증은 작업 안에서 다시 한다
+      if (p === "/land" && req.method === "POST") {
+        const body = JSON.parse(await ctx.body());
+        for (const k of ["product", "epic"]) if (typeof body[k] !== "string") throw new RequestError(400, `${k}가 없다`);
+        return json(res, 202, opts.signer.land(body.product, body.epic));
+      }
+      const job = /^\/land\/([0-9A-HJKMNP-TV-Z]{26})$/.exec(p);
+      if (job && req.method === "GET") {
+        const j = opts.signer.job(job[1]!);
+        if (!j) throw new RequestError(404, "없는 반영 작업");
+        return json(res, 200, j);
+      }
       throw new RequestError(404, `없는 경로: ${req.method} ${p}`);
     } catch (e) {
       if (e instanceof RequestError) return json(res, e.status, { error: e.message });

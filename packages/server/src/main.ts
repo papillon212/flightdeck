@@ -79,6 +79,10 @@ async function main() {
     ? { clientId: process.env.FD_GOOGLE_CLIENT_ID, clientSecret: process.env.FD_GOOGLE_CLIENT_SECRET, publicUrl: process.env.FD_PUBLIC_URL ?? `http://${host}:${port}` }
     : undefined;
   const app = createApp({ store, signer, keys, devLogin, ...(g ? { google: g } : {}) });
+  // 반영 보조 경로 (§11.1): 1분마다 반영 대기 에픽을 찾는다. 재시작 뒤 복구도 이것으로 한다
+  const scan = () => void signer.scanLanding().catch((e) => console.error("[land scan]", e instanceof Error ? e.message : e));
+  setTimeout(scan, 5_000);
+  setInterval(scan, Number(process.env.FD_LAND_SCAN_MS) || 60_000);
   createServer((req, res) => void app(req, res)).listen(port, host, () => {
     console.log(`flightdeck-server http://${host}:${port}  server key ${keyFingerprint(keys.publicKey)}${devLogin ? "  (개발용 로그인 켜짐)" : ""}`);
   });

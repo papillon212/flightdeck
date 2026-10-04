@@ -24,7 +24,8 @@ interface Ctx {
   /** 이 창이 에픽 작업 폴더(또는 읽기 전용 창)면 그 에픽 */
   epic: string | null;
   worktree: string | null;
-  role: "owner" | "viewer";
+  /** review: VERIFICATION 리뷰 사본 (쓰기 가능, 기록 안 함, M5 Y3) */
+  role: "owner" | "viewer" | "review";
   mode: "server" | "dev";
   /** 서버 모드인데 로그인이 안 됐거나 서버에 닿지 못해 쓸 수 없는 이유 */
   blocked?: string;

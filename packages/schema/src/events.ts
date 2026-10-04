@@ -5,6 +5,10 @@ import { EpicId, GitSha, MemberId, Phase, Sha256, ThreadId, Timestamp, Ulid } fr
 /** 구현 관문 명령의 실행 결과 (§7.5). 전체 로그는 세션 원본 ref에 두고 해시만 남긴다 */
 export const GateCommands = z.array(z.object({ cmd: z.string().min(1), exit: z.number().int(), summary: z.string(), log_hash: Sha256 }));
 
+/** 수정 제안 패치 (unified diff). 메타 이벤트에 그대로 넣으므로 64KB로 제한한다 (M5 제안 Y3) */
+export const PATCH_MAX = 64 * 1024;
+export const Patch = z.string().min(1).max(PATCH_MAX, "수정 제안이 64KB를 넘습니다. 나눠서 제안하세요");
+
 /** 이벤트 종류별 data (설계 §3.1 표) */
 const data = {
   "epic.started": z.object({
@@ -26,12 +30,14 @@ const data = {
     commit: GitSha.optional(),
     /** 에이전트가 쓴 쓰레드 초안을 사람이 올렸으면 agent (§3.2) */
     source: z.enum(["human", "agent"]).optional(),
+    /** 수정 제안 (M5 제안 Y3): 리뷰 사본의 diff. change_request에만 */
+    patch: Patch.optional(),
   }),
   "thread.replied": z.object({
     thread: ThreadId,
     body: z.string().min(1),
     source: z.enum(["human", "agent", "session"]),
-    patch: z.string().optional(), // 수정 제안 (§9.3)
+    patch: Patch.optional(), // 수정 제안 (§9.3)
   }),
   "thread.resolved": z.object({ thread: ThreadId }),
   "thread.reopened": z.object({ thread: ThreadId }),
@@ -70,7 +76,11 @@ const data = {
   }),
   "land.requested": z.object({ head_sha: GitSha }),
   "epic.landed": z.object({ main_commit: GitSha, approvals: z.array(Ulid) }),
-  "land.rejected": z.object({ reason: z.string().min(1), details: z.unknown().optional() }),
+  /**
+   * 반영 거부 (§11.3). reason: conflict(rebase 충돌 → IMPLEMENTATION) | needs_report(main이 움직여 rebase함. rebased_sha로 테스트를 다시 보고)
+   * | invalid(재검증 실패 → IMPLEMENTATION). rebased_sha는 needs_report에만
+   */
+  "land.rejected": z.object({ reason: z.string().min(1), rebased_sha: GitSha.optional(), details: z.unknown().optional() }),
   "session.started": z.looseObject({ sid: z.string().min(1) }),
   "session.ended": z.looseObject({ sid: z.string().min(1) }),
   "session.published": z.looseObject({ sid: z.string().min(1) }),
