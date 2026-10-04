@@ -82,7 +82,12 @@ export function replay(base: Map<string, string | null>, records: EditRecord[]):
   for (const r of [...records].sort((a, b) => a.seq - b.seq)) {
     const cur = files.get(r.file) ?? null;
     const actual = sha256(cur);
-    if (actual !== r.base_hash) mismatches.push({ seq: r.seq, file: r.file, expected: r.base_hash, actual });
+    // 기준이 다른 기록은 다른 내용 위에서 만든 편집이라 적용하면 엉뚱한 결과가 된다(범위 밖이면 예외). 건너뛰고 알린다
+    // (M2 실측: 같은 렌더링이 동시에 두 번 기록된 경우)
+    if (actual !== r.base_hash) {
+      mismatches.push({ seq: r.seq, file: r.file, expected: r.base_hash, actual });
+      continue;
+    }
     if (r.delete_file) {
       files.set(r.file, null);
       continue;

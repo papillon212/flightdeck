@@ -100,6 +100,20 @@ describe("EpicWorkflow (설계 §9.1, §4)", () => {
     expect(log.some((x) => x.source.kind === "external" && x.insert.includes("액세스"))).toBe(true);
   });
 
+  it("다시 그리기가 동시에 여러 번 불려도 편집 기록은 한 번만 남는다 (M2 실측: 질문 공유와 감시의 새로 고침이 겹침)", async () => {
+    const rel = `.flightdeck/epics/${EPIC}/analysis.md`;
+    const pid = parseBlocks((await readFile(analysisPath(), "utf8")).split("\n")).find((b) => b.text.startsWith("## 가정"))!.pid!;
+    // 쓰레드 생성 이벤트만 먼저 쓰고(렌더링 전), 여러 곳에서 동시에 다시 그린다
+    await (wf as any).emit(EPIC, "thread.created", { thread: "t-C0NCRR01", phase: "ANALYSIS", file: "analysis.md", anchor: { type: "paragraph", pid }, kind: "note", to: [], body: "동시 렌더링" });
+    await Promise.all([wf.renderDocs(EPIC), wf.renderDocs(EPIC), wf.sync(EPIC), wf.renderDocs(EPIC)]);
+    const log = (await readEditLog(await wf.eng.dataDir(), EPIC)).filter((x) => x.file === rel);
+    const r = replay(new Map([[rel, null]]), log);
+    expect(r.mismatches).toEqual([]);
+    expect(r.files.get(rel)).toBe(await readFile(analysisPath(), "utf8"));
+    expect((await readFile(analysisPath(), "utf8")).split("동시 렌더링").length).toBe(2); // 블록 하나
+    await wf.setThreadStatus(EPIC, "t-C0NCRR01", true); // 다음 테스트(관문)에 영향이 없도록
+  });
+
   it("권한 없는 동작은 이벤트를 쓰기 전에 막고 이유를 알린다 (메타 브랜치는 append-only)", async () => {
     const other = new EpicWorkflow({ ...wf.cfg, member: "choi" });
     const before = (await wf.store.list(EPIC)).length;

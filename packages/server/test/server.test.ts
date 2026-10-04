@@ -107,7 +107,8 @@ describe("설정 배포 (§2.5)", () => {
   });
 });
 
-describe("서버 서명 이벤트 (§3.1, §4.2, §12)", () => {
+// git 원격 왕복이 많아 전체 테스트를 함께 돌리면 기본 5초를 넘길 수 있다
+describe("서버 서명 이벤트 (§3.1, §4.2, §12)", { timeout: 60_000 }, () => {
   it("에픽 시작: 요청자가 담당자, 현재 설정 버전, 원격 main의 base_sha", async () => {
     expect((await api("dh.lee", "POST", "/events", { product: "sample", epic: EPIC, type: "epic.started", data: { base_sha: "f".repeat(40) } })).status).toBe(409);
     const r = await api("dh.lee", "POST", "/events", { product: "sample", epic: EPIC, type: "epic.started", data: { tracker_ref: "86abc", base_sha: base, owner: "park" } });

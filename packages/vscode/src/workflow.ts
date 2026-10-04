@@ -296,8 +296,18 @@ export class EpicWorkflow {
    * 3. 새 블록에 ID를 붙이고 쓰레드 블록을 그린다
    * 2·3의 변경도 편집 기록에 남긴다(출처 flightdeck, 설계 제안 T4). 그래서 편집 기록 재적용 = 디스크가 항상 유지된다.
    */
-  async renderDocs(epic: string, s?: EpicState): Promise<string[]> {
-    const state = s ?? (await this.epicState(epic));
+  renderDocs(epic: string, _s?: EpicState): Promise<string[]> {
+    // 한 번에 하나씩 (M2 실측: 질문 공유와 파일 감시·원격 감시의 새로 고침이 겹쳐 같은 렌더링이 편집 기록에 두 번 남았다).
+    // 읽기(재적용) → 디스크 쓰기 → 기록이 한 묶음이어야 편집 기록 재적용 = 디스크가 유지된다. 상태는 차례가 왔을 때 다시 계산한다
+    const run = this.renderQueue.then(() => this.renderDocsNow(epic));
+    this.renderQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  private renderQueue: Promise<unknown> = Promise.resolve();
+
+  private async renderDocsNow(epic: string): Promise<string[]> {
+    const state = await this.epicState(epic);
     const wt = await this.worktree(epic);
     const dataDir = await this.eng.dataDir();
     if ((await readState(dataDir, epic)).role === "viewer") {

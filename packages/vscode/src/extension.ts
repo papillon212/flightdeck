@@ -207,6 +207,14 @@ class ThreadView implements vscode.Disposable {
     }
   }
 
+  get(id: string): vscode.CommentThread | undefined {
+    return this.threads.get(id);
+  }
+
+  get size(): number {
+    return this.threads.size;
+  }
+
   idOf(thread: vscode.CommentThread): string | null {
     for (const [id, t] of this.threads) if (t === thread) return id;
     return null;
@@ -393,6 +401,13 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       vscode.window.showWarningMessage(`Flightdeck: ${w}`);
     }
   };
+  /** 띄운 알림 문구 (출력 창에도 남긴다. 시나리오 자동 진행이 읽는다) */
+  const notified: string[] = [];
+  const notify = (text: string, ...buttons: string[]) => {
+    notified.push(text);
+    out.appendLine(`[알림] ${text}`);
+    return vscode.window.showInformationMessage(text, ...buttons);
+  };
   /** 내 에픽 쓰레드에 남이 단 새 답글 알림용 (쓰레드 → 답글 수) */
   let replyCounts: Map<string, number> | null = null;
   const refresh = async () => {
@@ -423,7 +438,7 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     if (replyCounts) {
       for (const t of s.threads.values()) {
         const fresh = t.replies.slice(replyCounts.get(t.id) ?? 0).filter((r) => r.author !== me);
-        for (const r of fresh) vscode.window.showInformationMessage(`Flightdeck: @${r.author}이(가) 답했습니다 (${t.id}): ${r.body.split("\n")[0]!.slice(0, 80)}`);
+        for (const r of fresh) void notify(`Flightdeck: @${r.author}이(가) 답했습니다 (${t.id}): ${r.body.split("\n")[0]!.slice(0, 80)}`);
       }
     }
     replyCounts = new Map([...s.threads.values()].map((t) => [t.id, t.replies.length]));
@@ -444,8 +459,7 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     await ext.globalState.update("flightdeck.notified", [...seen, ...fresh.map((i) => `${i.thread.id}#${i.thread.replies.length}`)].slice(-500));
     for (const i of fresh) {
       const last = i.thread.replies.at(-1);
-      void vscode.window
-        .showInformationMessage(`Flightdeck: ${last ? `@${last.author}의 답글` : `@${i.thread.author}의 질문`} (${i.epic}): ${(last?.body ?? i.thread.body).split("\n")[0]!.slice(0, 80)}`, "열기")
+      void notify(`Flightdeck: ${last ? `@${last.author}의 답글` : `@${i.thread.author}의 질문`} (${i.epic}): ${(last?.body ?? i.thread.body).split("\n")[0]!.slice(0, 80)}`, "열기")
         .then((pick) => (pick ? openViewer(i.epic, i.commit) : undefined))
         .then(undefined, (e) => vscode.window.showErrorMessage(`Flightdeck: ${(e as Error).message}`));
     }
@@ -691,6 +705,20 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
   );
 
   await refresh().catch((e) => out.appendLine(String(e)));
+
+  // M2 시나리오 자동 진행 (개발 모드에서만, scenario.ts)
+  const scenario = process.env.FLIGHTDECK_SCENARIO;
+  if (scenario && ext.extensionMode === vscode.ExtensionMode.Development && ctx && !ctx.blocked) {
+    const { runScenario } = await import("./scenario.ts");
+    void runScenario(
+      {
+        wf: ctx.wf, epic: ctx.epic, worktree: ctx.worktree, role: ctx.role,
+        commentThread: (id) => view?.get(id), commentThreadCount: () => view?.size ?? 0, statusText: () => status.text,
+        notifications: notified, refresh, openViewer,
+      },
+      scenario,
+    );
+  }
 
   // 자동 점검: FLIGHTDECK_SMOKE=<결과 파일>이면 활성화 결과를 쓰고 창을 닫는다 (개발용)
   const smoke = process.env.FLIGHTDECK_SMOKE;

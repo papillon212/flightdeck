@@ -62,6 +62,17 @@ describe("replay: base_hash 순서 검증", () => {
     expect(bad.mismatches).toHaveLength(1);
   });
 
+  it("기준이 맞지 않는 기록은 적용하지 않는다: 같은 편집이 두 번 기록돼도 결과가 망가지지 않는다 (M2 실측)", () => {
+    const r1 = rec(1, "a.txt", "abc", [1, 1], "XYZ");
+    const dup = { ...rec(2, "a.txt", "abc", [1, 1], "XYZ") }; // 같은 기준으로 한 번 더
+    const r3 = rec(3, "a.txt", "aXYZbc", [4, 6], ""); // 첫 기록 뒤의 편집
+    const r = replay(new Map([["a.txt", "abc"]]), [r1, dup, r3]);
+    expect(r.files.get("a.txt")).toBe("aXYZ");
+    expect(r.mismatches.map((m) => m.seq)).toEqual([2]);
+    // 범위 밖이 되는 기록도 예외 없이 건너뛴다
+    expect(() => replay(new Map([["a.txt", "ab"]]), [rec(1, "a.txt", "zzzzzz", [3, 6], "")])).not.toThrow();
+  });
+
   it("새 파일은 base_hash null", () => {
     const r = replay(new Map(), [rec(1, "new.txt", null, [0, 0], "hi")]);
     expect(r.files.get("new.txt")).toBe("hi");

@@ -105,7 +105,7 @@ afterAll(async () => {
 
 const ANALYSIS = "## 요구사항 요약\n리프레시 토큰을 회전시킨다.\n\n## 영향 범위\nsrc/auth\n\n## 불명확한 점\n- TTL이 몇 분인가?\n\n## 가정\n30분\n";
 
-describe("2인 원격 분석 Q&A (M2 완료 기준)", () => {
+describe("2인 원격 분석 Q&A (M2 완료 기준)", { timeout: 60_000 }, () => {
   it("A: 내 일감에서 에픽 시작 → 서버 서명 epic.started, 에픽 브랜치에 epic.md, 일감 상태 분석", async () => {
     const mine = await A.assignedEpics();
     expect(mine.map((e) => e.epicId)).toEqual(["CU-86abc"]);
