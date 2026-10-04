@@ -259,13 +259,15 @@ const GROUP_GAP_MS = 2 * 60_000;
 export function coverage(files: (FileCoverageInput & { current: string | null })[], ctx: CoverageContext): CoverageReport {
   const hunks: Hunk[] = [];
   const drift: string[] = [];
+  const prov = new Map<string, ProvenanceResult>();
   for (const f of files) {
     const p = provenance(f.base, f.records);
+    prov.set(f.file, p);
     if (p.text !== f.current) drift.push(f.file);
     hunks.push(...fileHunks(f.file, f.base, p, ctx));
   }
   const unexplained = hunks.filter((h) => !h.explained);
-  const groups: MemoGroup[] = [];
+  const groups: (MemoGroup & { members: Set<number>; hunkLines: [number, number][] })[] = [];
   const byFile = new Map<string, { o: Origin; lines: [number, number] }[]>();
   for (const h of unexplained) {
     for (const s of h.sources.filter((x) => !x.explained)) {
@@ -276,7 +278,7 @@ export function coverage(files: (FileCoverageInput & { current: string | null })
   }
   for (const [file, list] of byFile) {
     list.sort((a, b) => a.o.seq - b.o.seq);
-    let g: MemoGroup | null = null;
+    let g: (typeof groups)[number] | null = null;
     let lastTs = 0;
     for (const { o, lines } of list) {
       const kind = o.source.kind === "agent_shell" ? "agent" : (o.source.kind as MemoGroup["kind"]);
@@ -284,15 +286,47 @@ export function coverage(files: (FileCoverageInput & { current: string | null })
       const ts = Date.parse(o.ts);
       if (g && g.kind === kind && g.who === who && ts - lastTs <= GROUP_GAP_MS) {
         g.seqs[1] = Math.max(g.seqs[1], o.seq);
-        if (!g.lines.some((l) => l[0] === lines[0] && l[1] === lines[1])) g.lines.push(lines);
+        g.members.add(o.seq);
+        if (!g.hunkLines.some((l) => l[0] === lines[0] && l[1] === lines[1])) g.hunkLines.push(lines);
       } else {
-        g = { file, kind, seqs: [o.seq, o.seq], lines: [lines], who };
+        g = { file, kind, seqs: [o.seq, o.seq], lines: [], who, members: new Set([o.seq]), hunkLines: [lines] };
         groups.push(g);
       }
       lastTs = ts;
     }
   }
-  return { hunks, unexplained, ratio: hunks.length ? (hunks.length - unexplained.length) / hunks.length : 1, groups, drift };
+  // 묶음의 줄 범위 = 그 편집들의 문자(지운 자리 포함)가 있는 줄 (X11). hunk 전체로 잡으면 새 파일은 파일 전체가 된다
+  const out: MemoGroup[] = groups.map(({ members, hunkLines, ...g }) => {
+    const lines = toRanges(originLines(prov.get(g.file)!, (o) => members.has(o.seq)));
+    return { ...g, lines: lines.length ? lines : hunkLines };
+  });
+  return { hunks, unexplained, ratio: hunks.length ? (hunks.length - unexplained.length) / hunks.length : 1, groups: out, drift };
+}
+
+/** 조건에 맞는 출처의 문자가 있는 현재 줄 번호(1부터, 오름차순). 지운 자리는 그 자리의 줄 */
+export function originLines(p: ProvenanceResult, pred: (o: Origin) => boolean): number[] {
+  const lines = new Set<number>();
+  const text = p.text ?? "";
+  const lineAt = (off: number) => text.slice(0, off).split("\n").length;
+  let pos = 0;
+  for (const seg of p.segs) {
+    if (seg.origin && pred(seg.origin)) {
+      if (!seg.text.length) lines.add(lineAt(pos));
+      else for (let l = lineAt(pos), b = lineAt(pos + seg.text.length - (seg.text.endsWith("\n") ? 1 : 0)); l <= b; l++) lines.add(l);
+    }
+    pos += seg.text.length;
+  }
+  return [...lines].sort((a, b) => a - b);
+}
+
+function toRanges(nums: number[]): [number, number][] {
+  const out: [number, number][] = [];
+  for (const n of nums) {
+    const last = out.at(-1);
+    if (last && n === last[1] + 1) last[1] = n;
+    else out.push([n, n]);
+  }
+  return out;
 }
 
 /** Step n의 에이전트 편집이 만든 현재 줄 범위 (impl-log changes 자동 생성, §7.3 3). 예: "src/a.ts:3-9" */
@@ -300,29 +334,13 @@ export function stepChanges(files: FileCoverageInput[], step: number): string[] 
   const out: string[] = [];
   for (const f of files) {
     const p = provenance(f.base, f.records);
-    const isStep = (o: Origin | null) => !!o && (o.source.kind === "agent" || o.source.kind === "agent_shell") && o.source.step === step;
-    const lines = new Set<number>();
-    let pos = 0;
-    const text = p.text ?? "";
-    const lineAt = (off: number) => text.slice(0, off).split("\n").length;
-    for (const seg of p.segs) {
-      if (isStep(seg.origin)) {
-        if (!seg.text.length) {
-          lines.add(lineAt(pos)); // 지운 자리의 줄
-        } else {
-          const a = lineAt(pos);
-          const b = lineAt(pos + seg.text.length - (seg.text.endsWith("\n") ? 1 : 0));
-          for (let l = a; l <= b; l++) lines.add(l);
-        }
-      }
-      pos += seg.text.length;
-    }
-    if (p.text === null && p.segs.some((s) => isStep(s.origin))) {
+    const isStep = (o: Origin) => (o.source.kind === "agent" || o.source.kind === "agent_shell") && o.source.step === step;
+    if (p.text === null && p.segs.some((s) => s.origin && isStep(s.origin))) {
       out.push(`${f.file}: 삭제`);
       continue;
     }
-    if (!lines.size) continue;
-    out.push(`${f.file}:${ranges([...lines].sort((a, b) => a - b))}`);
+    const lines = originLines(p, isStep);
+    if (lines.length) out.push(`${f.file}:${ranges(lines)}`);
   }
   return out;
 }

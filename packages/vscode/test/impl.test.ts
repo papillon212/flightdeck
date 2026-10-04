@@ -151,8 +151,8 @@ describe("구현·기록 (M4 완료 기준)", { timeout: 60_000 }, () => {
     for (const g of groups) await A.addMemo(EPIC, g, g.kind === "human" ? "주석 추가" : "README 문구");
     await step("주석", pidRotate);
     const md = parseImplLog(await readFile(await epicFile("impl-log.md"), "utf8"));
-    // 사람 수정이 Step 2 편집과 같은 hunk라 그 hunk 전체(1-4줄)가 묶음의 범위다
-    expect(md.memos.map((m) => [m.file, m.lines, m.memo])).toEqual([["README.md", "2", "README 문구"], ["src/token.js", "1-4", "주석 추가"]]);
+    // 사람 수정은 Step 2 편집과 같은 hunk(1-4줄)지만, 묶음의 범위는 사람이 넣은 줄만이다 (X11)
+    expect(md.memos.map((m) => [m.file, m.lines, m.memo])).toEqual([["README.md", "2", "README 문구"], ["src/token.js", "1", "주석 추가"]]);
     const out: string[] = [];
     const r = await A.submitImplementation(EPIC, { onOutput: (s) => out.push(s) });
     expect(r).toMatchObject({ ok: false, problems: [expect.stringContaining("명령 실패 (종료 코드 1): node check.js — FAIL: BUG")] });

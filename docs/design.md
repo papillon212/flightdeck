@@ -1,4 +1,4 @@
-# Flightdeck — 설계 문서 v0.13
+# Flightdeck — 설계 문서 v0.14
 
 > 코딩 에이전트 시대의 원격 페어 프로그래밍 워크플로우 도구
 > 작성일: 2026-10-01 · 상태: 초안(Draft)
@@ -67,6 +67,12 @@
 >   - 리뷰어 직접 수정(`review.edited`)을 없애고 **조종수에게 수정 제안**으로 통일했다(§3.4, §4.2, §9.3).
 >   - 리뷰어 본인이 연 쓰레드가 열려 있으면 그 리뷰어의 승인은 거부한다(§4.2).
 >   - 리뷰어 창에도 에이전트 설정을 넣는다(리뷰 정책). 에이전트가 문서에 **쓰레드 초안 블록**을 쓰면, 사람이 확인해 올린다(§3.2, §3.6, §6.2).
+> - **v0.14** (M4 구현·완료 확인 반영, 근거: [m4-plan.md](m4-plan.md) X1~X12)
+>   - impl-log는 **`flightdeck_log_step`으로만** 쓴다. 체크포인트를 먼저 만들고 Step을 기록한다. 편집이 속하는 Step = 마지막 기록 Step + 1(§6.2, §7.1, §7.3).
+>   - coverage는 로컬 편집 기록으로 계산하고, 외부 변경은 체크포인트·제출 때 잡는다. 서버의 재계산은 편집 기록 서버(M7) 이후. 메모 범위는 고친 줄로 좁힌다(§7.3, §7.4).
+>   - 테스트 결과 보고(`gate.reported`)를 M4로 당겼다. `phase.completed(IMPLEMENTATION)`에 검사한 커밋을 적고, 같은 커밋의 통과 보고가 있어야 한다(§3.1, §4.1, §7.5).
+>   - 복원도 편집 기록에 남기고 출처를 되살린다. 복원은 제품 코드만 되돌린다(§8.1, §8.6).
+>   - 훅은 ref를 백그라운드로 올리고, 세션 원본은 턴마다 저장한다. 비밀값은 이름이 비밀 같은 환경변수·토큰 패턴·`.env` 값만 가린다(§6.4, §8.1). 실패한 도구 호출 훅(`PostToolUseFailure`)도 등록한다(§6.1).
 
 ---
 
@@ -332,7 +338,7 @@ flightdeck-server DB
 | `thread.resolved` / `thread.reopened` | thread | |
 | `thread.moved` | thread, anchor | |
 | `patch.applied` | thread, commit | |
-| `phase.completed` | phase, artifact_hash (담당자의 "분석 완료" 등) | ✅ |
+| `phase.completed` | phase, artifact_hash, commit?(IMPLEMENTATION: 검사한 에픽 브랜치 커밋. 같은 커밋의 통과 `gate.reported`가 있어야 한다) (담당자의 "분석 완료", "구현 완료") | ✅ |
 | `review.requested` | phase, artifact_hash, commit (담당자의 리뷰 요청, §4.2) | ✅ |
 | `review.approved` | phase, tier, artifact_hash (§4.2) | ✅ |
 | `phase.reverted` | from, to, reason | |
@@ -487,7 +493,7 @@ INTAKE → ANALYSIS → DESIGN → IMPLEMENTATION → VERIFICATION → LANDING �
 | INTAKE | — | `epic.md`, worktree | 자동 |
 | ANALYSIS | `agent_drafting` → `questioning` → `owner_review` | `analysis.md`, handoff | 쓰레드 전부 resolved + `phase.completed` |
 | DESIGN | `agent_drafting` → `owner_review` → (`review.requested`) → `tier[k]_review` … | `design.md`, handoff | 리뷰어가 있는 모든 티어의 `review.approved` + 열린 쓰레드 0. 마지막 승인으로 자동 전환 |
-| IMPLEMENTATION | `agent_working` → `log_finalizing` → `gate_check` | 코드, impl-log, trace, handoff | 스키마 + coverage 100% + 명령 통과 |
+| IMPLEMENTATION | `agent_working` → `log_finalizing` → `gate_check` | 코드, impl-log, trace, handoff | 스키마 + coverage 100% + 명령 통과. 담당자의 "구현 완료" → 확장이 관문 검사·커밋·명령 실행 → `gate.reported` → `phase.completed(commit)` (§7.5) |
 | VERIFICATION | `owner_review` → `tier[1..n]_review` | 코드 쓰레드 | 각 티어 `review.approved` + 열린 change_request 0 |
 | LANDING | `requested` → `server_verifying` → `pushing` | main 커밋 | 서버의 `epic.landed` (§11) |
 | DONE | — | — | — |
@@ -639,9 +645,9 @@ retention:
 | 단계 룰·에픽 맥락 주입 | **SessionStart 훅** 추가 컨텍스트 | 현재 단계 룰(`rules/common.md`, `rules/<phase>.md`), 일감 요약, 열린 쓰레드 요약, 직전 handoff |
 | 단계 전환 반영 | **UserPromptSubmit 훅** 추가 컨텍스트 | 세션 중에 단계가 바뀌면 다음 프롬프트에 새 단계 룰을 붙인다. 세션을 다시 열 필요 없음 |
 | 단계별 권한 강제 | **PreToolUse 훅** | 현재 단계를 동적으로 읽어 허용·거부(§6.2). 설정을 단계마다 다시 만들 필요 없음 |
-| 편집 기록·trace·앵커·체크포인트 | **PostToolUse 훅** | §7.2, §8.6 |
+| 편집 기록·trace·앵커·체크포인트 | **PostToolUse 훅** + **PostToolUseFailure 훅** | §7.2, §8.6. 실패한 도구 호출(예: 종료 코드가 0이 아닌 Bash)은 PostToolUse 대신 PostToolUseFailure가 온다. 등록하지 않으면 실패한 셸 명령이 바꾼 파일이 기록되지 않는다(M4) |
 | 관찰자 의견 전달 | **PostToolUse / UserPromptSubmit 훅** 추가 컨텍스트 | §8.4 |
-| 실행 종료 | **Stop 훅** | handoff 작성 요청, 체크포인트, `run.finished` |
+| 턴·실행 종료 | **Stop·SessionEnd 훅** | 체크포인트, 세션 원본 저장(§6.4), ref 백그라운드 push(§8.1). 세션 종료 시 `run.finished` |
 | Flightdeck 도구 | **MCP 서버** | 아래 표 |
 
 #### 설정 배치
@@ -727,8 +733,8 @@ retention:
 | `flightdeck_get_handoffs` | 이전 실행들의 인수인계 기록 |
 | `flightdeck_search_run` | **세션 원본 검색**: 관련 구간만 반환 (§6.4) |
 | `flightdeck_reply_thread` | 에이전트 답글 (수정 요청 반영 시에만) |
-| `flightdeck_log_step` | impl-log Step 추가 (+ 체크포인트 생성) |
-| `flightdeck_submit` | 산출물 제출 → 로컬 게이트 검사 |
+| `flightdeck_log_step` | impl-log Step 추가·고쳐 쓰기. impl-log를 쓰는 **유일한 경로**다(§7.1) |
+| `flightdeck_submit` | 구현 관문 검사(impl-log 형식, 설명 없는 변경). 제출 자체는 사람이 확장에서 한다 |
 
 - Claude Code는 MCP 도구를 지연 로딩해, 처음에는 도구 검색(`ToolSearch`)으로 찾는다(M0 확인). 도구 설명에 에이전트가 검색할 단어(쓰레드, 인수인계, 단계, 구현 기록, 제출 등)를 넣는다. 단계 룰(SessionStart 컨텍스트)에도 쓸 도구 이름을 적는다.
 
@@ -738,7 +744,7 @@ retention:
 |---|---|---|
 | ANALYSIS | `analysis.md`, `runs/<run-id>/handoff.md` | 읽기 전용 허용 목록 |
 | DESIGN | `design.md`, `runs/<run-id>/handoff.md` | 읽기 전용 허용 목록 |
-| IMPLEMENTATION | `.flightdeck/` 제외 전체 + `impl-log.md`, handoff | 허용 (**모든 git 명령 차단**, `rm -rf` 등 차단) |
+| IMPLEMENTATION | `.flightdeck/` 제외 전체 + 이번 실행의 handoff. impl-log는 `flightdeck_log_step`으로만, trace는 훅이 쓴다 | 허용 (**모든 git 명령 차단**, `rm -rf` 등 차단) |
 | VERIFICATION | 없음 | 테스트 실행만 |
 | 읽기 전용 창 (질문 대상·리뷰어, 단계 무관) | 산출물 문서의 **쓰레드 초안 블록**만 (§3.2). 그 밖의 변경은 확장이 되돌린다 | 읽기 전용 허용 목록 |
 
@@ -764,7 +770,7 @@ retention:
 |---|---|---|---|
 | 1. 결과물 | analysis/design.md, impl-log, 쓰레드 | 작음 | 항상 |
 | 2. 인수인계 기록 `runs/<run-id>/handoff.md` | 실행 마지막에 에이전트가 작성 (형식 강제) | 수 KB | 항상 |
-| 3. 세션 원본 | Claude Code 세션 JSONL. 비밀값 제거 후 압축, `refs/flightdeck/runs/<epic-id>`에 저장 | 큼 | `flightdeck_search_run`으로 **관련 구간만** |
+| 3. 세션 원본 | Claude Code 세션 JSONL. 비밀값 제거 후 압축, `refs/flightdeck/runs/<epic-id>`의 `<run-id>/<session-id>.jsonl.gz`에 저장. **턴이 끝날 때마다(Stop)와 세션 종료 때** 그 세션 파일을 새로 쓴다(긴 세션 중에도 검색할 수 있게). 구현 관문 명령의 전체 로그도 `gate/<commit>/<n>.log.gz`로 둔다 | 큼 | `flightdeck_search_run`으로 **관련 구간만**. 리뷰어·질문 대상은 원격 ref를 받아 검색한다 |
 
 handoff.md 형식(강제):
 
@@ -790,7 +796,9 @@ handoff.md 형식(강제):
   - 차단 목록이 아니라 허용 목록이므로, 에이전트 업데이트로 새 기록 종류가 생겨도 기본적으로 걸러진다. 허용 목록은 어댑터가 정한다(`transcript()`, §6.5).
   - 부수 효과로 크기도 크게 준다(작은 세션 260KB 중 약 90%가 버리는 부분).
 - 비밀값 제거
-  - 환경변수 값, 토큰 패턴(정규식), `.env` 내용을 저장 전에 가린다.
+  - 저장 전에 가린다(`[REDACTED]`): 이름이 비밀처럼 보이는 환경변수(`TOKEN`·`SECRET`·`KEY`·`PASSWORD`·`CREDENTIAL`·`AUTH` 포함)의 값, 토큰 패턴(`sk-…`, `ghp_…`, `github_pat_…`, ClickUp `pk_…`, Slack `xox?-…`, AWS `AKIA…`, JWT, PEM 개인키), 작업 폴더 `.env*` 파일의 값.
+  - 환경변수 값을 모두 가리지는 않는다. `HOME`·`PATH` 같은 경로까지 가리면 원본이 읽히지 않는다(M4 X6).
+  - M4 실측: 실제 세션 40항목이 허용한 종류(사람 프롬프트, 에이전트 메시지·도구 호출, 도구 결과, Flightdeck 주입 맥락)만 남았고 이메일·`CLAUDE.md`·메모리 내용은 없었다.
   - 세션 시작 시 "이 실행은 기록됩니다"를 표시한다.
 - **개인 에이전트 질문(§3.6)은 이 기록 대상이 아니다.**
 
@@ -860,6 +868,13 @@ interface AgentAdapter {
 
 ### 7.1 impl-log.md (강제)
 
+- impl-log는 **`flightdeck_log_step`으로만** 쓴다. 에이전트는 Step의 제목·`design_ref`·의도·결정·검토한 대안·리뷰 포인트·검증을 넘기고, Flightdeck이 렌더링한다(편집 출처 `flightdeck/impl_log`). 에이전트의 직접 쓰기는 훅이 거부한다. 자동 기입 필드(`ckpt`, `changes`)를 에이전트가 지우거나 틀리게 쓰지 않게 하기 위해서다.
+- 순서: 그 Step까지의 코드를 체크포인트로 남김 → Step 작성(`ckpt` = 그 체크포인트). impl-log 자체는 다음 체크포인트에 들어간다.
+- 고칠 때는 `step: n`을 주어 같은 Step을 다시 쓴다. 에이전트가 제목에 붙인 "Step n:"은 떼어 낸다.
+- **Step 하나를 구현 → 확인 → 기록한 뒤 다음 Step으로 간다.** 여러 Step 분량을 한 번에 쓰고 몰아서 기록하면 뒤 Step의 `changes`가 빈다(M4 실측). 단계 룰에 적고, `changes`가 빈 Step은 기록 응답으로 알려 준다. 문서·확인만 하는 Step도 있으므로 형식 오류로 막지는 않는다.
+- 형식 검사(`impl_log_schema`): Step 번호가 1부터 빠짐없이, `ckpt`가 커밋, `design_ref`가 design.md에 있는 문단 ID, 글 항목이 모두 채워짐.
+- 끝에 **`## 직접 수정 메모`** 섹션을 Flightdeck이 그린다(§7.4).
+
 ````markdown
 ## Step 3: 리프레시 토큰 회전
 
@@ -904,8 +919,15 @@ verification: "pnpm test auth  # ✅ 12 passed"
    - Step 설명이 비어 있는 편집
    - **메모가 없는 직접 수정**: 출처가 `human` 또는 `external`인 편집(§7.4)
 5. 설명 없는 변경이 1개라도 있으면 게이트가 실패한다. `coverage_ignore`는 제외한다.
-6. 같은 계산을 **반영 서버가 서버의 편집 기록으로 다시 한다**(§11.3).
+6. 같은 계산을 **반영 서버가 서버의 편집 기록으로 다시 한다**(§11.3). 서버 편집 기록은 M7이므로, 그 전까지 서버는 impl-log 형식과 테스트 보고만 확인하고 coverage는 확장이 계산한 것에 맡긴다.
 7. **보조 수단**: 편집 기록이 없는 구간(서버 장애 중 재전송 실패 등)은 체크포인트 체인 diff(`ckpt(Step n-1) → ckpt(Step n)`)로 추적한다. 해당 hunk는 "기록 누락"으로 표시해 리뷰어에게 보여준다.
+
+**계산 방법 (M4)**
+- 대상: 최종 diff(`base → 작업 트리`)에서 `.flightdeck/`(Flightdeck 기록), `coverage_ignore`, 비밀 파일을 뺀 파일.
+- 파일마다 base 내용에서 편집 기록을 순서대로 재적용하며 **문자마다 출처**를 붙인다. 지운 자리에는 길이 0인 삭제 표시를 남긴다. 같은 출처가 넣고 지운 것은 흔적을 남기지 않는다.
+- 재적용 결과 ≠ 디스크면, 그 차이를 `external:unknown`으로 먼저 기록한다(체크포인트·제출 때, §7.4). 저장하지 않은 에디터 편집이 있으면 이 확인을 미룬다(사람 편집은 저장 전에도 기록되므로, 그대로 비교하면 사람 편집을 외부 변경으로 잘못 기록한다).
+- hunk 안의 출처가 모두 설명되면 통과다. 출처가 하나도 없는 hunk는 기록 누락이라 설명 없음이다.
+- **편집이 속하는 Step** = 그 편집 시점의 "마지막 기록 Step + 1"(에픽 단위 번호). Step은 끝날 때 기록하므로, 마지막 `log_step` 뒤의 에이전트 편집은 기록되지 않은 Step에 속해 설명 없는 변경이 된다.
 
 ### 7.4 직접 수정 메모 (필수)
 
@@ -917,7 +939,8 @@ verification: "pnpm test auth  # ✅ 12 passed"
 | 외부 도구 변경 | `external:unknown` | 아래 "외부 변경 감지" 참고. 직접 수정과 같은 방식으로 메모를 받는다 |
 | 수정 제안 반영 | `patch:<thread>/<member>` | 연결된 쓰레드가 설명이므로 메모가 필요 없다 |
 
-- 메모는 수정 묶음 단위로 편집 기록에 붙는다(`edit_group.memo`). 리뷰어는 구현 기록의 해당 Step 옆에서 "직접 수정 n건 + 메모"를 본다.
+- 수정 묶음 = 같은 파일·같은 출처(사람·외부)의 연속된 설명 없는 편집(2분 이내). 묶음의 줄 범위는 hunk 전체가 아니라 **그 편집들의 문자가 있는 줄**이다(새 파일은 파일 전체가 hunk 하나라, hunk로 잡으면 한 줄 수정이 파일 전체로 보인다, M4 실측).
+- 메모는 `{file, seqs:[처음, 끝], memo}`로 로컬에 저장하고(M7에서 서버로), **impl-log.md의 `## 직접 수정 메모`**에도 Flightdeck이 그린다(파일·줄 범위·작성자·메모). 리뷰어는 에픽 브랜치에서 본다.
 - 메모 형식: 한 줄 이상. 선택적으로 관련 쓰레드나 설계 문단(`design.md#p:xxxx`)을 연결할 수 있다.
 
 **외부 변경 감지**
@@ -944,6 +967,8 @@ verification: "pnpm test auth  # ✅ 12 passed"
 - 실행 결과는 확장이 서버에 보고하고, 서버가 보고자(로그인한 멤버)를 적어 서명한 `gate.reported` 이벤트로 남긴다.
   - 내용: 대상 커밋, 명령별 종료 코드, 요약, 로그 해시
   - 전체 로그는 `refs/flightdeck/runs/<epic-id>`에 보관한다.
+- **구현 완료** 순서: 저장 → 외부 변경 기록 → coverage·impl-log 검사(실패하면 커밋하지 않음) → 에픽 브랜치에 커밋(비밀 파일 제외)·공유 → 명령 실행 → `gate.reported` → `phase.completed {phase: IMPLEMENTATION, commit}`. 서버는 그 커밋이 원격 에픽 브랜치 끝이고, impl-log 형식이 맞고, 그 커밋의 서명된 보고가 모두 종료 코드 0일 때 서명한다(`artifact_hash` = 그 커밋의 tree). reducer도 같은 커밋의 통과 보고를 요구한다.
+- `gate.reported`는 담당자가 낸다. 서버는 보고한 커밋이 원격 에픽 브랜치에 있는지 본다.
 - 서버는 다음만 확인한다. 테스트를 다시 돌리지는 않는다.
   - 보고가 **반영 대상 커밋**에 대한 것인가
   - 서명이 유효한가
@@ -962,8 +987,11 @@ verification: "pnpm test auth  # ✅ 12 passed"
   - 에이전트: `flightdeck_log_step`마다, 그리고 편집 후 30초 유휴 시
   - 사람: 저장 시(디바운스 10초)
 - 커밋 메시지 trailer: `Flightdeck-Run`, `Flightdeck-Step`, `Flightdeck-Source(agent|human)`
-- 생성 직후 push한다(`refs/flightdeck/ckpt/<epic-id>/<member>`).
+- 생성 직후 push한다(`refs/flightdeck/ckpt/<epic-id>/<member>`). 훅 안에서는 기다리지 않고 **분리된 백그라운드 `git push`**를 띄운다(GitHub 왕복 약 4초 동안 에이전트가 멈추지 않게, M4). 실패하면 다음 push가 다시 올린다.
+- 생성 시점의 구현: Step 끝은 `flightdeck_log_step`, 턴 종료는 Stop 훅, 에이전트 유휴·사람 저장은 확장의 타이머.
 - **되돌리기**: Phase Panel의 타임라인에서 아무 체크포인트나 골라 "이 시점으로 복원"을 할 수 있다. 복원 직전 상태도 체크포인트로 남겨서 복원을 취소할 수 있다.
+  - 복원은 **제품 코드만** 되돌린다. `.flightdeck/` 아래 기록(impl-log·trace·handoff)은 그대로 둔다. Step 체크포인트는 그 Step 기록보다 먼저 만들어지므로, 함께 되돌리면 그 Step 기록이 사라진다(M4).
+  - 복원도 편집 기록에 남긴다(출처 `restore`, 파일 전체 교체, 그 체크포인트의 `Flightdeck-Seq`). coverage는 복원된 파일의 출처를 그 seq 시점의 출처로 되살린다. 내용이 맞지 않으면(기록 누락) 그 줄은 메모가 필요하다. 기록하지 않으면 복원이 외부 변경(메모 필수)으로 잡힌다.
 - **비교**: 두 체크포인트 사이 diff를 보여준다.
 
 - 체크포인트에는 그 시점의 편집 기록 순번(`Flightdeck-Seq`)을 trailer로 남긴다. git 스냅샷과 편집 기록이 서로를 가리킨다.
@@ -1071,6 +1099,7 @@ XP 페어 프로그래밍에서는 드라이버가 작성하고 내비게이터�
 | 에이전트 셸 결과 (포맷터·코드 생성 등) | 셸 도구의 `tool.before`·`tool.after`에서 임시 index로 작업 트리 tree를 만들고(`add -A` + `write-tree`, §8.1과 같은 바이트 그대로 옵션), 두 tree의 diff를 편집으로 변환 | `agent_shell:<run>/<step>/<cmd>` |
 | 수정 제안 반영 | 패치 적용 | `patch:<thread>/<member>` |
 | Flightdeck 렌더링 (문단 ID 부여·복원, 쓰레드 블록) | 확장이 문서를 다시 그릴 때 전후 diff를 편집으로 변환. 기록하지 않으면 편집 기록 재적용 결과가 디스크와 어긋난다(M1: 실제 초안 뒤 어긋남 확인) | `flightdeck:<member>/<paragraph_ids \| thread_render>`. coverage(§7.3)에서 설명이 필요 없는 출처 |
+| 체크포인트 복원 | 바뀐 파일마다 파일 전체 교체 (§8.1) | `restore:<member>/<ckpt>/<seq>` |
 | 외부 반영 (main rebase 등) | diff를 편집으로 변환 | `external:<commit>` |
 | 외부 도구 변경 (Flightdeck 밖 에이전트·에디터·터미널) | 파일 감시. 위 경로에 해당하지 않는 디스크 변경 | `external:unknown` (메모 필수, §7.4) |
 
@@ -1358,8 +1387,8 @@ flightdeck/
 | **M1 로컬 단일 사용자** | core reducer·렌더러, **문단 ID + 편집 추적**, GitEngine 기초, **AgentAdapter 인터페이스 + claude-code 어댑터**, ANALYSIS 에이전트, handoff | 혼자 분석 → 설계 초안 |
 | **M2 원격 협업** | 서버 서명 이벤트, 메타 브랜치 EventStore, 알림, ClickUp 일감 수신, **서버 어드민(멤버·설정) + 설정 배포**, Google 로그인<br>**결과(2026-10-04, 완료)**: 실제 VS Code 두 창(멤버 둘, 한 PC) + GitHub + 서버 + ClickUp으로 분석 Q&A 전 단계 통과 ([m2-plan.md](m2-plan.md)). Google 로그인(OAuth 클라이언트 없음, 개발용 로그인으로 진행)과 실제 여러 사람의 사용은 완성 뒤 확인한다 | 2인이 원격으로 분석 Q&A |
 | **M3 설계 티어** | 리뷰 요청·티어 승인(서버 서명), reapproval, 리뷰어 없는 티어 건너뛰기, 수정 요청 쓰레드, 리뷰어 창의 에이전트(리뷰 정책, 쓰레드 초안 블록)<br>**결과(2026-10-04, 완료)**: 실제 VS Code 세 창(담당자·lead·architect)에서 리뷰어의 에이전트(실제 claude)가 쓴 수정 요청 초안 → 올리기 → 담당자 수정·재요청 → 1티어부터 재승인 → 2티어 승인으로 IMPLEMENTATION ([m3-plan.md](m3-plan.md)) | 설계가 2티어 통과 |
-| **M4 구현·기록** | 구현 에이전트, **체크포인트**, impl-log·trace, Step별 coverage, **세션 원본 저장·검색** | 설명 없는 hunk 차단 확인 |
-| **M5 검증·반영** | 코드 쓰레드, **리뷰 사본 + 수정 제안**, 테스트 결과 보고, **반영 서버 검증·rebase·main push**, main 보호 설정, 감사 | 실제 에픽 1개가 서버를 통해 main까지 |
+| **M4 구현·기록** | 구현 에이전트, **체크포인트**, impl-log·trace, Step별 coverage, **세션 원본 저장·검색**, 테스트 결과 보고(M5에서 당김)<br>**결과(2026-10-05, 완료)**: 실제 VS Code 두 창에서 에이전트(실제 claude)가 2 Step 구현·기록 → 사람 직접 수정·외부 변경으로 제출 차단 → 메모 → 서명된 테스트 보고·구현 완료로 VERIFICATION → 다른 멤버의 에이전트가 세션 원본을 검색해 결정 근거를 찾음 ([m4-plan.md](m4-plan.md)) | 설명 없는 hunk 차단 확인 |
+| **M5 검증·반영** | 코드 쓰레드, **리뷰 사본 + 수정 제안**, **반영 서버 검증·rebase·main push**, main 보호 설정, 감사 | 실제 에픽 1개가 서버를 통해 main까지 |
 | **M6 회의** | Meet 연동, 포커스 이벤트, 회의록 앵커링. Flightdeck OAuth 앱으로 만든 회의 공간의 회의록 자동 켜기·`meetings.space.created` 범위 확인(M0에서 넘어옴) | 회의 요약이 올바른 쓰레드에 게시 |
 | **M7 편집 기록** | 서버 ③, 편집 경로 4종 수집, 줄 단위 출처 조회, 앵커·coverage를 편집 기록 기반으로 전환, impl-log `changes` 자동 생성 | 모든 hunk의 출처가 조회되고, 쓰레드가 대규모 수정 후에도 위치 유지 |
 | **M8 조종수 모델** | 서버 ④, 대화·편집 실시간 스트림, 관찰자 읽기 전용 창, 의견 보내기·처리, 조종 요청·넘기기·강제 인수 | 관찰자가 1초 안에 조종수 작업을 보고, 의견이 에이전트까지 전달됨 |

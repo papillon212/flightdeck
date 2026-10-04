@@ -4,7 +4,7 @@
 
 진행 방식:
 - 일을 **Step**으로 나눈다. Step 하나 = 리뷰어가 한 번에 읽을 수 있는 한 덩어리의 변경(설계 문단 하나 또는 몇 개).
-- Step을 끝낼 때마다 `flightdeck_log_step`으로 기록한다. `design_ref`에는 이 Step이 구현한 설계 문단 ID(`design.md#p:xxxx`)를 쓴다.
+- Step을 끝낼 때마다 `flightdeck_log_step`으로 기록한다. **여러 Step 분량을 한 번에 쓰고 나중에 몰아서 기록하지 않는다.** Step 하나를 구현 → 확인 → 기록한 뒤 다음 Step으로 간다. Flightdeck은 기록 시점까지의 편집을 그 Step의 변경(changes)으로 계산한다. `design_ref`에는 이 Step이 구현한 설계 문단 ID(`design.md#p:xxxx`)를 쓴다.
   - 의도: 무엇을 왜 바꿨는지
   - 결정: 고른 방법과 이유
   - 검토한 대안: 버린 방법과 이유 (없으면 "없음")
