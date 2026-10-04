@@ -89,6 +89,20 @@
 
 | M2-3 | (이번 커밋) | `packages/server`: 저장소(메모리·PostgreSQL), 개발용 로그인(루프백만, 루프백이 아닌 주소에서 켜면 시작 거부), Google 로그인(코드만, OAuth 클라이언트 없어 미확인), `GET /me`·`/config`(서명)·`POST /events`, 어드민 화면(멤버, 파이프라인·룰 편집 = 새 설정 버전, 변경 이력). 설정 검증 `verifyConfig`는 확장도 쓰도록 core에 둠. 테스트 9개(PostgreSQL은 `FD_TEST_PG`일 때) |
 
+| M2-5 | (이번 커밋) | `packages/tracker`: TrackerAdapter + ClickUp(me, 배정된 일감, 일감 조회, 단계 상태, 멘션 댓글) + reconcile. 기록한 응답 모양으로 테스트 4개, 실제 ClickUp 1회(`spikes/13-clickup`) |
+
+### M2-5 ClickUp 확인 (2026-10-04, 시험 리스트)
+
+| 항목 | 결과 |
+|---|---|
+| 목록 `GET /list/{id}/task?tags[]=flightdeck&assignees[]=<나>` | 됨. `include_markdown_description=true`면 본문이 마크다운(목록 기호는 `*   `로 바뀜) |
+| 상태 `PUT /task/{id} {status:"분석"}` | 됨. 사용자 정의 상태 이름 그대로 |
+| reconcile | 같으면 호출 안 함, 다르면 한 번 바꿈 (ANALYSIS→`분석`, DESIGN→`설계`) |
+| 멘션 댓글 `{type:"tag",user:{id}}` | `comment_text`에 `@doohwan lee`로 들어감. 읽기 API는 멘션 항목의 사용자 ID를 돌려주지 않는다. 워크스페이스 멤버가 1명이라 **실제 알림 도착은 확인하지 못함**(자기 멘션은 알림이 없다) |
+| 에픽 ID | `CU-<task id>` (예: `CU-z8r3fdn5a0`). `tracker_ref`는 task id |
+
+스파이크 일감은 확인 후 지웠다.
+
 ### M2-3에서 정한 처리
 
 - **서버 서명 요청 처리** (`POST /events`): 제품 레포의 서버 쪽 사본(bare)에서 메타 브랜치를 sync하고 reducer로 다시 계산한다. 서명한 후보 이벤트를 넣은 결과에서 무시되면(권한·차례·관문) 409로 이유를 돌려준다. 제품별로 하나씩 처리한다(동시 시작 3건 → 1건만 성공).
