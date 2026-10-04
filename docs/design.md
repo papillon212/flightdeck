@@ -1,4 +1,4 @@
-# Flightdeck — 설계 문서 v0.11
+# Flightdeck — 설계 문서 v0.12
 
 > 코딩 에이전트 시대의 원격 페어 프로그래밍 워크플로우 도구
 > 작성일: 2026-10-01 · 상태: 초안(Draft)
@@ -51,6 +51,13 @@
 >   - 체크포인트: 복원과 비밀 파일 패턴, racy git 대응(임시 index 수정 시각 보존)(§8.1).
 >   - resume은 같은 실행을 잇고 `run.finished`는 여러 번 올 수 있다(§6.1).
 >   - (2026-10-02, M0 11 반영) **급한 의견**: PreToolUse 거부로 같은 턴 안에서 전달, 같은 메시지는 1초 시간 간격으로 판정(§8.4). **훅 실패 시 기본 동작**을 경로별로 정함: 차단은 fail-closed, 기록은 fail-open(§6.1). 도구 실행·transcript 기록 시점을 §6.1에 기록.
+> - **v0.12** (M2 계획 검토 반영, 근거: [m2-plan.md](m2-plan.md) U1~U7)
+>   - **서명은 단계 통과에만.** 파이프라인에 정의된 단계 통과 이벤트(에픽 시작, 단계 완료, 티어 승인, 테스트 보고, 반영 결과)는 확장이 서버에 요청하고 **서버가 검증한 뒤 서버 키로 서명**해 기록한다. 쓰레드·답글 등 일반 이벤트는 서명하지 않는다. 멤버 개인 키를 없앴다(§3.1, §4.2, §12).
+>   - **설정 레포를 없앴다.** 파이프라인·룰·멤버는 서버 DB에 두고 **서버 어드민 화면**에서 관리한다. 모든 사용자는 서버에 등록된 사람이고, **Google 계정으로 로그인**한다(§2.5, §11.2, §12).
+>   - 질문 대상이 문서를 볼 수 있게 쓰레드를 만들 때 산출물을 에픽 브랜치에 커밋해 push한다(§3.1, §2.4).
+>   - 메타 브랜치도 force push·삭제를 막고, 확장은 이력 재작성을 감지한다(§2.1).
+>   - 일감 멘션은 새 질문과 리뷰 차례에만 남긴다(§3.7).
+>   - **내장 git 서버를 기본**으로 하고, 외부 git 미러·외부 git 단독 방식도 지원한다. 내장 방식은 ref 규칙을 서버가 강제한다(D21, §1.5, M5.5).
 
 ---
 
@@ -69,15 +76,16 @@
 | D9 | 에이전트 실행 | 1차 대상은 각자 **개인 Claude 구독으로 로그인한 Claude Code** (다른 에이전트는 D20). 조종수는 **대화형 Claude Code를 직접** 쓰고, headless(`claude -p`)는 자동 초안에만 사용 (§6.1) |
 | D10 | 일감 관리 도구 | **TrackerAdapter**로 추상화. 1차 ClickUp. 모든 호출은 행위자 본인의 개인 토큰으로 |
 | D11 | 머지 후 정리 | 메타 이벤트·체크포인트·세션 원본은 정리. main에는 사람이 읽는 기록만 남김 |
-| D12 | git의 역할 | **저장소로만 사용**. 사용자는 git을 직접 다루지 않으며, 모든 git 명령은 확장이 실행. git 호스트는 push/fetch 대상일 뿐(GitHub·GitLab·Gitea·SSH 무관) |
-| D13 | 승인·반영 | **PR 없음**. 승인은 메타 브랜치의 **서명된 이벤트**. 마지막 검증 티어가 승인하면 **반영 서버가 검증 후 main에 push**. main push 권한은 서버 봇 계정만 가짐 |
+| D12 | git의 역할 | **저장소로만 사용**. 사용자는 git을 직접 다루지 않으며, 모든 git 명령은 확장이 실행. git 호스트는 push/fetch 대상일 뿐(내장 git 서버·GitHub·GitLab·Gitea 무관, D21) |
+| D13 | 승인·반영 | **PR 없음**. 승인은 확장에서 누르고, 서버가 파이프라인 기준으로 검증해 **서버 키로 서명한 이벤트**를 메타 브랜치에 남긴다. 마지막 검증 티어가 승인하면 **반영 서버가 검증 후 main에 push**. main push 권한은 서버 봇 계정만 가짐 |
 | D14 | 실행 맥락 공유 | 세션 원본을 통째로 넘기지 않음. **결과물 + 인수인계 기록**을 기본으로 하고, 원본은 **필요할 때 검색해 일부만** 사용 (토큰 절감) |
-| D15 | 설정 관리 | pipeline.yaml·rules·멤버 공개키는 관리자만 push할 수 있는 **설정 레포**에 둔다. 서버가 읽어 서명해 배포한다. 에픽은 시작할 때 설정 버전을 고정 |
-| D16 | 테스트 검증 | **A안**: 서버는 서명·티어·해시·diff 대조·형식만 다시 검증하고, lint/test는 실행자의 **서명된 결과 보고**를 신뢰. 서버 재실행(B안)은 이후 추가 |
+| D15 | 설정 관리 | pipeline.yaml·rules·멤버는 **서버 DB**에 두고 **서버 어드민 화면**에서 관리한다. 모든 사용자는 서버에 등록돼 있고 Google 계정으로 로그인한다. 서버가 설정을 서명해 배포한다. 에픽은 시작할 때 설정 버전을 고정 |
+| D16 | 테스트 검증 | **A안**: 서버는 서명·티어·해시·diff 대조·형식만 다시 검증하고, lint/test는 실행자가 보고한 결과(서버가 받아 서명)를 신뢰. 서버 재실행(B안)은 이후 추가 |
 | D17 | 협업 방식 | **조종수 1명 + 실시간 관찰자**. 동시 편집 없음. 관찰자는 대화·편집을 실시간으로 보고 **조종수에게** 의견을 낸다. 에이전트에 전달할지는 조종수가 정한다. 조종은 요청·수락으로 넘긴다 (§8) |
 | D18 | 편집 출처 | 확장이 잡은 모든 편집(에디터·에이전트·셸 결과·외부 반영)을 **편집 기록**으로 서버에 저장. 쓰는 사람이 한 명이라 기록이 하나의 순서열이 되어, 충돌 해결 없이 위치 고정과 출처 조회가 정확함 (§8.6) |
 | D19 | Claude Code 연동 방식 | **대화 UI를 다시 만들지 않는다.** Claude Code의 공식 확장 지점(SessionStart·UserPromptSubmit·PreToolUse·PostToolUse·Stop 훅, MCP 서버)에만 붙는다. Claude Code 기능과 업데이트는 그대로 따라감. Zed(ACP) 등 다른 에디터에서도 같은 연동이 동작 |
 | D20 | 에이전트 확장 | 에이전트별 차이는 **AgentAdapter** 안에 가둔다(§6.5). 1차 Claude Code, 이후 Codex CLI → Gemini CLI → jcode 등. 지원 등급(완전·부분·최소)에 따라 기능이 달라지지만 **관문은 동일**. 한 에픽 안에서 에이전트를 섞어 쓸 수 있음 |
+| D21 | git 호스트 방식 | **내장 git 서버를 기본**으로 한다. flightdeck-server가 git 저장소를 직접 제공하고 ref 규칙을 서버에서 강제한다. CI/CD 연계가 필요하면 main(과 태그)을 외부 git에 **미러**한다. GitHub·GitLab 등 **외부 git만 쓰는 방식**도 지원한다. 이때는 보호 규칙을 호스트 설정에 맡기고 확장이 이력 재작성을 감지한다 (§1.5) |
 
 ---
 
@@ -91,7 +99,7 @@
 │  Flightdeck 패널: Phase · Comments · 관찰 뷰 · 의견 · 메모 ┘               │
 │                          │                                           │
 │              Flightdeck Client Core (packages/core)                    │
-│  상태 계산(reducer) · 서명 검증 · 쓰레드 렌더/파싱 · 위치 추적 · coverage │
+│  상태 계산(reducer) · 서버 서명 검증 · 쓰레드 렌더/파싱 · 위치 추적 · coverage │
 │                          │                                           │
 │              Git Engine (확장 내부 전용, 사용자 노출 없음)               │
 │   worktree: 에픽 / 리뷰 / 관찰(읽기 전용)                               │
@@ -99,22 +107,22 @@
        │ git fetch/push                │ REST           │ REST
        │ (main 제외)                    │                │
 ┌──────▼───────────────────┐  ┌───────▼──────┐  ┌──────▼────────────────┐
-│ Git 원격 저장소            │  │ 일감 도구      │  │ Google Workspace      │
+│ Git 원격 (기본: 서버 내장)  │  │ 일감 도구      │  │ Google Workspace      │
 │  main  ◄── 서버만 push     │  │ (ClickUp →    │  │  Meet API · Docs API  │
 │  flightdeck/<epic>         │  │  Jira 등)     │  └───────────────────────┘
 │  flightdeck-meta           │  └──────────────┘
 │  refs/flightdeck/*         │
-│  flightdeck-config (별도)   │◄── 관리자만 push
 └──────▲───────────────────┘
-       │ fetch / main push (봇 자격 증명)
+       │ fetch / main·meta push (봇 자격 증명)
 ┌──────┴───────────────────────────────────────┐
-│ flightdeck-server                              │◄── 확장: REST + WebSocket
-│  ① 설정 배포 (서버 서명)                        │
+│ flightdeck-server                              │◄── 확장: REST + WebSocket (Google 로그인)
+│  ① 설정·서명: 어드민 화면(파이프라인·멤버),      │◄── 관리자: 어드민 웹
+│     설정 배포, 단계 통과 이벤트 검증·서명         │
 │  ② 반영: 검증 → rebase → main push             │
 │  ③ 편집 기록: 편집 순서열 저장, 출처·위치 조회     │
 │  ④ 실시간 중계: 조종수 → 관찰자 (대화·편집 스트림), │
 │     관찰자 → 조종수 (의견), 조종 넘기기            │
-│  PostgreSQL (편집 기록·세션 상태)                │
+│  PostgreSQL (설정·멤버·편집 기록·세션 상태)       │
 └──────────────────────────────────────────────┘
 ```
 
@@ -123,17 +131,17 @@
 | 데이터 | 원천 | 비고 |
 |---|---|---|
 | 문서 본문, 코드, impl-log | 에픽 브랜치 `flightdeck/<epic-id>` | 확장이 커밋 |
-| 쓰레드·댓글·승인·단계 전환 | 메타 브랜치 `flightdeck-meta` | **서명된** 이벤트 파일, append-only (§3.1, §12) |
+| 쓰레드·댓글·승인·단계 전환 | 메타 브랜치 `flightdeck-meta` | 이벤트 파일, append-only. 단계 통과 이벤트는 **서버 서명** (§3.1, §12) |
 | 진행 중 작업 상태 | 체크포인트 ref `refs/flightdeck/ckpt/…` | §8.1 |
 | 편집 기록 (출처 포함) | **flightdeck-server ③** | §8.6. git 체크포인트는 편집 기록 위치(seq)를 참조 |
 | 조종 상태·관찰 세션 | **flightdeck-server ④** | §8.2. 조종 넘기기 결과는 메타 이벤트로도 남김 |
 | 에이전트 세션 원본 | 실행 ref `refs/flightdeck/runs/<epic-id>` | §6.4 |
 | 회의 요약 | Google Docs (Gemini 회의록) | 가져와서 메타 이벤트로 변환 |
-| 파이프라인·룰·멤버 공개키 | **설정 레포** `flightdeck-config` | 서버가 서명해 배포 (§2.5) |
+| 파이프라인·룰·멤버 | **서버 DB** (어드민 화면에서 관리) | 서버가 서명해 배포 (§2.5) |
 | 완료된 결과 | `main` | **반영 서버만 push** (§11) |
 
 - 현재 상태는 모든 확장이 **같은 reducer(`packages/core`)**로 계산한다. 입력은 메타 이벤트와 에픽 브랜치다.
-- 서명이 유효하지 않거나 권한이 없는 이벤트는 reducer가 무시한다.
+- 권한이 없는 이벤트, 그리고 서버 서명이 필요한데 서명이 없거나 틀린 이벤트는 reducer가 무시한다(§12).
 
 ### 1.2 Git 사용 원칙
 
@@ -144,8 +152,9 @@
   - 쓰레드 블록 영역은 렌더링 결과라 충돌이 생기지 않는다.
   - 문서 본문이 충돌하면 확장의 병합 화면에서 "내 것 / 상대 것 / 직접 수정"으로 고른다. git 용어는 노출하지 않는다.
 - 원격 인증
-  - 사용자 PC의 기존 git 자격 증명(SSH 키, credential helper)을 쓴다. 호스트 API는 쓰지 않는다.
-  - 개발자 계정에는 **main push 권한이 없다.** 저장소 호스트에서 main 보호 설정을 한 번 해 두고, 서버 봇 계정만 허용한다. PR 기능이 아니라 브랜치 쓰기 권한만 설정한다.
+  - 내장 git 서버: 확장이 git credential helper를 제공하고, 서버 로그인 세션으로 인증한다(§1.5).
+  - 외부 git: 사용자 PC의 기존 git 자격 증명(SSH 키, credential helper)을 쓴다. 호스트 API는 쓰지 않는다.
+  - 개발자 계정에는 **main push 권한이 없다.** 내장 git 서버는 서버가 거부하고, 외부 git은 호스트에서 main 보호 설정을 한 번 해 두고 서버 봇 계정만 허용한다. PR 기능이 아니라 브랜치 쓰기 권한만 설정한다.
 
 ### 1.3 저장 인터페이스
 
@@ -159,6 +168,7 @@ interface EventStore {
 
 - `append`는 작업 폴더 없이 git 저수준 명령으로 커밋한다: blob 작성 → 임시 index에 이벤트 파일 추가 → `write-tree` → `commit-tree` → `update-ref`(CAS). CAS가 실패하면 새 끝 위에 다시 만든다. 이벤트 추가는 파일 하나를 더하는 일이라 작업 폴더가 필요 없고, 동시 추가도 CAS로 처리된다(M1: 동시 20건 유실·병합 커밋 0).
 - `append`는 쓰기 전에 그 이벤트를 넣은 reducer 결과를 미리 계산한다. reducer가 무시할 이벤트(권한·관문·ID 중복)는 쓰지 않고 이유를 사용자에게 알린다. 메타 브랜치는 append-only라 한번 쓰면 지울 수 없기 때문이다.
+- 확장이 직접 `append`하는 것은 **일반 이벤트**뿐이다. 서버 서명이 필요한 이벤트(§12)는 확장이 서버 API로 요청하고, 서버가 검증·서명해 메타 브랜치에 push한다. 확장은 다음 fetch에서 받는다.
 
 ### 1.4 TrackerAdapter
 
@@ -179,6 +189,31 @@ interface TrackerAdapter {
 - 누락 대비 **조정(reconcile)**: 에픽을 열고 있는 확장이 "reducer 단계 ≠ 일감 상태"이면 상태를 맞춘다. 여러 번 실행돼도 결과가 같다.
 - **알림 경로**: VS Code가 꺼져 있을 때는 리뷰 차례와 쓰레드 멘션을 모두 이 어댑터의 `notifyMention`(일감 댓글 @멘션)으로 받는다.
 
+### 1.5 git 호스트 (D21)
+
+확장은 git을 push·fetch 대상으로만 쓰므로(D12) 호스트가 바뀌어도 확장의 git 사용은 같다. 다른 것은 **ref 보호 규칙을 누가 강제하느냐**다.
+
+| 방식 | 내용 | 보호 규칙 |
+|---|---|---|
+| **내장** (기본) | flightdeck-server가 git smart HTTP(`git http-backend`)로 레포를 제공한다. 인증은 서버 로그인 세션이고, 확장이 git credential helper를 제공한다 | 서버의 `pre-receive` 훅이 강제한다(아래 표) |
+| **내장 + 외부 미러** | 내장을 원본으로 두고, 서버가 main(과 태그)만 외부 git(GitHub 등)에 미러 push한다. CI/CD는 미러의 main을 본다 | 내장과 같다. 미러 대상은 서버 봇 외에는 쓰기 금지로 둔다 |
+| **외부** | GitHub·GitLab·Gitea 등을 원격으로 쓴다 | 호스트의 브랜치 보호 설정(main: 봇만, `flightdeck-meta`: force push·삭제 금지)에 맡긴다. 호스트가 강제하지 못하는 규칙은 확장·서버가 **감지**해 관리자에게 경고한다(§2.1, §11.4) |
+
+내장 git 서버의 `pre-receive` 규칙:
+
+| ref | 허용 |
+|---|---|
+| `main` | 서버(반영 모듈)만 |
+| `flightdeck-meta` | fast-forward만. 새 커밋은 `epics/<epic>/events/`에 **파일 추가만** 한다(수정·삭제 거부). 일반 이벤트의 `author`와 파일 이름의 멤버가 push한 멤버와 같아야 한다. 서버 서명 이벤트는 서버만 추가한다 |
+| `flightdeck/<epic>` | 그 에픽의 담당자·현재 조종수, 서버(반영 시 rebase) |
+| `refs/flightdeck/ckpt/<epic>/<member>` | 그 멤버만 |
+| `refs/flightdeck/runs/<epic>` | 그 에픽의 실행자, 서버(정리) |
+| 그 밖의 ref | 거부 |
+
+- 내장 방식에서는 일반 이벤트도 사실상 위조할 수 없다. 서명은 없지만 push한 사람과 작성자가 같은지 서버가 확인하기 때문이다.
+- 레포 데이터는 서버 디스크에 있다. 백업은 서버 운영에 포함한다(§11.5). 서버가 죽으면 push·fetch가 멈추지만 조종수의 로컬 작업은 계속되고, 복구 후 밀린 이벤트를 보낸다(§3.1 재시도와 같은 경로).
+- 코드 브라우징 웹 화면은 제공하지 않는다. 필요하면 외부 미러에서 본다.
+
 ---
 
 ## 2. 저장 구조
@@ -196,6 +231,7 @@ interface TrackerAdapter {
 - 체크포인트와 세션 원본은 크기가 크다. 그래서 **별도 ref**에 둔다. ref를 지우면 결국 원격 저장소에서 공간이 회수된다(gc). 회수 시점은 호스트가 정한다.
   - **GitHub에서는 ref를 지워도 커밋이 바로 사라지지 않는다.** 삭제 직후에도 SHA를 알면 레포 읽기 권한자가 fetch할 수 있다(M0 확인). 따라서 체크포인트·세션 원본에 한 번 들어간 비밀값은 ref 삭제로 지울 수 없다. 저장 전에 걸러야 한다(§6.4 비밀값 제거, §8.1 비밀 파일 제외).
 - `refs/flightdeck/*`는 브랜치가 아니므로 브랜치 목록·브랜치 보호 규칙·Actions 트리거에 나타나지 않는다(GitHub 확인).
+- **메타 브랜치 보호**: append-only는 약속만으로는 지켜지지 않는다. 쓰기 권한이 있으면 force push나 브랜치 삭제로 질문·승인 이벤트를 없앨 수 있다. 내장 git 서버는 이를 서버에서 거부한다(§1.5). 외부 git은 호스트에서 `flightdeck-meta`도 **force push·삭제 금지**로 설정한다(main 보호와 함께 처음에 한 번). 어느 방식이든 확장은 fetch한 메타 브랜치가 이전에 본 끝을 포함하지 않으면(이력 재작성) 받아들이지 않고 관리자에게 경고한다.
 - fetch 설정(refspec)은 확장이 관리한다. `refs/flightdeck/*`는 기본 clone/fetch로 받아지지 않으므로 필요한 refspec(예: `+refs/flightdeck/ckpt/<epic-id>/*:refs/flightdeck/ckpt/<epic-id>/*`)을 명시해 fetch한다.
 
 ### 2.2 에픽 브랜치
@@ -221,7 +257,7 @@ interface TrackerAdapter {
 ```
 flightdeck-meta/
 └── epics/<epic-id>/
-    ├── events/<ULID>-<member>.json    # 파일 1개 = 서명된 이벤트 1개
+    ├── events/<ULID>-<member>.json    # 파일 1개 = 이벤트 1개 (단계 통과 이벤트는 서버 서명)
     └── sessions/<sid>/focus-<member>.jsonl
 ```
 
@@ -229,32 +265,36 @@ flightdeck-meta/
 
 | 경로 | 용도 |
 |---|---|
-| `../<repo>.flightdeck/<epic-id>` | 에픽 작업 폴더 (담당자, 질문 받은 사람) |
+| `../<repo>.flightdeck/<epic-id>` | 에픽 작업 폴더 (담당자). 질문 받은 사람은 에픽 브랜치를 **읽기 전용**으로 연다. 쓰레드 블록 렌더링은 그 사람의 편집 기록에 남기지 않는다 |
 | `../<repo>.flightdeck/<epic-id>#review-<member>` | 리뷰 전용 사본 (§9.3) |
 | `../<repo>.flightdeck/<epic-id>@live` | 관찰자용 읽기 전용 창. 조종수의 편집 스트림이 실시간 적용됨 (§8.3) |
 | `../<repo>.flightdeck/<epic-id>#ask` | 조종수의 개인 질문용 읽기 전용 사본. 현재 체크포인트 기준 (§3.6) |
 
-### 2.5 설정 레포 `flightdeck-config` (관리자만 push)
+### 2.5 설정: 서버 DB + 어드민 화면
 
 ```
-flightdeck-config/
-├── server.pub                      # 반영 서버 공개키
-├── members/<member>.pub            # 멤버 공개키 (§12)
-└── products/<product>/             # 제품 레포별 설정
-    ├── pipeline.yaml               # §5
-    └── rules/{common,analysis,design,implementation,verification}.md
+flightdeck-server DB
+├── members      # 멤버 ID, Google 계정 이메일, 그룹, 일감 도구 사용자 ID, 활성 여부, 어드민 여부
+└── products/<product>
+    ├── config_versions[]           # 설정 버전마다 변경 불가 스냅샷
+    │   ├── pipeline.yaml           # §5
+    │   └── rules/{common,analysis,design,implementation,verification}.md
+    └── current                     # 새 에픽이 쓰는 버전
 ```
 
-- **관리자의 push = 설정 승인**이다. 별도 관리 화면 없이 git 이력이 변경 감사 기록이 된다. 관리자는 일반 git 도구로 이 레포를 다룬다. 사용자 git 비노출 원칙(D12)은 일반 참여자에게만 적용한다.
-- **설정 버전** = 설정 레포 커밋 해시.
+- 관리자는 서버의 **어드민 화면**(웹)에서 멤버를 등록하고 파이프라인·룰을 고친다. 저장할 때마다 새 설정 버전이 생기고, 누가 언제 무엇을 바꿨는지가 감사 기록으로 남는다.
+- **모든 사용자는 서버에 등록된 멤버다.** 확장은 Google 계정으로 서버에 로그인하고, 등록된 이메일이면 그 멤버가 된다(§12). 등록되지 않았거나 비활성인 계정은 쓸 수 없다.
+- **설정 버전** = 서버가 저장 시 부여한 버전 ID. 한 번 만든 버전은 바뀌지 않는다.
 - **배포**
   - 확장이 `GET /config?product=<p>`로 설정을 받는다. 응답은 `{version, pipeline, rules, members}`이고 서버 서명이 붙는다.
   - 받은 설정을 `.flightdeck/.runtime/config/<version>/`에 캐시한다.
-  - 서버가 죽어 있으면 캐시를 쓴다. 단, 새 에픽 시작과 반영은 할 수 없다.
+  - 서버가 죽어 있으면 캐시를 쓴다. 쓰레드·답글은 계속할 수 있지만, 서버 서명이 필요한 일(새 에픽 시작, 단계 완료, 승인, 반영)은 할 수 없다.
+  - 개발용으로 로컬 설정 폴더(`flightdeck.configDir`)를 쓰는 모드는 **개발 모드에서만** 켤 수 있다. 이 모드의 에픽은 서버 서명이 없어 서버 검증을 통과하지 못한다.
 - **버전 고정**
   - `epic.started`에 `config_version`을 기록한다. reducer와 서버는 그 에픽을 **고정된 버전의 파이프라인**으로 판정한다.
-  - 진행 중 에픽에 새 설정을 적용하려면 담당자가 "설정 업그레이드"를 해야 한다. `epic.config_upgraded` 이벤트가 남고, 이미 받은 승인은 새 규칙으로 다시 판정한다.
+  - 진행 중 에픽에 새 설정을 적용하려면 담당자가 "설정 업그레이드"를 해야 한다. `epic.config_upgraded` 이벤트(서버 서명)가 남고, 이미 받은 승인은 새 규칙으로 다시 판정한다.
 - 에픽 브랜치에서 설정을 고칠 수 없다. 레포 안에 설정 파일이 없고, 에이전트의 `.flightdeck/.runtime/` 쓰기도 차단한다.
+- 멤버 정보는 설정 버전과 별도로 **현재 값**을 쓴다. 멤버를 비활성으로 바꾸면 그 뒤로 서버가 그 멤버의 요청을 받지 않는다. 이미 서명된 이벤트는 그대로 유효하다.
 
 ---
 
@@ -270,31 +310,34 @@ flightdeck-config/
   "epic": "CU-86abc123",
   "author": "park",
   "at": "2026-10-01T11:03:00+09:00",
-  "data": { "thread": "t-01JB2X4K", "body": "30분, 슬라이딩 갱신입니다.", "source": "human" },
-  "sig": "ed25519:…"
+  "data": { "thread": "t-01JB2X4K", "body": "30분, 슬라이딩 갱신입니다.", "source": "human" }
 }
 ```
 
-| 이벤트 타입 | data |
-|---|---|
-| `epic.started` | tracker_ref, owner, base_sha, config_version |
-| `epic.config_upgraded` | from_version, to_version |
-| `thread.created` | thread, phase, file, anchor(§3.5), kind, to[], body |
-| `thread.replied` | thread, body, source(`human`\|`agent`\|`session`), patch?(수정 제안, §9.3) |
-| `thread.resolved` / `thread.reopened` | thread |
-| `thread.moved` | thread, anchor |
-| `patch.applied` | thread, commit |
-| `phase.completed` | phase (담당자의 "분석 완료" 등) |
-| `review.approved` | phase, tier, artifact_hash (§4.2) |
-| `review.edited` | phase, commit |
-| `phase.reverted` | from, to, reason |
-| `run.started` / `run.finished` | run_id, phase, member, ckpt_from, ckpt_to |
-| `gate.reported` | commit, commands[{cmd, exit, summary, log_hash}] (실행자 서명, §7.5) |
-| `pilot.changed` | from, to, reason(`handoff`\|`request`\|`takeover`), ckpt, handoff_run (§8.5) |
-| `land.requested` | head_sha |
-| `epic.landed` | main_commit, approvals[] (**서버 서명**) |
-| `land.rejected` | reason, details (**서버 서명**) |
-| `session.started` / `session.ended` / `session.published` | sid, … |
+| 이벤트 타입 | data | 서버 서명 |
+|---|---|---|
+| `epic.started` | tracker_ref, owner, base_sha, config_version | ✅ |
+| `epic.config_upgraded` | from_version, to_version | ✅ |
+| `thread.created` | thread, phase, file, anchor(§3.5), kind, to[], body, commit?(문서 공유 커밋) | |
+| `thread.replied` | thread, body, source(`human`\|`agent`\|`session`), patch?(수정 제안, §9.3) | |
+| `thread.resolved` / `thread.reopened` | thread | |
+| `thread.moved` | thread, anchor | |
+| `patch.applied` | thread, commit | |
+| `phase.completed` | phase, artifact_hash (담당자의 "분석 완료" 등) | ✅ |
+| `review.approved` | phase, tier, artifact_hash (§4.2) | ✅ |
+| `review.edited` | phase, commit | |
+| `phase.reverted` | from, to, reason | |
+| `run.started` / `run.finished` | run_id, phase, member, ckpt_from, ckpt_to | |
+| `gate.reported` | commit, commands[{cmd, exit, summary, log_hash}] (§7.5) | ✅ |
+| `pilot.changed` | from, to, reason(`handoff`\|`request`\|`takeover`), ckpt, handoff_run (§8.5) | |
+| `land.requested` | head_sha | |
+| `epic.landed` | main_commit, approvals[] | ✅ |
+| `land.rejected` | reason, details | ✅ |
+| `session.started` / `session.ended` / `session.published` | sid, … | |
+
+- **서버 서명 이벤트**는 단계를 넘기는 효력이 있는 이벤트다(§12). 확장이 서버에 요청하면 서버가 요청자(로그인한 멤버)·파이프라인·현재 상태를 검증하고, `author`에 요청자를 적어 서버 키로 서명한 뒤 메타 브랜치에 push한다. 서명 대상은 `sig`를 뺀 이벤트의 **정규화 JSON**(RFC 8785 JCS: 키 정렬, 공백 없음, UTF-8)이고, `sig`는 `ed25519:<base64>`다.
+- **일반 이벤트**는 서명하지 않는다. `author`는 확장이 로그인한 멤버 ID로 채운다. 저장소 쓰기 권한이 있으면 위조할 수 있지만, 일반 이벤트로는 단계를 넘길 수 없다.
+- `thread.created`의 `commit`: 쓰레드를 만들 때 담당자의 확장이 산출물을 에픽 브랜치에 커밋해 push하고 그 커밋을 적는다. 질문 대상은 이 커밋으로 질문이 달린 문서를 본다(§2.4). 담당자가 이후 고친 내용은 다음 공유 커밋(쓰레드 생성, 단계 완료) 때 보인다.
 
 - 파일 이름은 `<ULID>-<member>.json`이다. 내용 충돌이 없다. push가 거절되면 `fetch → rebase → push`를 자동으로 재시도한다.
   - 거절 사유(non-fast-forward, `cannot lock ref` 등)와 무관하게 같은 경로로 재시도한다. 지수 백오프에 지터를 둔다.
@@ -391,7 +434,11 @@ flightdeck-config/
 | 상황 | 방법 |
 |---|---|
 | VS Code 실행 중 | 20초마다 `ls-remote`로 확인 → 바뀌었으면 fetch → reducer 결과에서 나에게 해당하는 항목을 VS Code 알림으로 표시 |
-| VS Code 꺼짐 | 행위자의 확장이 일감 도구에 @멘션 댓글을 남김 (리뷰 차례, 질문 대상) |
+| VS Code 꺼짐 | 행위자의 확장이 일감 도구에 @멘션 댓글을 남김 (**새 질문의 대상, 리뷰 차례**에만) |
+
+- 행위자는 상대의 VS Code가 켜져 있는지 알 수 없으므로 위 두 경우에는 항상 멘션한다. 답글·해결은 VS Code 알림만 보낸다. 답글마다 멘션하면 일감 댓글이 대화로 넘친다.
+- 멘션 본문은 "질문 1건 · analysis.md · <링크>"처럼 짧게 하고 질문 내용은 넣지 않는다. 일감 도구에 내용이 복제되지 않게 하기 위해서다.
+- VS Code 알림은 나에게 해당하는 **새** 항목만 띄운다. 이미 알린 항목은 로컬에 기록해 다시 띄우지 않는다.
 
 - **메타 브랜치는 실시간 경로가 아니다.** GitHub 왕복은 push·fetch 각 약 4초이고, 여러 명이 동시에 push하면 이벤트 반영이 수십 초까지 밀린다(M0: 5명이 쉬지 않고 push할 때 최대 75초). 쓰레드·승인은 "수 초~수십 초 안에" 보이면 충분하다. 1초 안에 보여야 하는 것(대화·편집·의견)은 서버 ④로 보낸다(§8.3).
 
@@ -419,13 +466,13 @@ INTAKE → ANALYSIS → DESIGN → IMPLEMENTATION → VERIFICATION → LANDING �
 | LANDING | `requested` → `server_verifying` → `pushing` | main 커밋 | 서버의 `epic.landed` (§11) |
 | DONE | — | — | — |
 
-### 4.2 티어 승인 (서명된 이벤트)
+### 4.2 티어 승인 (서버 서명 이벤트)
 
 - 티어 차례가 되면 행위자의 확장이 다음 리뷰어에게 VS Code 알림과 일감 도구 멘션을 보낸다.
-- 승인 = `review.approved` 이벤트이고, 리뷰어 개인 키로 서명한다(§12).
+- 승인 = `review.approved` 이벤트다. 리뷰어가 확장에서 승인을 누르면 확장이 서버에 요청하고, 서버가 아래 조건을 검증한 뒤 서버 키로 서명해 기록한다(§12). 담당자의 단계 완료(`phase.completed`)도 같은 방식이다.
   - `artifact_hash`: 승인 시점 산출물의 해시. 설계 단계는 `design.md`, 검증 단계는 에픽 브랜치 tree 해시.
-- reducer가 승인을 유효로 인정하는 조건
-  - 서명이 유효하다.
+- 서버(서명 전)와 reducer(받은 뒤)가 승인을 유효로 인정하는 조건
+  - 서버 서명이 유효하다.
   - 리뷰어가 해당 티어 멤버다.
   - 현재 차례의 티어다.
   - `reapproval: on_change`이면 `artifact_hash`가 현재 산출물과 같다. 다르면 그 티어부터 다시 승인받는다.
@@ -444,7 +491,7 @@ INTAKE → ANALYSIS → DESIGN → IMPLEMENTATION → VERIFICATION → LANDING �
 
 ## 5. pipeline.yaml
 
-위치: `flightdeck-config/products/<product>/pipeline.yaml` (§2.5)
+위치: 서버 DB의 제품별 설정 버전. 어드민 화면에서 편집한다(§2.5)
 
 ```yaml
 version: 1
@@ -458,15 +505,11 @@ agent:
     claude-code: claude-opus-5-5
   max_turns: 200
 
-members:                           # 공개키는 flightdeck-config/members/
+members:                           # 멤버 자체(이메일·일감 도구 ID)는 어드민의 멤버 목록에서 관리
   groups:
     leads: [kim]
     architects: [park, lee]
     qa: [choi]
-  tracker_ids:
-    dh.lee: 1111111
-    kim: 1234567
-    park: 2345678
 
 tracker:
   provider: clickup
@@ -867,14 +910,14 @@ verification: "pnpm test auth  # ✅ 12 passed"
 ### 7.5 테스트 결과 보고 (A안)
 
 - 구현 게이트의 `commands`(lint/test)는 **에이전트가 아니라 확장**이 직접 실행한다. 에이전트가 결과를 꾸밀 수 없게 하기 위해서다.
-- 실행 결과는 실행자의 키로 서명해 `gate.reported` 이벤트로 남긴다.
+- 실행 결과는 확장이 서버에 보고하고, 서버가 보고자(로그인한 멤버)를 적어 서명한 `gate.reported` 이벤트로 남긴다.
   - 내용: 대상 커밋, 명령별 종료 코드, 요약, 로그 해시
   - 전체 로그는 `refs/flightdeck/runs/<epic-id>`에 보관한다.
 - 서버는 다음만 확인한다. 테스트를 다시 돌리지는 않는다.
   - 보고가 **반영 대상 커밋**에 대한 것인가
   - 서명이 유효한가
   - 모든 명령의 종료 코드가 0인가
-- **신뢰 경계**: 보고를 꾸미려면 확장을 고의로 변조해야 한다. 그래도 **누가 통과를 보고했는지**는 서명으로 남는다.
+- **신뢰 경계**: 보고를 꾸미려면 확장을 고의로 변조해야 한다. 그래도 **누가 통과를 보고했는지**는 서버 서명 이벤트로 남는다.
 - 서버 재실행(B안)은 `landing.test_verification: server_run`으로 이후 추가한다.
 
 ---
@@ -898,7 +941,7 @@ verification: "pnpm test auth  # ✅ 12 passed"
 - **디스크 바이트 그대로 저장한다.** 체크포인트를 만드는 git 호출에는 `-c core.autocrlf=false`와 `GIT_ATTR_SOURCE=<빈 트리 4b825dc…>`를 줘서 줄바꿈 변환과 레포 `.gitattributes`(filter 포함)를 끈다. 그래야 편집 기록의 `base_hash`(§8.6)와 체크포인트가 같은 바이트를 가리키고, 복원 결과가 그 시점 디스크와 바이트 단위로 같다.
   - 대가: LFS 대상 파일도 원본 그대로 체크포인트에 들어간다. 체크포인트는 별도 ref라 retention 후 회수된다(§2.1).
   - 에픽 브랜치 커밋(단계 전환·제출)은 레포 규칙대로 변환한다. 체크포인트만 예외다.
-- **비밀 파일은 체크포인트에 넣지 않는다.** `.env`, `*.pem`, `*.key` 등 비밀 파일 패턴(설정 레포 `pipeline.yaml`에서 관리)을 임시 index에서 뺀다. GitHub에서는 ref를 지워도 커밋이 SHA로 남기 때문이다(§2.1). 이 파일들은 편집 기록에서도 내용 없이 "변경됨"만 남긴다.
+- **비밀 파일은 체크포인트에 넣지 않는다.** `.env`, `*.pem`, `*.key` 등 비밀 파일 패턴(`pipeline.yaml`에서 관리)을 임시 index에서 뺀다. GitHub에서는 ref를 지워도 커밋이 SHA로 남기 때문이다(§2.1). 이 파일들은 편집 기록에서도 내용 없이 "변경됨"만 남긴다.
 - 임시 index는 사용자 index를 복사해 만든다(stat 캐시 재사용). 사용자 index·HEAD·브랜치는 건드리지 않는다.
   - **복사한 임시 index의 수정 시각을 원본과 같게 둔다.** 복사로 시각이 새로 찍히면 git의 racy 검사가 꺼져서, 같은 1초 안에 같은 크기로 바뀐 파일을 "안 바뀜"으로 보고 예전 내용을 담는다. 그러면 체크포인트·셸 편집 기록에서 편집이 조용히 빠진다(M1: 셸 재현에서 시각이 새로 찍힌 복사 6/6회 예전 내용, 시각 보존 0/6회).
 - `update-ref`는 항상 **이전 값을 지정(CAS)**한다. 커스텀 ref에는 reflog가 남지 않으므로 덮어쓰기 실수를 되돌릴 수단이 없다. 이력은 커밋 체인(parent)으로만 따라간다.
@@ -914,7 +957,7 @@ XP 페어 프로그래밍에서는 드라이버가 작성하고 내비게이터�
 | **조종수** (에픽당 1명) | 작업 폴더 쓰기, 에이전트 실행·지시, 관찰자 의견 처리, 조종 넘기기 |
 | **관찰자** (여러 명) | 대화·편집 실시간 보기, 조종수에게 의견 보내기, 쓰레드 작성, 조종 요청 |
 
-- 조종 상태는 서버 ④가 관리한다. 넘길 때마다 `pilot.changed` 메타 이벤트(서명)를 남긴다.
+- 조종 상태는 서버 ④가 관리한다. 넘길 때마다 `pilot.changed` 메타 이벤트를 남긴다.
 - 조종수만 에픽 작업 폴더에 쓸 수 있다.
   - 조종수가 아닌 사람의 에픽 창은 **읽기 전용**으로 열린다(`<epic-id>@live`).
   - 리뷰 사본(§9.3)은 이와 별개로 각자 자유롭게 쓸 수 있다.
@@ -1082,7 +1125,7 @@ XP 페어 프로그래밍에서는 드라이버가 작성하고 내비게이터�
    - 필요한 Step만 골라 diff를 연다.
    - coverage에서 강조된 hunk(`human`/`agent_shell`)를 확인한다.
 4. 리뷰어가 사본에서 고친 내용은 쓰레드에 **수정 제안(패치)**으로 첨부한다. 담당자가 `수정 제안 반영`을 누르면 에픽 브랜치에 적용되고 `patch.applied`가 남는다.
-5. 승인을 누르면 `review.approved`(서명)가 남는다. 리뷰 사본은 정리 대상이 된다.
+5. 승인을 누르면 서버가 검증해 `review.approved`(서버 서명)를 남긴다. 리뷰 사본은 정리 대상이 된다.
 
 ---
 
@@ -1149,12 +1192,16 @@ PR 없이 반영한다. 사용자에게는 "반영 중 → 완료"만 보인다.
 
 | API | 설명 |
 |---|---|
+| `GET /auth/login`, `GET /auth/callback` | Google 로그인 (§12) |
+| `GET /me` | 로그인한 멤버 정보(멤버 ID, 그룹) |
 | `GET /config?product=<p>` | 서버가 서명한 설정 (§2.5) |
+| `POST /events` | 서버 서명 이벤트 요청 `{type, epic, data}` → 검증 후 서명·메타 push → `{event}` (§3.1, §12) |
 | `POST /land` | `{epic, head_sha}` → `202 {job}` |
 | `GET /land/<job>` | 진행 상태 |
 | `GET /health` | 상태 확인 |
+| `/admin/*` | 어드민 화면: 멤버 등록·비활성, 제품별 파이프라인·룰 편집, 설정 버전·변경 이력 (어드민 멤버만) |
 
-- 모든 요청은 **멤버 키 서명**이 필요하다. 서명 대상은 메서드, 경로, 본문 해시, 시각이다. 시각 오차는 ±5분까지 허용한다.
+- 모든 요청은 로그인 세션 토큰이 필요하다(`/health`, `/auth/*` 제외). 토큰은 확장의 `SecretStorage`에 보관한다.
 - 서버는 사내망에만 둔다.
 
 ### 11.3 서버 검증·반영 절차
@@ -1163,9 +1210,9 @@ PR 없이 반영한다. 사용자에게는 "반영 중 → 완료"만 보인다.
 
 ```
 1. fetch: main, flightdeck/<epic>, flightdeck-meta, refs/flightdeck/ckpt|runs/<epic>
-2. epic.started의 config_version으로 설정 레포에서 파이프라인·멤버 공개키 로드
+2. epic.started의 config_version으로 서버 DB에서 파이프라인 로드
 3. reducer 재실행
-   - 모든 이벤트 서명 검증 (설정 레포 공개키 기준)
+   - 서버 서명 이벤트의 서명 검증
    - 단계 순서, 각 티어 승인의 유효성 (멤버·순서·artifact_hash)
    - 열린 쓰레드 / change_request 0
 4. 형식 검증: analysis·design 섹션, impl-log, handoff
@@ -1198,7 +1245,8 @@ PR 없이 반영한다. 사용자에게는 "반영 중 → 완료"만 보인다.
 ### 11.4 우회 차단
 
 - **차단**
-  - 저장소 호스트에서 main 쓰기를 **서버 봇 계정만** 허용한다. force push도 금지한다. 처음에 한 번 설정하면 된다.
+  - 내장 git 서버: `pre-receive`가 서버 외의 main push를 거부한다(§1.5). 외부 미러의 main도 서버 봇만 쓸 수 있게 둔다.
+  - 외부 git: 저장소 호스트에서 main 쓰기를 **서버 봇 계정만** 허용한다. force push도 금지한다. 처음에 한 번 설정하면 된다.
   - 개발자 계정과 에이전트는 main에 쓸 수 없다.
 - **감사(이중 안전장치)**
   - 확장은 계속 main 이력을 검사한다.
@@ -1211,38 +1259,39 @@ PR 없이 반영한다. 사용자에게는 "반영 중 → 완료"만 보인다.
 |---|---|
 | 형태 | flightdeck-server 컨테이너 1개(모듈 ①~④) + PostgreSQL. TypeScript, `core`·`git`·`schema` 패키지 재사용 |
 | 통신 | REST(설정·반영) + WebSocket(편집 기록 전송, 실시간 중계, 의견) |
-| 저장 | PostgreSQL: 편집 기록, 조종·관찰 세션 상태, 반영 작업. 디스크: 레포 미러 캐시 |
+| 저장 | PostgreSQL: 멤버, 설정 버전·변경 이력, 로그인 세션, 편집 기록, 조종·관찰 세션 상태, 반영 작업. 디스크: 내장 git 레포(백업 대상) 또는 외부 레포 미러 캐시 |
 | 상태 | 반영 작업은 재시작 시 메타 브랜치를 다시 훑어 복구한다. 편집 기록은 DB에 영속한다. 실시간 스트림은 메모리 중계만 하고 저장하지 않는다(원본은 실행 기록 §6.4) |
-| 비밀 | ① main push 자격 증명: 봇 SSH 키 또는 토큰, **해당 레포 쓰기만** ② 서버 서명 개인키 ③ DB 자격 증명 |
+| 비밀 | ① main·메타 브랜치 push 자격 증명: 봇 SSH 키 또는 토큰, **해당 레포 쓰기만** ② 서버 서명 개인키 ③ DB 자격 증명 ④ Google OAuth 클라이언트 비밀 |
 | 배치 | 사내망 |
-| 장애 시 | 반영·새 에픽 시작·실시간 관찰이 멈춘다. **조종수의 작업은 계속된다.** 편집 기록은 로컬에 쌓았다가 복구 후 재전송한다. 쓰레드·승인은 메타 브랜치라 영향이 없다 |
+| 장애 시 | 반영·새 에픽 시작·단계 완료·승인·실시간 관찰이 멈춘다. **조종수의 작업은 계속된다.** 쓰레드·답글도 메타 브랜치라 계속된다. 편집 기록은 로컬에 쌓았다가 복구 후 재전송한다 |
 
 ---
 
 ## 12. 서명과 신뢰
 
-PR 리뷰라는 외부 증거가 없다. 그래서 승인의 진위를 **서명**으로 보장한다. **신뢰의 기준점은 설정 레포**다. 이 레포는 관리자만 push할 수 있다.
+PR 리뷰라는 외부 증거가 없다. 그래서 **단계를 넘기는 이벤트**의 진위를 **서버 서명**으로 보장한다. **신뢰의 기준점은 서버**다. 서버는 로그인한 멤버의 요청을 파이프라인 기준으로 검증한 뒤에만 서명한다.
 
-| 키 | 생성 | 공개키 위치 | 서명 대상 |
+| 키 | 생성 | 공개키 배포 | 서명 대상 |
 |---|---|---|---|
-| 멤버 키 (ed25519) | 확장 최초 실행 시. 개인키는 `SecretStorage` | `flightdeck-config/members/<member>.pub` | 모든 이벤트, 서버 API 요청 |
-| 서버 키 (ed25519) | 서버 설치 시. 개인키는 서버 비밀 저장소 | `flightdeck-config/server.pub` | 설정 응답, `epic.landed`, `land.rejected` |
+| 서버 키 (ed25519) | 서버 설치 시. 개인키는 서버 비밀 저장소 | 설정 응답에 포함, 지문은 확장 설정 | 설정 응답, 서버 서명 이벤트(§3.1 표의 ✅) |
 
-- **멤버 등록**
-  1. 신규 멤버가 확장에서 `키 등록 요청`을 실행한다. 공개키와 지문이 표시되고, 관리자에게 일감 도구 멘션이 간다.
-  2. 관리자가 설정 레포 `members/`에 공개키를 push한다.
-  3. 서버와 확장이 다음 설정 조회 때 반영한다.
+멤버 개인 키는 두지 않는다. 멤버의 신원은 **Google 로그인**으로 확인한다.
+
+- **멤버 등록**: 관리자가 어드민 화면에서 멤버 ID, Google 계정 이메일, 그룹, 일감 도구 사용자 ID를 등록한다. 등록되지 않은 계정은 로그인해도 쓸 수 없다.
+- **로그인**: 확장이 브라우저로 서버의 Google 로그인을 열고, 서버가 등록된 이메일인지 확인해 세션 토큰을 준다. 확장은 `GET /me`로 내 멤버 ID를 알고, 일반 이벤트의 `author`에 쓴다.
+- **서명 요청**: 확장이 `POST /events`로 단계 통과 이벤트를 요청하면, 서버는 메타 브랜치를 fetch해 reducer로 현재 상태를 계산하고 다음을 확인한다. 모두 맞으면 `author`=요청자로 서명해 push한다.
+  - 요청자가 파이프라인상 그 이벤트를 낼 수 있는 사람인가(담당자, 해당 티어 그룹 멤버)
+  - 지금 그 이벤트를 낼 차례인가(단계·티어 순서, 관문 조건: 열린 쓰레드 0 등)
+  - `artifact_hash`가 에픽 브랜치의 산출물과 같은가
 - **서버 키 최초 신뢰**: 관리자가 확장 설정 두 가지를 팀에 배포한다.
   - `flightdeck.serverUrl`
   - `flightdeck.serverKeyFingerprint`
   
-  확장은 설정 응답의 서명을 이 지문으로 검증한다.
+  확장은 설정 응답과 서버 서명 이벤트를 이 지문의 키로 검증한다.
 - **reducer가 무시하는 이벤트**
-  - 서명이 없거나 틀린 이벤트
-  - 설정 레포에 없는 키의 이벤트
-  - 권한 밖의 이벤트
-  - 서버 키가 아닌 키로 서명된 `epic.landed`/`land.rejected`
-- **키 폐기**: 관리자가 설정 레포에서 공개키를 `members/revoked/<member>-<시각>.pub`로 옮긴다. 폐기 시각 이전 이벤트는 유효하다.
+  - 서버 서명이 필요한데 서명이 없거나 틀린 이벤트
+  - 권한 밖의 일반 이벤트(작성자 기준, §3.4)
+- **멤버 비활성**: 관리자가 어드민에서 비활성으로 바꾸면 서버가 그 뒤의 요청을 받지 않는다. 이미 서명된 이벤트는 유효하다. 일반 이벤트는 서명이 없으므로, 비활성 이후 시각의 일반 이벤트는 reducer가 무시한다.
 
 ---
 
@@ -1253,16 +1302,16 @@ flightdeck/
 ├── docs/design.md
 ├── packages/
 │   ├── schema/    # zod 스키마: 이벤트, pipeline.yaml, impl-log, handoff, state
-│   ├── core/      # reducer, 서명 검증, 쓰레드 렌더/파싱, 위치 추적, coverage (순수 로직)
+│   ├── core/      # reducer, 서버 서명 검증, 쓰레드 렌더/파싱, 위치 추적, coverage (순수 로직)
 │   ├── git/       # GitEngine: worktree·체크포인트·ref·rebase·push (확장 내부 전용)
 │   ├── tracker/   # TrackerAdapter + clickup
 │   ├── agent/     # AgentAdapter 인터페이스 + claude-code 구현 (codex, gemini-cli는 이후)
 │   ├── hook/      # flightdeck-hook: 모든 에이전트 훅의 공통 진입점. 어댑터로 입출력 변환 후 공통 처리 (세션 등록·룰 주입·권한·편집 기록·의견 전달·체크포인트), 확장과 로컬 IPC
 │   ├── mcp/       # flightdeck MCP 서버 (search_run 포함)
-│   ├── server/    # flightdeck-server: config · landing · editlog · live 모듈
+│   ├── server/    # flightdeck-server: config(어드민·설정·서명) · landing · editlog · live 모듈
 │   └── vscode/    # VS Code 확장
 └── examples/
-    └── flightdeck-config/   # 설정 레포 템플릿 (pipeline.yaml, rules/, members/)
+    └── flightdeck-config/   # 제품 설정 예시 (pipeline.yaml, rules/). 서버 초기 데이터로 가져올 수 있다
 ```
 
 ---
@@ -1273,13 +1322,14 @@ flightdeck/
 |---|---|---|
 | **M0 스파이크** | ① Comments API를 markdown에 적용 ② 대화형 Claude Code + worktree의 `settings.local.json` 훅(권한 차단·trace·사용자 설정과 병합, `.mcp.json` 최초 승인 흐름) ③ 훅 추가 컨텍스트로 **실행 중** 의견 전달(PostToolUse)과 단계 룰 갱신(UserPromptSubmit)이 되는지 ③-1 headless 초안 세션을 대화형으로 이어가기(resume) ③-2 `transcript_path` 세션 기록 파일 실시간 읽기 ④ Meet 회의록·전사 조회 ⑤ 메타 브랜치 동시 push ⑥ 체크포인트 숨은 커밋 push/fetch ⑦ 에디터·에이전트·셸 편집을 오프셋 편집 기록으로 빠짐없이 잡을 수 있는지(재적용 시 파일 해시 일치)<br>**결과(2026-10-02, 완료)**: ①~⑦ 모두 **가능**. "불가" 없음 ([m0-results.md](m0-results.md)). ④는 지난 회의 조회와 실제 회의의 회의록 생성 시간(4분 이내)까지 확인했다. Flightdeck 자체 OAuth 앱 + `meetings.space.created`로 연 회의의 회의록 자동 켜기는 M6에서 확인한다 | 각 항목 가능/불가 판정 |
 | **M1 로컬 단일 사용자** | core reducer·렌더러, **문단 ID + 편집 추적**, GitEngine 기초, **AgentAdapter 인터페이스 + claude-code 어댑터**, ANALYSIS 에이전트, handoff | 혼자 분석 → 설계 초안 |
-| **M2 원격 협업** | 서명 이벤트, 메타 브랜치 EventStore, 알림, ClickUp 일감 수신, **설정 레포 + 서버의 설정 배포**, 멤버 키 등록 | 2인이 원격으로 분석 Q&A |
-| **M3 설계 티어** | 티어 승인(서명), reapproval, 수정 요청 반영 | 설계가 2티어 통과 |
+| **M2 원격 협업** | 서버 서명 이벤트, 메타 브랜치 EventStore, 알림, ClickUp 일감 수신, **서버 어드민(멤버·설정) + 설정 배포**, Google 로그인 | 2인이 원격으로 분석 Q&A |
+| **M3 설계 티어** | 티어 승인(서버 서명), reapproval, 수정 요청 반영 | 설계가 2티어 통과 |
 | **M4 구현·기록** | 구현 에이전트, **체크포인트**, impl-log·trace, Step별 coverage, **세션 원본 저장·검색** | 설명 없는 hunk 차단 확인 |
 | **M5 검증·반영** | 코드 쓰레드, **리뷰 사본 + 수정 제안**, 테스트 결과 보고, **반영 서버 검증·rebase·main push**, main 보호 설정, 감사 | 실제 에픽 1개가 서버를 통해 main까지 |
 | **M6 회의** | Meet 연동, 포커스 이벤트, 회의록 앵커링. Flightdeck OAuth 앱으로 만든 회의 공간의 회의록 자동 켜기·`meetings.space.created` 범위 확인(M0에서 넘어옴) | 회의 요약이 올바른 쓰레드에 게시 |
 | **M7 편집 기록** | 서버 ③, 편집 경로 4종 수집, 줄 단위 출처 조회, 앵커·coverage를 편집 기록 기반으로 전환, impl-log `changes` 자동 생성 | 모든 hunk의 출처가 조회되고, 쓰레드가 대규모 수정 후에도 위치 유지 |
 | **M8 조종수 모델** | 서버 ④, 대화·편집 실시간 스트림, 관찰자 읽기 전용 창, 의견 보내기·처리, 조종 요청·넘기기·강제 인수 | 관찰자가 1초 안에 조종수 작업을 보고, 의견이 에이전트까지 전달됨 |
+| **M5.5 내장 git 서버** | git smart HTTP, 로그인 세션 기반 credential helper, `pre-receive` ref 규칙(§1.5), 외부 미러(main·태그), 백업. 외부 git 방식은 그대로 지원 | M5의 에픽 흐름이 내장 git 서버로 main까지 가고, 규칙 위반 push(메타 이벤트 수정, 남의 이름 이벤트, main 직접 push)가 거부됨 |
 | **M9 에이전트 확장** | codex 어댑터 → gemini-cli 어댑터 → jcode 등 (훅 세부 확인 후 등급 결정), 지원 등급 표시, 에이전트 혼용 조종 넘기기 | Claude Code → Codex로 조종을 넘겨 같은 에픽을 main까지 반영 |
 
 ---
@@ -1290,10 +1340,10 @@ flightdeck/
 2. **저장소 크기**: 체크포인트와 세션 원본의 retention 기본값(14일/30일)이 적절한지 시범 운영 후 조정한다.
 3. **서버 배치와 봇 계정** (M5 전까지)
    - 서버 배치: flightdeck-server(컨테이너 + PostgreSQL + 레포 미러 디스크)를 둘 환경, DB 방식, 팀원 접속 경로(사내망/VPN, 도메인·TLS), 비밀값 보관 위치
-   - git 호스트: **GitHub** (2026-10-01 확정). 봇 방식(GitHub App / deploy key / 봇 사용자)과 계정 생성·키 교체 담당은 미정
-   - main 보호 설정: 봇만 쓰기, force push 금지. 커미터 이름·이메일
+   - git 호스트: 기본은 **내장 git 서버**(D21, 2026-10-04). 외부 미러·외부 git 방식에서는 **GitHub**(2026-10-01 확정). 봇 방식(GitHub App / deploy key / 봇 사용자)과 계정 생성·키 교체 담당은 미정
+   - main 보호 설정: 봇만 쓰기, force push 금지. `flightdeck-meta` force push·삭제 금지(§2.1). 커미터 이름·이메일
    - TeamCity의 main push 여부: 버전 올림 커밋·태그 등이 있으면 허용 목록 추가 또는 반영 서버로 이전
-   - 설정 레포 관리자 지정
+   - 어드민 멤버 지정, 서버용 Google OAuth 클라이언트 발급
 4. **서버 테스트 재실행(B안)**: 이후 추가. 테스트 실행 환경(DB 등 의존성) 구성 방식은 그때 정한다.
 5. **제품명 사용 가능 여부**: 외부 공개 전에 "Flightdeck"이 VS Code 마켓플레이스, npm 패키지 이름(`flightdeck`, `@flightdeck/*`), 도메인, 상표에서 비어 있는지 확인해야 한다.
 
@@ -1301,11 +1351,11 @@ flightdeck/
 - 에이전트 과금 → 개인 Claude 구독 + Claude Code CLI (D9)
 - 일감 도구 토큰 → 개인 토큰 + reconcile (D10)
 - 기록 누적 → 정리 정책 (D11, §11.3, §2.1)
-- PR 의존 제거 → 서명 이벤트 승인 + 반영 서버 (D12, D13, §11, §12)
+- PR 의존 제거 → 서버 서명 이벤트 승인 + 반영 서버 (D12, D13, §11, §12)
 - 실행 맥락 공유 비용 → 3계층 기록 (D14, §6.4)
 - main 우회 → 서버 봇만 main 쓰기 + 감사 (§11.4)
-- pipeline.yaml 조작 → 설정 레포 + 에픽별 버전 고정 (D15, §2.5)
-- 테스트 검증 수준 → A안, 서명된 보고 신뢰 (D16, §7.5)
+- pipeline.yaml 조작 → 서버 DB + 어드민 + 에픽별 버전 고정 (D15, §2.5)
+- 테스트 검증 수준 → A안, 서버가 받아 서명한 보고 신뢰 (D16, §7.5)
 - 실시간 협업 방식 → 조종수 1명 + 관찰자 + 의견, 동시 편집 없음 (D17, §8.2~8.5)
 - 편집 출처 정확도 → 서버 편집 기록 (D18, §8.6)
 - 직접 수정 설명 → 메모 필수, 외부 도구 변경도 감지해 메모 필수 (§7.4)
