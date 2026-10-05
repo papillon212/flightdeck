@@ -210,8 +210,51 @@ describe("내장 git 서버 (§1.5, M5.5)", { timeout: 60_000 }, () => {
     expect(r2.problems[0]).toContain("갈라졌다");
   });
 
+  it("어드민: 내장 레포가 없는 제품은 화면에서 가져오거나 빈 레포를 만든다. 그 전의 요청은 거부 (Z8)", async () => {
+    const yaml = (product: string, repo: string) => (async () => (await readProductDir(SAMPLE, repo)).pipeline_yaml.replace(/^product: .*$/m, `product: ${product}`))();
+    for (const [product, repo] of [["other", "builtin"], ["blank", "builtin"], ["ext", "git@example.com:x/ext.git"]] as const) {
+      await store.addConfigVersion({ product, pipeline_yaml: await yaml(product, repo), rules: {}, created_by: "test" });
+    }
+    const admin = (who: string, p: string, body?: Record<string, string>) =>
+      fetch(url + p, { method: body ? "POST" : "GET", redirect: "manual", headers: { authorization: `Bearer ${session[who]}`, ...(body ? { "content-type": "application/x-www-form-urlencoded" } : {}) }, body: body ? new URLSearchParams(body).toString() : undefined });
+
+    expect(await (await admin("dh.lee", "/admin/products/other")).text()).toContain("내장 레포가 아직 없다");
+    expect(await (await admin("dh.lee", "/admin/products/ext")).text()).toContain("외부 git: <code>git@example.com:x/ext.git</code>");
+    const early = await api("dh.lee", "POST", "/events", { product: "other", epic: "CU-9", type: "epic.started", data: { tracker_ref: "CU-9", base_sha: "a".repeat(40) } });
+    expect(early).toMatchObject({ status: 503, data: { error: expect.stringContaining("어드민 화면") } });
+
+    expect((await admin("park", "/admin/products/other/repo", { action: "create" })).status).toBe(403); // 어드민만
+    expect((await admin("dh.lee", "/admin/products/ext/repo", { action: "create" })).status).toBe(409); // 외부 git 제품
+    expect((await admin("dh.lee", "/admin/products/other/repo", { action: "import", url: "--upload-pack=touch /tmp/x" })).status).toBe(502);
+    expect((await host.repoInfo("other")).exists).toBe(false);
+
+    // 가져오기: 다른 레포의 모든 ref
+    expect((await admin("dh.lee", "/admin/products/other/repo", { action: "import", url: host.repoDir("sample") })).status).toBe(303);
+    const info = await host.repoInfo("other");
+    expect(info).toMatchObject({ exists: true, target: (await git(["rev-parse", "main"], { cwd: host.repoDir("sample") })).trim() });
+    expect((await git(["for-each-ref", "--format=%(refname)"], { cwd: host.repoDir("other") })).trim().split("\n")).toEqual((await git(["for-each-ref", "--format=%(refname)"], { cwd: host.repoDir("sample") })).trim().split("\n"));
+    expect(await git(["config", "--get", "remote.origin.url"], { cwd: host.repoDir("other") }).catch(() => "")).toBe(""); // 원본 주소를 남기지 않는다
+    expect(await (await admin("dh.lee", "/admin/products/other")).text()).toContain("내장 git: <code>/git/other.git</code>");
+    expect((await admin("dh.lee", "/admin/products/other/repo", { action: "create" })).status).toBe(409); // 이미 있다
+
+    // 빈 레포 만들기 → 바로 HTTP로 받고, 훅이 규칙을 강제한다
+    expect((await admin("dh.lee", "/admin/products/blank/repo", { action: "create" })).status).toBe(303);
+    const blank = path.join(root, "blank-clone");
+    await git(["clone", "-q", url.replace("http://", `http://dh.lee:${gitTok["dh.lee"]}@`) + "/git/blank.git", blank], { cwd: root });
+    expect((await git(["log", "--format=%s", "main"], { cwd: blank })).trim()).toBe("blank 시작");
+    expect(await tryPush(blank, ["origin", "HEAD:main"])).toBeNull(); // 같은 커밋: 바뀌는 ref 없음
+    await git(["-c", "user.name=x", "-c", "user.email=x@test.local", "commit", "-q", "--allow-empty", "-m", "x"], { cwd: blank });
+    expect(await tryPush(blank, ["origin", "HEAD:main"])).toContain("반영 서버만");
+    expect((await store.audit()).filter((a) => a.action.startsWith("repo.")).map((a) => [a.action, (a.detail as { product: string }).product])).toEqual([
+      ["repo.create", "blank"],
+      ["repo.import", "other"],
+    ]);
+  });
+
   it("백업: 레포마다 bundle, 그것으로 복원하면 메타·main이 그대로 (Z6)", async () => {
-    const [bundle] = await host.backup(path.join(root, "backup"));
+    const bundles = await host.backup(path.join(root, "backup"));
+    expect(bundles).toHaveLength(3); // sample, other, blank
+    const bundle = bundles.find((b) => path.basename(b).startsWith("sample-"));
     const restored = path.join(root, "restored.git");
     await git(["clone", "-q", "--mirror", bundle!, restored], { cwd: root });
     for (const ref of ["refs/heads/main", "refs/heads/flightdeck-meta", `refs/heads/flightdeck/${EPIC}`]) {

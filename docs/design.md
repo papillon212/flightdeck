@@ -1,4 +1,4 @@
-# Flightdeck — 설계 문서 v0.16
+# Flightdeck — 설계 문서 v0.17
 
 > 코딩 에이전트 시대의 원격 페어 프로그래밍 워크플로우 도구
 > 작성일: 2026-10-01 · 상태: 초안(Draft)
@@ -80,8 +80,14 @@
 >   - 반영 작업은 **서버가 마지막 승인에 서명할 때 바로 건다.** `land.requested`를 없앴다(§11.1).
 >   - main이 움직였으면 rebase 대신 **main을 에픽 브랜치에 병합한 커밋**을 서버가 올린다. 담당자 확장이 자동으로 테스트를 다시 보고하면 서버가 다시 반영한다(§11.3).
 >   - squash에는 `keep` 목록의 기록만 남기고, 코드 쓰레드 기록은 서버가 만든다. main 감사는 가장 오래된 에픽의 base부터 보고, 예외 목록을 둔다(§5, §11.3, §11.4).
-> - **v0.16** (M5.5 시나리오에서 찾은 문제, 근거: [m5.5-plan.md](m5.5-plan.md) Z9. Z1~Z8은 결정 대기)
+> - **v0.16** (M5.5 시나리오에서 찾은 문제, 근거: [m5.5-plan.md](m5.5-plan.md) Z9)
 >   - `epic.started`에 **설정 내용 해시**를 서명한다. 같은 버전 ID에 다른 내용이면 "설정 불일치"로 표시하고 판정하지 않는다(§2.5, §3.1).
+> - **v0.17** (M5.5 구현·완료 확인 반영, 근거: [m5.5-plan.md](m5.5-plan.md) Z1~Z8)
+>   - 내장 git(기본)과 외부 git은 제품 설정 `repo:`로 고른다(`builtin` 또는 URL). 미러는 `mirror:`(§1.5, §5).
+>   - 내장 git 인증은 **git 전용 토큰**이다. 로그인 세션 토큰은 git이 읽는 곳에 두지 않는다(§1.2).
+>   - `pre-receive` 규칙을 멤버·서버별로 구체화했다. 판정은 서버 안의 reducer가 하고, 서버 자신의 push도 같은 규칙을 거친다. 조종수의 에픽 브랜치 쓰기는 M8(§1.5).
+>   - 내장 레포는 어드민 화면에서 가져오거나 만든다. 저절로 만들지 않는다(§1.5, §2.5).
+>   - 미러 실패·갈라짐, 백업(`backup` 명령), 새 멤버의 "서버 레포 받기"를 정했다. 백업 주기는 미결(§1.5, §9.1, §15).
 
 ---
 
@@ -176,7 +182,10 @@
   - 쓰레드 블록 영역은 렌더링 결과라 충돌이 생기지 않는다.
   - 문서 본문이 충돌하면 확장의 병합 화면에서 "내 것 / 상대 것 / 직접 수정"으로 고른다. git 용어는 노출하지 않는다.
 - 원격 인증
-  - 내장 git 서버: 확장이 git credential helper를 제공하고, 서버 로그인 세션으로 인증한다(§1.5).
+  - 내장 git 서버: **git 전용 토큰**으로 인증한다(§1.5). 로그인 세션 토큰은 승인 서명까지 요청할 수 있어 git이 읽는 곳에 두지 않는다.
+    - 확장이 서버 로그인 세션으로 `POST /git/token`을 불러 토큰(7일, git 경로에만 유효, 서버 키로 만든 HMAC이라 DB에 두지 않음)을 받는다. 하루 안에 끝나면 새로 받는다.
+    - 토큰은 `<git 공용 폴더>/flightdeck/git-credentials`(0600)에 두고, 레포 설정의 credential helper가 이 파일을 읽는다. 훅의 백그라운드 push도 같은 helper로 인증된다. 서버 주소에 대해서는 다른 helper(osxkeychain 등)를 지워 토큰이 저장·재사용되지 않게 한다.
+    - 비활성 멤버는 토큰이 남아 있어도 거부한다. 에이전트 훅은 이 파일 읽기를 막는다(§6.2). 셸 우회까지는 막지 못하나, 새어도 그 멤버가 할 수 있는 push뿐이다.
   - 외부 git: 사용자 PC의 기존 git 자격 증명(SSH 키, credential helper)을 쓴다. 호스트 API는 쓰지 않는다.
   - 개발자 계정에는 **main push 권한이 없다.** 내장 git 서버는 서버가 거부하고, 외부 git은 호스트에서 main 보호 설정을 한 번 해 두고 서버 봇 계정만 허용한다. PR 기능이 아니라 브랜치 쓰기 권한만 설정한다.
 
@@ -219,23 +228,31 @@ interface TrackerAdapter {
 
 | 방식 | 내용 | 보호 규칙 |
 |---|---|---|
-| **내장** (기본) | flightdeck-server가 git smart HTTP(`git http-backend`)로 레포를 제공한다. 인증은 서버 로그인 세션이고, 확장이 git credential helper를 제공한다 | 서버의 `pre-receive` 훅이 강제한다(아래 표) |
+| **내장** (기본) | flightdeck-server가 git smart HTTP(`git http-backend`를 CGI로 실행)로 레포를 제공한다. 주소는 `<서버>/git/<product>.git`. 인증은 git 전용 토큰(§1.2) | 서버의 `pre-receive` 훅이 강제한다(아래 표) |
 | **내장 + 외부 미러** | 내장을 원본으로 두고, 서버가 main(과 태그)만 외부 git(GitHub 등)에 미러 push한다. CI/CD는 미러의 main을 본다 | 내장과 같다. 미러 대상은 서버 봇 외에는 쓰기 금지로 둔다 |
 | **외부** | GitHub·GitLab·Gitea 등을 원격으로 쓴다 | 호스트의 브랜치 보호 설정(main: 봇만, `flightdeck-meta`: force push·삭제 금지)에 맡긴다. 호스트가 강제하지 못하는 규칙은 확장·서버가 **감지**해 관리자에게 경고한다(§2.1, §11.4) |
 
-내장 git 서버의 `pre-receive` 규칙:
+- **방식 선택**: 제품 설정 `repo:`가 `builtin`이면 내장, URL이면 외부다. 미러는 `mirror: {url, refs}`(내장일 때만, §5). 방식 전환은 진행 중인 에픽이 없을 때만 한다.
+- **내장 레포 준비**: 어드민 화면(제품 → git 레포)에서 기존 레포의 **모든 ref를 가져오거나** 빈 레포(첫 커밋 하나로 반영 대상 브랜치)를 만든다. 서버 시작 인자 `--import-repo <url>`로도 가져올 수 있다. 레포가 없으면 저절로 만들지 않는다. 빈 레포가 먼저 생기면 가져오기가 막히기 때문이다(M5.5). 레포가 없는 동안 그 제품의 서명 요청은 거부한다. 가져온 레포에는 원본 주소를 남기지 않는다.
+- **서버 자신의 쓰기**: 서버는 외부 방식과 같은 작업 사본(`repos/<product>.git`)을 두고, 그 원격만 내장 레포(로컬 경로)로 한다. 서명·반영 코드는 두 방식에서 같다. 서버의 push도 같은 `pre-receive`를 거치고, 서버 프로세스만 아는 push ID로 "서버"로 판정된다.
+- **판정 방식**: 레포의 `pre-receive` 훅은 서버 HTTP에 판정을 요청하는 작은 스크립트다. 서버가 CGI 환경에 요청마다 다른 push ID를 넣어, 훅이 그것을 보내면 서버가 push한 멤버를 안다. 서버를 거치지 않은 push(레포 폴더에 직접)는 push ID가 없어 거부한다. 판정 중 오류도 거부한다(fail-closed).
 
-| ref | 허용 |
-|---|---|
-| `main` | 서버(반영 모듈)만 |
-| `flightdeck-meta` | fast-forward만. 새 커밋은 `epics/<epic>/events/`에 **파일 추가만** 한다(수정·삭제 거부). 일반 이벤트의 `author`와 파일 이름의 멤버가 push한 멤버와 같아야 한다. 서버 서명 이벤트는 서버만 추가한다 |
-| `flightdeck/<epic>` | 그 에픽의 담당자·현재 조종수(fast-forward만), 서버(main 병합 커밋, 반영 후 삭제) |
-| `refs/flightdeck/ckpt/<epic>/<member>` | 그 멤버만 |
-| `refs/flightdeck/runs/<epic>` | 그 에픽의 실행자, 서버(정리) |
-| 그 밖의 ref | 거부 |
+내장 git 서버의 `pre-receive` 규칙 (판정은 서버 안의 reducer. 담당자 = 서명이 맞는 `epic.started.owner`):
 
+| ref | 멤버 | 서버 |
+|---|---|---|
+| `main`(반영 대상), `refs/tags/*` | 거부 | 허용 |
+| `flightdeck-meta` | fast-forward만. 새 커밋은 병합이 아니고 `epics/<epic>/events/<ULID>-<member>.json` **추가만**(수정·삭제·다른 경로 거부). 파일이 이벤트 형식이고 이름·에픽이 내용과 맞으며 `author`가 push한 멤버. 서버 서명 이벤트 종류는 거부. 만들기·지우기 거부 | fast-forward만, 추가만 |
+| `flightdeck/<epic>` | 담당자만(확장은 `epic.started` 서명을 받은 뒤 브랜치를 올린다). fast-forward만. 지우기 거부. 조종수(§8.2)의 쓰기는 M8에서 더한다 | 허용 (main 병합 커밋, 반영 후 삭제) |
+| `refs/flightdeck/ckpt/<epic>/<member>` | 그 멤버만 | 허용 |
+| `refs/flightdeck/runs/<epic>` | 담당자만, fast-forward만 | 허용 (정리) |
+| 그 밖의 ref | 거부 | 거부 |
+
+- 읽기(clone·fetch)는 활성 멤버 모두.
 - 내장 방식에서는 일반 이벤트도 사실상 위조할 수 없다. 서명은 없지만 push한 사람과 작성자가 같은지 서버가 확인하기 때문이다.
-- 레포 데이터는 서버 디스크에 있다. 백업은 서버 운영에 포함한다(§11.5). 서버가 죽으면 push·fetch가 멈추지만 조종수의 로컬 작업은 계속되고, 복구 후 밀린 이벤트를 보낸다(§3.1 재시도와 같은 경로).
+- **외부 미러**: 반영 직후 main과 태그만 올리고, 실패하면 1분 스캔에서 다시 한다. 미러의 main이 내장 main의 조상이 아니면(미러 쪽에 누가 push) 덮지 않고 서버 로그와 어드민 화면에 경고한다. 메타·에픽 브랜치는 미러하지 않는다.
+- **백업**: `flightdeck-server backup <폴더>`가 내장 레포마다 `git bundle create --all` + `bundle verify`를 한다. 복원은 bundle에서 bare clone 후 서버를 시작한다(훅은 시작할 때 다시 설치). DB는 `pg_dump`로 따로 둔다. DB와 레포의 백업 시점이 어긋나 설정 내용이 달라지면 §2.5 설정 불일치로 드러난다. 정기 실행 주기는 미정(§15).
+- 레포 데이터는 서버 디스크에 있다. 서버가 죽으면 push·fetch가 멈추지만 조종수의 로컬 작업은 계속되고, 복구 후 밀린 이벤트를 보낸다(§3.1 재시도와 같은 경로).
 - 코드 브라우징 웹 화면은 제공하지 않는다. 필요하면 외부 미러에서 본다.
 
 ---
@@ -306,6 +323,7 @@ flightdeck-server DB
 ```
 
 - 관리자는 서버의 **어드민 화면**(웹)에서 멤버를 등록하고 파이프라인·룰을 고친다. 저장할 때마다 새 설정 버전이 생기고, 누가 언제 무엇을 바꿨는지가 감사 기록으로 남는다.
+- 제품 화면에는 git 레포 칸이 있다. 외부 git이면 주소를, 내장 git이면 레포 상태(ref 수, 반영 대상 브랜치)와 **가져오기·빈 레포 만들기**를 보여 준다(§1.5). 제품 목록에는 외부 미러의 마지막 결과가 보인다. 가져오기·만들기도 감사 기록에 남는다.
 - **모든 사용자는 서버에 등록된 멤버다.** 확장은 Google 계정으로 서버에 로그인하고, 등록된 이메일이면 그 멤버가 된다(§12). 등록되지 않았거나 비활성인 계정은 쓸 수 없다.
 - **설정 버전** = 서버가 저장 시 부여한 버전 ID. 한 번 만든 버전은 바뀌지 않는다.
 - **배포**
@@ -552,7 +570,10 @@ INTAKE → ANALYSIS → DESIGN → IMPLEMENTATION → VERIFICATION → LANDING �
 ```yaml
 version: 1
 product: ad-platform
-repo: git@git.example.com:anypointmedia/ad-platform.git
+repo: builtin                      # builtin: 서버 내장 git (<서버>/git/<product>.git) | 외부 git URL (§1.5)
+mirror:                            # 내장 git일 때만. 반영된 main(과 태그)을 외부 git에 올린다
+  url: git@github.com:anypointmedia/ad-platform.git
+  refs: [main, "tags/*"]
 
 agent:
   allowed: [claude-code, codex, gemini-cli]   # 이 제품에서 허용하는 에이전트
@@ -767,6 +788,7 @@ retention:
 | 읽기 전용 창 (질문 대상·설계 리뷰어, 단계 무관) | 산출물 문서의 **쓰레드 초안 블록**만 (§3.2). 그 밖의 변경은 확장이 되돌린다 | 읽기 전용 허용 목록 |
 
 - 에이전트도 git 명령을 쓸 수 없다. 버전 관리는 확장만 한다(D12).
+- 모든 단계·창에서 내장 git 토큰 파일(`<git 공용 폴더>/flightdeck/git-credentials`, §1.2)은 읽거나 쓸 수 없다. 작업 폴더 밖이라 경로 이름으로 막는다.
 - 모든 단계에서 다음 경로의 읽기·쓰기를 차단한다. 설정 캐시와 훅·MCP 설정을 에이전트가 조작하는 것을 막기 위해서다.
   - `.flightdeck/.runtime/`
   - 어댑터의 `protectedPaths()`. 예: Claude Code는 `.claude/settings.local.json`, `.mcp.json`. Codex는 `.codex/`
@@ -1164,6 +1186,7 @@ XP 페어 프로그래밍에서는 드라이버가 작성하고 내비게이터�
   → 초안 완료 알림 → [이어서 작업]: Claude Code에서 그 세션을 이어서 대화형으로 계속
 ```
 
+- **레포 받기 (내장 git)**: 새 멤버는 `Flightdeck: 서버 레포 받기`로 폴더를 고르면 서버 레포를 받아 연다. 인증 설정(git 토큰·credential helper)까지 확장이 한다. git 주소나 인증을 몰라도 된다(D12). 레포를 열 때 원격 주소가 서버 레포가 아니면 알리고 "서버 레포로 바꾸기"를 준다. 외부 git은 지금처럼 사용자가 받은 레포를 연다.
 - 첫 에픽의 [이어서 작업] 전에 신뢰를 안내한다(§6.1). 신뢰하지 않으면 Flightdeck 훅이 동작하지 않는다.
   - VS Code: "에픽 작업 폴더의 상위 폴더 `../<repo>.flightdeck/`을 신뢰해 주세요." 한 번 신뢰하면 이후 에픽 창은 묻지 않는다.
   - 터미널 `claude`: "처음 열 때 나오는 신뢰 확인 창에서 'Yes'를 골라 주세요(기본값은 'No, exit')." 레포 기준이라 한 번이면 된다.
@@ -1282,6 +1305,9 @@ PR 없이 반영한다. 사용자에게는 "반영 중 → 완료"만 보인다.
 | `POST /events` | 서버 서명 이벤트 요청 `{type, epic, data}` → 검증 후 서명·메타 push → `{event}` (§3.1, §12) |
 | `POST /land` | `{product, epic}` → `202 {job}` (재시도용. 보통은 서버가 스스로 건다) |
 | `GET /land/<job>` | 진행 상태 |
+| `POST /git/token` | 내장 git 전용 토큰 발급 (§1.2) |
+| `/git/<product>.git/*` | 내장 git smart HTTP. Basic 인증(비밀번호 = git 토큰)만 받는다 (§1.5) |
+| `POST /internal/git/pre-receive` | 레포 훅의 판정 요청. 루프백 + push ID만 (§1.5) |
 | `GET /health` | 상태 확인 |
 | `/admin/*` | 어드민 화면: 멤버 등록·비활성, 제품별 파이프라인·룰 편집, 설정 버전·변경 이력 (어드민 멤버만) |
 
@@ -1420,7 +1446,7 @@ flightdeck/
 | **M6 회의** | Meet 연동, 포커스 이벤트, 회의록 앵커링. Flightdeck OAuth 앱으로 만든 회의 공간의 회의록 자동 켜기·`meetings.space.created` 범위 확인(M0에서 넘어옴) | 회의 요약이 올바른 쓰레드에 게시 |
 | **M7 편집 기록** | 서버 ③, 편집 경로 4종 수집, 줄 단위 출처 조회, 앵커·coverage를 편집 기록 기반으로 전환, impl-log `changes` 자동 생성 | 모든 hunk의 출처가 조회되고, 쓰레드가 대규모 수정 후에도 위치 유지 |
 | **M8 조종수 모델** | 서버 ④, 대화·편집 실시간 스트림, 관찰자 읽기 전용 창, 의견 보내기·처리, 조종 요청·넘기기·강제 인수 | 관찰자가 1초 안에 조종수 작업을 보고, 의견이 에이전트까지 전달됨 |
-| **M5.5 내장 git 서버** | git smart HTTP, 로그인 세션 기반 credential helper, `pre-receive` ref 규칙(§1.5), 외부 미러(main·태그), 백업. 외부 git 방식은 그대로 지원 | M5의 에픽 흐름이 내장 git 서버로 main까지 가고, 규칙 위반 push(메타 이벤트 수정, 남의 이름 이벤트, main 직접 push)가 거부됨 |
+| **M5.5 내장 git 서버** | git smart HTTP, git 전용 토큰 + credential helper, `pre-receive` ref 규칙(§1.5), 외부 미러(main·태그), 백업, 어드민 레포 가져오기·만들기. 외부 git 방식은 그대로 지원<br>**결과(2026-10-05, 완료)**: 실제 VS Code 세 창 + PostgreSQL 서버 + 내장 git(GitHub `test-flightdeck`에서 가져옴)으로 M5 흐름이 main까지, GitHub 미러에도 반영. main 직접 push·메타 이벤트 수정·남의 이름 이벤트가 거부되고, 백업으로 복원한 레포가 원본과 같음 ([m5.5-plan.md](m5.5-plan.md)) | M5의 에픽 흐름이 내장 git 서버로 main까지 가고, 규칙 위반 push(메타 이벤트 수정, 남의 이름 이벤트, main 직접 push)가 거부됨 |
 | **M9 에이전트 확장** | codex 어댑터 → gemini-cli 어댑터 → jcode 등 (훅 세부 확인 후 등급 결정), 지원 등급 표시, 에이전트 혼용 조종 넘기기 | Claude Code → Codex로 조종을 넘겨 같은 에픽을 main까지 반영 |
 
 ---
@@ -1437,6 +1463,7 @@ flightdeck/
    - 어드민 멤버 지정, 서버용 Google OAuth 클라이언트 발급
 4. **서버 테스트 재실행(B안)**: 이후 추가. 테스트 실행 환경(DB 등 의존성) 구성 방식은 그때 정한다.
 5. **제품명 사용 가능 여부**: 외부 공개 전에 "Flightdeck"이 VS Code 마켓플레이스, npm 패키지 이름(`flightdeck`, `@flightdeck/*`), 도메인, 상표에서 비어 있는지 확인해야 한다.
+6. **백업 주기**: 내장 git 레포(`flightdeck-server backup`)와 DB(`pg_dump`)를 얼마나 자주, 몇 개까지 보관할지 미정(§1.5). 두 백업의 시점을 맞추는 방법도 함께 정한다.
 
 ### 해결됨
 - 에이전트 과금 → 개인 Claude 구독 + Claude Code CLI (D9)

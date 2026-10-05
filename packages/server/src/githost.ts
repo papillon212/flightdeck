@@ -69,6 +69,15 @@ export class GitHost {
     return (await readdir(this.root)).filter((n) => n.endsWith(".git")).map((n) => n.slice(0, -4));
   }
 
+  /** 내장 레포 상태 (어드민 화면) */
+  async repoInfo(product: string): Promise<{ exists: false } | { exists: true; refs: number; target: string | null }> {
+    const dir = this.repoDir(product);
+    if (!existsSync(dir)) return { exists: false };
+    const refs = (await git(["for-each-ref", "--format=%(refname)"], { cwd: dir })).split("\n").filter(Boolean).length;
+    const target = (await git(["rev-parse", "-q", "--verify", `refs/heads/${await this.deps.target(product)}`], { cwd: dir }).catch(() => "")).trim() || null;
+    return { exists: true, refs, target };
+  }
+
   /** 내장 레포를 만든다(없으면). importUrl이 있으면 그 레포의 모든 ref를 가져오고, 없으면 빈 첫 커밋으로 target을 만든다. 훅은 매번 다시 설치한다 */
   async ensureRepo(product: string, opts: { importUrl?: string; target?: string } = {}): Promise<string> {
     const dir = this.repoDir(product);
@@ -76,7 +85,9 @@ export class GitHost {
     if (!existsSync(dir)) {
       await mkdir(this.root, { recursive: true });
       if (opts.importUrl) {
-        await git(["clone", "-q", "--mirror", opts.importUrl, dir], { cwd: this.root });
+        if (opts.importUrl.startsWith("-")) throw new Error(`레포 주소 형식: ${opts.importUrl}`);
+        // ext:: 같은 명령 실행 전송은 막는다
+        await git(["-c", "protocol.ext.allow=never", "clone", "-q", "--mirror", "--", opts.importUrl, dir], { cwd: this.root, env: { GIT_TERMINAL_PROMPT: "0" } });
         await git(["remote", "remove", "origin"], { cwd: dir });
       } else {
         await git(["init", "-q", "--bare", "-b", target, dir], { cwd: this.root });

@@ -11,7 +11,8 @@
 //   --bootstrap-admin <id>:<email>   활성 어드민이 없으면 이 어드민을 만든다
 //   --import-product <폴더>          <폴더>/pipeline.yaml, rules/*.md를 그 제품의 설정이 없을 때 첫 버전으로 가져온다
 //   --repo <url|builtin>             가져올 때 pipeline.yaml의 repo를 이 값으로 바꾼다
-//   --import-repo <url>              --import-product 제품이 내장 git(repo: builtin)이고 내장 레포가 없으면, 이 레포의 모든 ref를 가져와 만든다 (M5.5 Z1)
+//   --import-repo <url>              --import-product 제품이 내장 git(repo: builtin)이고 내장 레포가 없으면, 이 레포의 모든 ref를 가져와 만든다 (M5.5 Z1).
+//                                    없으면 어드민 화면(제품 → git 레포)에서 가져오거나 빈 레포를 만든다 (Z8)
 // 명령
 //   flightdeck-server backup <폴더>  내장 git 레포마다 bundle을 만들고 검증한다 (M5.5 Z6)
 import { existsSync } from "node:fs";
@@ -100,12 +101,14 @@ async function main() {
     },
   });
   signer = new EventSigner({ store, dataDir, ...keys, githost });
-  // 내장 git 제품의 레포를 만들고(없으면) 훅을 다시 설치한다
+  // 내장 git 제품: 있는 레포는 훅을 다시 설치하고, 없는 레포는 --import-repo가 있을 때만 가져온다.
+  // 그 밖에는 어드민 화면에서 가져오거나 만든다 (M5.5 Z8: 빈 레포를 저절로 만들면 가져오기가 막힌다)
   for (const { product } of await store.listProducts()) {
     const cfg = await store.currentConfig(product);
     if (!cfg || parsePipeline(cfg.pipeline_yaml).repo !== BUILTIN_REPO) continue;
     const importUrl = product === imported ? arg("--import-repo") : undefined;
-    await githost.ensureRepo(product, importUrl ? { importUrl } : {});
+    if ((await githost.repoInfo(product)).exists || importUrl) await githost.ensureRepo(product, importUrl ? { importUrl } : {});
+    else console.log(`[git] ${product}: 내장 레포가 없다. 어드민 화면에서 가져오거나 만드세요`);
   }
   const g = process.env.FD_GOOGLE_CLIENT_ID && process.env.FD_GOOGLE_CLIENT_SECRET
     ? { clientId: process.env.FD_GOOGLE_CLIENT_ID, clientSecret: process.env.FD_GOOGLE_CLIENT_SECRET, publicUrl: process.env.FD_PUBLIC_URL ?? `http://${host}:${port}` }

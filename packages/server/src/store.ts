@@ -54,6 +54,8 @@ export interface ServerStore {
   listConfigVersions(product: string): Promise<ConfigVersion[]>;
 
   audit(limit?: number): Promise<AuditEntry[]>;
+  /** 저장소 밖의 어드민 작업(내장 레포 가져오기 등)을 변경 이력에 남긴다 */
+  addAudit(actor: string, action: string, detail: unknown): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -128,6 +130,9 @@ export class MemoryStore implements ServerStore {
 
   async audit(limit = 100) {
     return this.log.slice(-limit).reverse();
+  }
+  async addAudit(actor: string, action: string, detail: unknown) {
+    this.record(actor, action, detail);
   }
   async close() {}
 }

@@ -1,6 +1,7 @@
 // 어드민 화면 (설계 §2.5, §11.2 /admin/*): 멤버 등록·비활성, 제품별 파이프라인·룰 편집(저장 = 새 설정 버전), 변경 이력.
 // 서버가 그리는 단순한 HTML 폼이다. 쿠키 세션(SameSite=Strict) + POST의 Origin 확인.
 import { parsePipeline } from "@flightdeck/schema";
+import { BUILTIN_REPO } from "./githost.ts";
 import { isLoopback, type Ctx } from "./http.ts";
 import { RequestError } from "./signer.ts";
 
@@ -118,7 +119,28 @@ export async function adminRoutes(ctx: Ctx): Promise<void> {
     const cur = await opts.store.currentConfig(product);
     const versions = await opts.store.listConfigVersions(product);
     const rules = cur?.rules ?? { common: "", analysis: "", design: "" };
-    return send(ctx, 200, editor(product, cur?.version ?? null, cur?.pipeline_yaml ?? `version: 1\nproduct: ${product}\nrepo: \n`, rules, versions.map((v) => ({ version: v.version, by: v.created_by, at: v.created_at, note: v.note })), null, who));
+    return send(ctx, 200, editor(product, cur?.version ?? null, cur?.pipeline_yaml ?? `version: 1\nproduct: ${product}\nrepo: \n`, rules, versions.map((v) => ({ version: v.version, by: v.created_by, at: v.created_at, note: v.note })), null, who, await repoSection(ctx, product, cur?.pipeline_yaml)));
+  }
+
+  // 내장 git 레포 가져오기·만들기 (M5.5 Z8): 서버를 다시 시작하지 않고 새 제품의 레포를 준비한다
+  const repo = /^\/admin\/products\/([^/]+)\/repo$/.exec(p);
+  if (repo && req.method === "POST") {
+    const product = decodeURIComponent(repo[1]!);
+    if (!PRODUCT.test(product)) throw new RequestError(400, "제품 ID 형식이 틀렸다");
+    if (!opts.githost) throw new RequestError(404, "내장 git 서버가 꺼져 있다");
+    const cur = await opts.store.currentConfig(product);
+    if (!cur || parsePipeline(cur.pipeline_yaml).repo !== BUILTIN_REPO) throw new RequestError(409, "현재 설정이 내장 git(repo: builtin)이 아니다. 먼저 설정을 저장하세요");
+    if ((await opts.githost.repoInfo(product)).exists) throw new RequestError(409, "내장 레포가 이미 있다");
+    const f = await form(ctx);
+    const importUrl = f.get("action") === "import" ? f.get("url")?.trim() : undefined;
+    if (f.get("action") === "import" && !importUrl) throw new RequestError(400, "가져올 레포 주소가 없다");
+    try {
+      await opts.githost.ensureRepo(product, importUrl ? { importUrl } : {});
+    } catch (e) {
+      throw new RequestError(502, `레포를 ${importUrl ? "가져오지" : "만들지"} 못했다: ${e instanceof Error ? e.message : e}`);
+    }
+    await opts.store.addAudit(who, importUrl ? "repo.import" : "repo.create", { product, ...(importUrl ? { url: importUrl } : {}), ...(await opts.githost.repoInfo(product)) });
+    return redirect(ctx, `/admin/products/${product}`);
   }
   if (prod && req.method === "POST") {
     const product = decodeURIComponent(prod[1]!);
@@ -151,11 +173,30 @@ export async function adminRoutes(ctx: Ctx): Promise<void> {
   throw new RequestError(404, `없는 경로: ${req.method} ${p}`);
 }
 
-function editor(product: string, version: string | null, yaml: string, rules: Record<string, string>, versions: { version: string; by: string; at: string; note?: string }[], error: string | null, who: string): string {
+/** 제품 화면의 git 레포 칸 (M5.5 Z1·Z8): 외부 git이면 주소, 내장 git이면 레포 상태와 가져오기·만들기 */
+async function repoSection(ctx: Ctx, product: string, yaml: string | undefined): Promise<string> {
+  if (!yaml) return "";
+  let repo: string;
+  try {
+    repo = parsePipeline(yaml).repo;
+  } catch {
+    return "";
+  }
+  if (repo !== BUILTIN_REPO) return `<h2>git 레포</h2><p>외부 git: <code>${esc(repo)}</code></p>`;
+  const gh = ctx.opts.githost;
+  if (!gh) return `<h2>git 레포</h2><p class="bad">내장 git(repo: builtin)인데 서버의 내장 git이 꺼져 있다.</p>`;
+  const info = await gh.repoInfo(product);
+  if (info.exists) return `<h2>git 레포</h2><p>내장 git: <code>/git/${esc(product)}.git</code> · ref ${info.refs}개 · ${info.target ? `main <code>${esc(info.target.slice(0, 10))}</code>` : `<span class="bad">반영 대상 브랜치 없음</span>`}</p>`;
+  return `<h2>git 레포</h2><p class="bad">내장 레포가 아직 없다. 가져오거나 새로 만들어야 에픽을 시작할 수 있다.</p>
+<form method="post" action="/admin/products/${esc(product)}/repo" class="row"><input type="hidden" name="action" value="import"><input name="url" placeholder="가져올 레포 주소 (예: git@github.com:org/repo.git)" style="flex:1" required><button>모든 ref 가져오기</button></form>
+<form method="post" action="/admin/products/${esc(product)}/repo" class="row" style="margin-top:8px"><input type="hidden" name="action" value="create"><button>빈 레포 만들기</button><span class="muted">첫 커밋 하나로 반영 대상 브랜치를 만든다</span></form>`;
+}
+
+function editor(product: string, version: string | null, yaml: string, rules: Record<string, string>, versions: { version: string; by: string; at: string; note?: string }[], error: string | null, who: string, repo = ""): string {
   return page(
     `제품 ${product}`,
     `<p class="muted">현재 설정 버전: ${esc(version ?? "없음")}. 저장하면 새 버전이 생기고, 새 에픽부터 그 버전을 쓴다. 진행 중 에픽은 시작할 때의 버전을 그대로 쓴다.</p>
-${error ? `<p class="bad">저장하지 않았다: ${esc(error)}</p>` : ""}
+${error ? `<p class="bad">저장하지 않았다: ${esc(error)}</p>` : ""}${repo}
 <form method="post"><h2>pipeline.yaml</h2><textarea name="pipeline_yaml" rows="24">${esc(yaml)}</textarea>
 <h2>룰</h2>${Object.entries(rules).map(([k, v]) => `<h3>rules/${esc(k)}.md</h3><textarea name="rule:${esc(k)}" rows="8">${esc(v)}</textarea>`).join("")}
 <h3>룰 추가</h3><div class="row"><input name="new_rule_name" placeholder="이름 (예: implementation)"></div><textarea name="new_rule_body" rows="4"></textarea>

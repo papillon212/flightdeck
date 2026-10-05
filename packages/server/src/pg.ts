@@ -111,6 +111,10 @@ export class PgStore implements ServerStore {
     return (await this.q("select * from fd_config_versions where product=$1 order by seq desc", [product])).rows.map(version);
   }
 
+  async addAudit(actor: string, action: string, detail: unknown): Promise<void> {
+    await this.record(actor, action, detail);
+  }
+
   async audit(limit = 100): Promise<AuditEntry[]> {
     return (await this.q("select at, actor, action, detail from fd_audit order by id desc limit $1", [limit])).rows as AuditEntry[];
   }

@@ -61,8 +61,8 @@ export class EventSigner {
     if (source === BUILTIN_REPO) {
       if (!this.deps.githost) throw new RequestError(503, "내장 git 서버가 꺼져 있다");
       source = this.deps.githost.repoDir(product);
-      // 내장 레포는 서버 시작 때만 만든다(가져오기 또는 빈 레포). 여기서 만들면 설정을 바꾼 직후의 스캔이 빈 레포를 먼저 만들어 가져오기를 막는다 (M5.5 시나리오)
-      if (!existsSync(source)) throw new RequestError(503, `내장 레포가 아직 없다: ${product}. 서버를 다시 시작하면 만든다(기존 레포는 --import-repo)`);
+      // 내장 레포는 어드민이 가져오거나 만든다. 여기서 만들면 설정을 바꾼 직후의 스캔이 빈 레포를 먼저 만들어 가져오기를 막는다 (M5.5 Z8)
+      if (!existsSync(source)) throw new RequestError(503, `내장 레포가 아직 없다: ${product}. 어드민 화면(제품 → git 레포)에서 가져오거나 만드세요`);
     }
     const dir = path.join(this.deps.dataDir, "repos", `${product}.git`);
     if (!existsSync(dir)) {
