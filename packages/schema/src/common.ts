@@ -15,6 +15,8 @@ export const EpicId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/, "에픽 ID
 
 /** 쓰레드 ID: t-<ULID 앞 8자> (설계 §3.1) */
 export const ThreadId = z.string().regex(/^t-[0-9A-HJKMNP-TV-Z]{8}$/, "쓰레드 ID 형식이 아닙니다");
+/** 회의 ID (§10, M6): s-<ULID 뒤 8자> (쓰레드 ID와 같은 이유로 뒤 8자) */
+export const SessionId = z.string().regex(/^s-[0-9A-HJKMNP-TV-Z]{8}$/, "회의 ID 형식이 아닙니다");
 
 /** 문단 고정 ID: p:<16진 4자> (설계 §3.2) */
 export const ParagraphId = z.string().regex(/^p:[0-9a-f]{4}$/, "문단 ID 형식이 아닙니다");

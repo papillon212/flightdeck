@@ -18,6 +18,11 @@
       { "command": "flightdeck.login", "title": "서버 로그인", "category": "Flightdeck" },
       { "command": "flightdeck.logout", "title": "서버 로그아웃", "category": "Flightdeck" },
       { "command": "flightdeck.cloneFromServer", "title": "서버 레포 받기", "category": "Flightdeck" },
+      { "command": "flightdeck.startMeeting", "title": "회의 시작", "category": "Flightdeck" },
+      { "command": "flightdeck.joinMeeting", "title": "회의 참여", "category": "Flightdeck" },
+      { "command": "flightdeck.endMeeting", "title": "회의 종료 (주최자)", "category": "Flightdeck" },
+      { "command": "flightdeck.collectMeeting", "title": "회의 요약 초안 만들기 (회의록 다시 가져오기)", "category": "Flightdeck" },
+      { "command": "flightdeck.publishMeeting", "title": "회의 요약 게시", "category": "Flightdeck" },
       { "command": "flightdeck.watch", "title": "관찰 시작", "category": "Flightdeck" },
       { "command": "flightdeck.sendOpinion", "title": "의견 보내기", "category": "Flightdeck", "icon": "$(comment)" },
       { "command": "flightdeck.requestPilot", "title": "조종 요청", "category": "Flightdeck" },
@@ -102,7 +107,12 @@
         "flightdeck.configDir": { "type": "string", "default": "", "description": "개발 모드의 설정 폴더 (rules/, pipeline.yaml). 비우면 내장 견본. 서버 모드에서는 서버가 배포한다" },
         "flightdeck.model": { "type": "string", "default": "", "description": "에이전트 권장 모델 (비우면 Claude Code 기본값)" },
         "flightdeck.maxTurns": { "type": "number", "default": 40, "description": "자동 초안의 최대 턴 수" },
-        "flightdeck.claudePath": { "type": "string", "default": "claude", "description": "Claude Code 실행 파일" }
+        "flightdeck.claudePath": { "type": "string", "default": "claude", "description": "Claude Code 실행 파일" },
+        "flightdeck.meet": { "type": "string", "enum": ["google", "gws", "fixture"], "default": "google", "description": "회의 연동: google(OAuth 클라이언트 필요) | gws(개발 모드: gws CLI에 위임) | fixture(개발 모드: 시험용 회의 자료)" },
+        "flightdeck.googleClientId": { "type": "string", "default": "", "description": "회의 연동용 Google OAuth 데스크톱 클라이언트 ID (관리자가 배포)" },
+        "flightdeck.googleClientSecret": { "type": "string", "default": "", "description": "Google 데스크톱 클라이언트의 secret (데스크톱 앱은 공개 값)" },
+        "flightdeck.gwsPath": { "type": "string", "default": "gws", "description": "개발 모드 gws CLI 경로" },
+        "flightdeck.meetFixtureDir": { "type": "string", "default": "", "description": "개발 모드 시험용 회의 자료 폴더 (notes.md, transcript.json)" }
       }
     }
   }

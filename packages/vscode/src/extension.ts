@@ -10,6 +10,7 @@ import * as vscode from "vscode";
 import { ClaudeCodeAdapter, cleanEnv } from "@flightdeck/agent";
 import { coalesce, linesLabel, nowIso, parseBlocks, parseDrafts, PID_LINE, restoreParagraphIds, reviewOf, sha256, writerOf, type ConfigPayload, type EpicState, type Thread } from "@flightdeck/core";
 import { blameLabel } from "./blame-label.ts";
+import { collectAndOpen, FocusRecorder, meetAdapter, openSession } from "./meeting-ui.ts";
 import { adoptedButNotOpened, ChatTree, handleOpinion, liveFolderEpic, OpinionTree, sendOpinion, startLiveWindow, startPilotWindow, type LiveWindow, type OpinionMsg, type PilotWindow } from "./live-ui.ts";
 import { git, RemoteEventStore } from "@flightdeck/git";
 import { appendEditRecords, readEditLog, readState } from "@flightdeck/hook";
@@ -488,6 +489,20 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
   let liveWin: LiveWindow | null = null;
   let pilotWin: PilotWindow | null = null;
   let opinionsSent = 0;
+  /** 회의 (M6): 포커스 기록, 알린 회의 */
+  let focus: FocusRecorder | null = null;
+  const sessionNotified = new Set<string>();
+  /** 회의: 시작 알림·포커스·게시된 요약 커밋 (§10.1) */
+  const onSessions = async (s: EpicState) => {
+    if (!ctx?.epic) return;
+    await focus?.update(s).catch((e) => out.appendLine(`[회의] ${(e as Error).message}`));
+    const open = openSession(s);
+    if (open && !sessionNotified.has(open.sid) && open.host !== ctx.wf.cfg.member) {
+      sessionNotified.add(open.sid);
+      void notify(`Flightdeck: @${open.host}이(가) 회의를 시작했습니다 — ${open.title}`, "참여").then((p) => (p && open.space ? vscode.env.openExternal(vscode.Uri.parse(open.space.uri)) : undefined));
+    }
+    if (ctx.role === "owner") await ctx.wf.commitSessionSummaries(ctx.epic).catch((e) => out.appendLine(`[회의] 요약 커밋: ${(e as Error).message}`));
+  };
   /** 구현 단계 상태 표시 (Step·설명 필요 수). 저장하지 않은 편집이 있으면 계산하지 않고 직전 값을 쓴다 */
   let implLabel = "";
   /** 저장하고 사람 편집 기록을 비운다. 그래야 편집 기록 재적용 = 디스크 비교(외부 변경 감지)가 맞다 */
@@ -530,7 +545,8 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       // 관찰자 창: 작업 폴더 상태·렌더링 없이 메타 상태와 실시간 상태만 (M8)
       await ctx.wf.pull().catch(() => undefined);
       const ls = await ctx.wf.epicState(ctx.epic);
-      status.text = `$(eye) Flightdeck · ${ctx.epic} · ${ls.phase} · ${liveWin?.status() ?? "관찰 준비 중"}${opinionsSent ? ` · 보낸 의견 ${opinionsSent}` : ""}`;
+      await onSessions(ls);
+      status.text = `$(eye) Flightdeck · ${ctx.epic} · ${ls.phase} · ${liveWin?.status() ?? "관찰 준비 중"}${opinionsSent ? ` · 보낸 의견 ${opinionsSent}` : ""}${openSession(ls) ? " · 회의 중" : ""}`;
       status.tooltip = "관찰자 창 (읽기 전용): 의견 보내기·조종 요청";
       status.command = "flightdeck.menu";
       status.show();
@@ -538,6 +554,7 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     }
     const s = await ctx.wf.sync(ctx.epic);
     flushWarnings();
+    await onSessions(s);
     for (const r of ctx.wf.lastRender.filter((x) => x.external)) {
       if (ctx.role !== "owner") {
         // §6.2 v0.13: 읽기 전용 창에서는 쓰레드 초안 밖의 변경을 되돌린다
@@ -584,7 +601,7 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     } else if (s.phase !== "IMPLEMENTATION") implLabel = "";
     // 조종수 모델 (M8): 내가 조종수가 아니면 표시, 조종수 창은 받은 의견 수
     const pilot = writerOf(s);
-    const pilotLabel = pilot && pilot !== me && ctx.role === "owner" ? ` · 조종수 @${pilot} (관찰자)` : pilotWin?.opinions.pending ? ` · 의견 ${pilotWin.opinions.pending}` : "";
+    const pilotLabel = (pilot && pilot !== me && ctx.role === "owner" ? ` · 조종수 @${pilot} (관찰자)` : pilotWin?.opinions.pending ? ` · 의견 ${pilotWin.opinions.pending}` : "") + (openSession(s) ? " · 회의 중" : "");
     status.text = `$(rocket) Flightdeck · ${ctx.epic} · ${s.phase}${tier}${implLabel}${landing}${ro}${pilotLabel}${myTurn ? " · 내 리뷰 차례" : ""}${open ? ` · 열린 쓰레드 ${open}` : ""}${drafts ? ` · 초안 ${drafts}` : ""}${ctx.offline ? " · 서버 연결 안 됨" : ""}${s.config_mismatch ? " · ⚠ 설정 불일치" : ""}`;
     status.tooltip = s.config_mismatch
       ? `설정 불일치 (M5.5 Z9): 이 에픽은 ${s.config_mismatch.version}로 시작했는데 서버의 ${s.config_mismatch.version} 내용이 다릅니다. 단계 통과를 판정하지 않습니다. 관리자에게 원래 설정 복구를 요청하세요`
@@ -764,6 +781,8 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
   if (ctx?.epic && ctx.worktree) {
     view = new ThreadView(ctx);
     ext.subscriptions.push(view);
+    focus = new FocusRecorder(ctx.wf, ctx.epic, ctx.worktree, out);
+    ext.subscriptions.push(focus);
     // 읽기 전용 창은 편집 기록을 남기지 않는다 (§2.4)
     if (ctx.role === "owner") {
       human = new HumanEdits(ctx, await ctx.wf.eng.dataDir(), ctx.wf.cfg.member, refresh);
@@ -1115,6 +1134,59 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       const me = await new ServerClient(url, token, "").me();
       const pick = await vscode.window.showInformationMessage(`Flightdeck: @${me.id}(으)로 로그인했습니다. 창을 다시 불러옵니다.`, "다시 불러오기");
       if (pick) await vscode.commands.executeCommand("workbench.action.reloadWindow");
+    }),
+
+    // ---- 회의 (§10, M6) ----
+    run("flightdeck.startMeeting", async () => {
+      if (!ctx?.epic) throw new Error("에픽 창에서 회의를 시작합니다");
+      const s = await ctx.wf.epicState(ctx.epic);
+      if (openSession(s)) throw new Error("이미 진행 중인 회의가 있습니다 (Flightdeck: 회의 참여)");
+      const title = await vscode.window.showInputBox({ title: "회의 제목", value: `${ctx.epic} 논의`, ignoreFocusOut: true });
+      if (!title) return;
+      const r = await ctx.wf.startSession(ctx.epic, title, await meetAdapter(ext));
+      sessionNotified.add(r.sid);
+      if (r.space.artifacts && (r.space.artifacts.notes !== "ON" || r.space.artifacts.transcript !== "ON")) {
+        void vscode.window.showWarningMessage(`Flightdeck: 회의록·전사 자동 생성이 켜지지 않았습니다 (회의록 ${r.space.artifacts.notes}, 전사 ${r.space.artifacts.transcript}). 회의에서 직접 켜 주세요`);
+      }
+      void notify(`Flightdeck: 회의 ${r.sid} 시작 — ${r.space.uri}`, "참여").then((p) => (p ? vscode.env.openExternal(vscode.Uri.parse(r.space.uri)) : undefined));
+      await refresh();
+    }),
+    run("flightdeck.joinMeeting", async () => {
+      if (!ctx?.epic) throw new Error("에픽 창에서");
+      const open = openSession(await ctx.wf.epicState(ctx.epic));
+      if (!open?.space) throw new Error("진행 중인 회의가 없습니다");
+      await vscode.env.openExternal(vscode.Uri.parse(open.space.uri));
+    }),
+    run("flightdeck.endMeeting", async () => {
+      if (!ctx?.epic) throw new Error("에픽 창에서");
+      const open = openSession(await ctx.wf.epicState(ctx.epic));
+      if (!open) throw new Error("진행 중인 회의가 없습니다");
+      if (open.host !== ctx.wf.cfg.member) throw new Error(`주최자(@${open.host})가 끝냅니다`);
+      await ctx.wf.endSession(ctx.epic, open.sid);
+      await refresh(); // 내 포커스를 올린다
+      await collectAndOpen(ext, ctx.wf, ctx.epic, open.sid, out);
+      void notify(`Flightdeck: 회의 ${open.sid} 요약 초안을 열었습니다. 검토한 뒤 "회의 요약 게시"를 실행하세요`);
+    }),
+    // 회의록을 기다리는 동안 창을 닫았거나 다시 만들고 싶을 때 (G6)
+    run("flightdeck.collectMeeting", async (sidArg?: string) => {
+      if (!ctx?.epic) throw new Error("에픽 창에서");
+      const s = await ctx.wf.epicState(ctx.epic);
+      const mine = [...s.sessions.values()].filter((x) => x.host === ctx.wf.cfg.member && x.ended_at && !x.published);
+      const sid = sidArg ?? (mine.length === 1 ? mine[0]!.sid : await vscode.window.showQuickPick(mine.map((x) => x.sid), { title: "요약을 만들 회의" }));
+      if (!sid) return;
+      await collectAndOpen(ext, ctx.wf, ctx.epic, sid, out);
+    }),
+    run("flightdeck.publishMeeting", async (sidArg?: string) => {
+      if (!ctx?.epic) throw new Error("에픽 창에서");
+      const s = await ctx.wf.epicState(ctx.epic);
+      const mine = [...s.sessions.values()].filter((x) => x.host === ctx.wf.cfg.member && x.ended_at && !x.published);
+      const sid = sidArg ?? (mine.length === 1 ? mine[0]!.sid : await vscode.window.showQuickPick(mine.map((x) => x.sid), { title: "게시할 회의" }));
+      if (!sid) return;
+      await vscode.workspace.saveAll(false);
+      const r = await ctx.wf.publishSession(ctx.epic, sid);
+      flushWarnings();
+      void notify(`Flightdeck: 회의 ${sid} 요약을 게시했습니다 (쓰레드 답글 ${r.replies}, 새 쓰레드 ${r.created}, 에픽 전체 ${r.epicItems})`);
+      await refresh();
     }),
 
     // ---- 조종수 모델 (§8.2~8.5, M8) ----

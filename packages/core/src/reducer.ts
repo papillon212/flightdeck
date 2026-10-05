@@ -84,6 +84,21 @@ export interface EpicState {
   landed: { main_commit: string; event: string; at: string } | null;
   /** VERIFICATION을 통과시킨 승인 이벤트 ID (squash trailer Flightdeck-Approvals) */
   verifiedApprovals: string[];
+  /** 회의 (§10, M6) */
+  sessions: Map<string, Session>;
+}
+
+export interface Session {
+  sid: string;
+  /** 주최자 = 회의 시작자 = 게시 담당 (§10.3) */
+  host: string;
+  title: string;
+  started_at: string;
+  ended_at?: string;
+  space?: { name: string; uri: string; code?: string };
+  /** 멤버별 포커스 (회의가 끝나면 한 번씩) */
+  focus: { member: string; entries: { ts: string; file: string; range: [number, number] }[] }[];
+  published?: { at: string; items: number; summary: string; notes_url?: string; event: string };
 }
 
 export interface ReduceOptions {
@@ -114,6 +129,7 @@ export function initialState(epic: string): EpicState {
     landing: null,
     landed: null,
     verifiedApprovals: [],
+    sessions: new Map(),
   };
 }
 
@@ -212,8 +228,10 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
       const d = e.data;
       if (s.threads.has(d.thread)) return ignore("이미 있는 쓰레드 ID");
       if (d.patch && d.kind !== "change_request") return ignore("수정 제안은 수정 요청 쓰레드에만 붙인다");
-      // 생성 권한 (§3.4): 해당 단계 담당자·조종수 / 현재 티어 리뷰어 (리뷰 요청 이후)
-      if (e.author !== s.owner && e.author !== s.pilot) {
+      // 생성 권한 (§3.4): 해당 단계 담당자·조종수 / 현재 티어 리뷰어 (리뷰 요청 이후) / 회의 요약을 게시하는 주최자 (§10.1 ⑧, M6 G4)
+      const bySession = d.source === "session" && !!d.sid && s.sessions.get(d.sid)?.host === e.author;
+      if (d.source === "session" && !bySession) return ignore("회의 주최자만 회의 요약을 게시할 수 있음");
+      if (!bySession && e.author !== s.owner && e.author !== s.pilot) {
         const cur = s.review.requested ? reviewOf(s)?.current : null;
         if (!cur?.reviewers.includes(e.author)) return ignore("쓰레드 생성 권한 없음");
       }
@@ -238,8 +256,11 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
     case "thread.replied": {
       const t = s.threads.get(e.data.thread);
       if (!t) return ignore("없는 쓰레드");
-      // 답글 권한 (§3.4): 쓰레드 참여자 + 멘션 대상. 담당자의 에이전트 답글은 담당자 이름으로 온다
-      if (!threadMembers(t, s).has(e.author)) return ignore("답글 권한 없음");
+      // 답글 권한 (§3.4): 쓰레드 참여자 + 멘션 대상. 담당자의 에이전트 답글은 담당자 이름으로 온다.
+      // 회의 요약(source=session)은 그 회의의 주최자가 단다 (§10.1 ⑧, M6 G4)
+      if (e.data.source === "session") {
+        if (!e.data.sid || s.sessions.get(e.data.sid)?.host !== e.author) return ignore("회의 주최자만 회의 요약을 게시할 수 있음");
+      } else if (!threadMembers(t, s).has(e.author)) return ignore("답글 권한 없음");
       t.replies.push({ id: e.id, author: e.author, at: e.at, body: e.data.body, source: e.data.source, ...(e.data.patch ? { patch: e.data.patch } : {}) });
       return;
     }
@@ -359,6 +380,37 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
       const ok = (e.data.from === "DESIGN" && e.data.to === "ANALYSIS") || (e.data.from === "VERIFICATION" && e.data.to === "IMPLEMENTATION");
       if (!ok) return ignore("허용하지 않는 되돌림");
       move(e.data.to);
+      return;
+    }
+
+    // ---- 회의 (§10.1, M6) ----
+    case "session.started": {
+      if (s.sessions.has(e.data.sid)) return ignore("이미 있는 회의");
+      s.sessions.set(e.data.sid, { sid: e.data.sid, host: e.author, title: e.data.title, started_at: e.at, ...(e.data.space ? { space: e.data.space } : {}), focus: [] });
+      return;
+    }
+    case "session.ended": {
+      const ss = s.sessions.get(e.data.sid);
+      if (!ss) return ignore("없는 회의");
+      if (ss.host !== e.author) return ignore("주최자만 회의를 끝낼 수 있음");
+      if (ss.ended_at) return ignore("이미 끝난 회의");
+      ss.ended_at = e.at;
+      return;
+    }
+    case "session.focus": {
+      const ss = s.sessions.get(e.data.sid);
+      if (!ss) return ignore("없는 회의");
+      if (ss.focus.some((f) => f.member === e.author)) return ignore("이미 올린 포커스");
+      ss.focus.push({ member: e.author, entries: e.data.entries });
+      return;
+    }
+    case "session.published": {
+      const ss = s.sessions.get(e.data.sid);
+      if (!ss) return ignore("없는 회의");
+      if (ss.host !== e.author) return ignore("주최자만 회의 요약을 게시할 수 있음");
+      if (!ss.ended_at) return ignore("끝나지 않은 회의");
+      if (ss.published) return ignore("이미 게시한 회의");
+      ss.published = { at: e.at, items: e.data.items, summary: e.data.summary, ...(e.data.notes_url ? { notes_url: e.data.notes_url } : {}), event: e.id };
       return;
     }
 

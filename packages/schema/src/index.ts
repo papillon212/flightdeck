@@ -5,3 +5,4 @@ export * from "./pipeline.ts";
 export * from "./artifacts.ts";
 export * from "./editlog.ts";
 export * from "./local.ts";
+export * from "./session.ts";

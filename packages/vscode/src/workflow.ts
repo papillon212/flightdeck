@@ -5,13 +5,14 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
-import { applyTextEdit, artifactHash, auditMain, blame, checkSections, configHash, moveLines, writerOf, type BlameEntry, configVersionOf, diffRecords, diffToEdits, draftText, ensureParagraphIds, insertDrafts, linesLabel, mapLines, myOpenThreads, type AuditFinding, type MainCommit, needsServerSignature, nowIso, parseDrafts, parseImplLog, pipelineFromDir, reduce, removeDrafts, renderThreads, replay, restoreParagraphIds, reviewOf, sha256, stripThreads, threadIdFrom, trustFromConfig, ulid, type ConfigPayload, type CoverageReport, type Draft, type EpicState, type MemoGroup, type Thread } from "@flightdeck/core";
+import { anchoringPrompt, applyTextEdit, artifactHash, auditMain, blame, checkSections, configHash, moveLines, parseAnchoring, parseSessionDraft, renderSessionDraft, renderSessionSummary, sessionReplyText, writerOf, type BlameEntry, type SessionItem, configVersionOf, diffRecords, diffToEdits, draftText, ensureParagraphIds, insertDrafts, linesLabel, mapLines, myOpenThreads, type AuditFinding, type MainCommit, needsServerSignature, nowIso, parseDrafts, parseImplLog, pipelineFromDir, reduce, removeDrafts, renderThreads, replay, restoreParagraphIds, reviewOf, sha256, stripThreads, threadIdFrom, trustFromConfig, ulid, type ConfigPayload, type CoverageReport, type Draft, type EpicState, type MemoGroup, type Thread } from "@flightdeck/core";
 import { git, gitBuffer, GitEngine, LocalEventStore, MetaRewriteError, RAW_ARGS, RAW_ENV, RemoteEventStore, RunStore, seqTrailer } from "@flightdeck/git";
 import { DEV_TRUST, HANDOFF_SECTIONS, parsePipeline, PHASE_ARTIFACT, type Anchor, type EditMemo, type EditRecord, type EditSource, type Event, type EventOf, type EventType, type LocalEpicStateInput, type Phase, type Pipeline, type Trust } from "@flightdeck/schema";
 import type { AgentAdapter } from "@flightdeck/agent";
 import type { TrackerAdapter, TrackerEpic } from "@flightdeck/tracker";
 import { appendEditRecords, appendMemo, baseContent, checkImplLogFile, computeCoverage, implLogRel, lastSeq, readEditLog, readMemos, readState, recordDrift, renderMemos, queueOpinion, replaceEditLog, statePath, toolInProgress, writeState, type ImplContext, type Opinion } from "@flightdeck/hook";
 import { applyRecords } from "./live.ts";
+import { waitForNotes, type CollectedNotes, type MeetAdapter, type MeetSpace } from "./meet.ts";
 import { cacheConfig, configCacheDir, loadCachedConfig, ServerRequestError, type ServerClient } from "./server-client.ts";
 
 /** 서버 모드 (M2 원격 협업). 없으면 개발 모드: 로컬 설정 폴더, 로컬 메타 브랜치, 서명 없음 */
@@ -488,6 +489,117 @@ export class EpicWorkflow {
     await this.eng.pushCheckpoint(epic, this.cfg.member, this.gitRemote);
     await this.syncEditlog(epic).catch(() => undefined);
     return sha;
+  }
+
+  // ---- 회의 (§10, M6) ----
+
+  /** 회의 시작 (§10.1 ①②): Meet 공간을 만들고(회의록·전사 자동 생성 요청) session.started */
+  async startSession(epic: string, title: string, meet: MeetAdapter): Promise<{ sid: string; space: MeetSpace }> {
+    const space = await meet.createSpace();
+    const sid = `s-${ulid().slice(-8)}`;
+    await this.emit(epic, "session.started", { sid, title, space: { name: space.name, uri: space.uri, ...(space.code ? { code: space.code } : {}) }, ...(space.artifacts ? { artifacts: space.artifacts } : {}) });
+    await this.sync(epic);
+    return { sid, space };
+  }
+
+  async endSession(epic: string, sid: string): Promise<void> {
+    await this.emit(epic, "session.ended", { sid });
+    await this.sync(epic);
+  }
+
+  /** 회의 중 내 포커스 (§10.1 ③, G1): 회의가 끝나면 한 번 올린다 */
+  async postFocus(epic: string, sid: string, entries: { ts: string; file: string; range: [number, number] }[]): Promise<void> {
+    await this.emit(epic, "session.focus", { sid, entries: entries.slice(-1000) });
+  }
+
+  /** 회의 초안 위치: <git 공용 폴더>/flightdeck/sessions/<sid>.md (주최자만 보는 검토 문서, G3) */
+  async sessionDraftPath(sid: string): Promise<string> {
+    return path.join(await this.eng.dataDir(), "sessions", `${sid}.md`);
+  }
+
+  /**
+   * 회의 요약 초안 (§10.1 ⑤⑥, G3·G6): 회의록을 기다려 가져오고, 주최자의 에이전트로 쓰레드·코드 위치·에픽에 앵커링해 검토 초안을 쓴다.
+   * 회의록이 없으면(꺼짐·30분 초과) 포커스와 전사만으로
+   */
+  async collectSession(epic: string, sid: string, meet: MeetAdapter, opts: { intervalMs?: number; timeoutMs?: number; onWait?: (m: string) => void; model?: string } = {}): Promise<{ draft: string; items: SessionItem[]; notes: CollectedNotes }> {
+    await this.pull();
+    const s = await this.epicState(epic);
+    const ss = s.sessions.get(sid);
+    if (!ss) throw new Error(`없는 회의: ${sid}`);
+    if (ss.host !== this.cfg.member) throw new Error(`주최자(@${ss.host})만 회의 요약을 만든다`);
+    if (!ss.ended_at) throw new Error("회의가 아직 끝나지 않았습니다");
+    const notes = await waitForNotes(meet, ss.space?.name ?? "", opts);
+    const threads = [...s.threads.values()].map((t) => ({
+      id: t.id,
+      file: t.file,
+      where: t.anchor.type === "paragraph" ? t.anchor.pid : t.anchor.type === "code" ? `${t.anchor.file}:${t.anchor.range[0]}-${t.anchor.range[1]}` : "",
+      status: t.status,
+      body: t.body,
+      ...(t.replies.at(-1) ? { last: t.replies.at(-1)!.body } : {}),
+    }));
+    const focus = ss.focus.flatMap((f) => f.entries.map((x) => ({ member: f.member, ...x })));
+    const prompt = anchoringPrompt({ epic, title: ss.title, notes: notes.notes, transcript: notes.transcript, focus, threads });
+    if (!this.cfg.adapter.headless) throw new Error(`${this.cfg.adapter.id}는 headless 실행을 지원하지 않습니다`);
+    const cwd = existsSync(statePath(await this.eng.dataDir(), epic)) ? await this.worktree(epic) : this.cfg.repo;
+    const r = await this.cfg.adapter.headless(prompt, { cwd, ...(opts.model ?? this.cfg.model ? { model: opts.model ?? this.cfg.model } : {}), maxTurns: 3, allowedTools: [] });
+    const items = parseAnchoring(r.result, new Set(threads.map((t) => t.id)));
+    const notesUrl = notes.notesDoc && !notes.notesDoc.startsWith("fixture") ? `https://docs.google.com/document/d/${notes.notesDoc}` : undefined;
+    const draft = await this.sessionDraftPath(sid);
+    await mkdir(path.dirname(draft), { recursive: true });
+    await writeFile(draft, renderSessionDraft(sid, ss.title, items, notesUrl));
+    return { draft, items, notes };
+  }
+
+  /** 게시 (§10.1 ⑧, G4): 검토 초안을 읽어 쓰레드 답글·새 코드 쓰레드·session.published(sessions/<sid>.md 내용) */
+  async publishSession(epic: string, sid: string): Promise<{ replies: number; created: number; epicItems: number }> {
+    const s = await this.epicState(epic);
+    const ss = s.sessions.get(sid);
+    if (!ss) throw new Error(`없는 회의: ${sid}`);
+    const md = await readFile(await this.sessionDraftPath(sid), "utf8");
+    const { items, problems } = parseSessionDraft(md);
+    if (problems.length) throw new Error(`초안 문제: ${problems.join("; ")}`);
+    const notesUrl = /^회의록: (\S+)$/m.exec(md)?.[1];
+    let replies = 0;
+    let created = 0;
+    for (const i of items) {
+      if ("thread" in i.target) {
+        await this.emit(epic, "thread.replied", { thread: i.target.thread, body: sessionReplyText(i), source: "session", sid });
+        replies++;
+      } else if ("file" in i.target) {
+        await this.createCodeThread(epic, { file: i.target.file, range: i.target.lines, kind: "note", to: [], body: `🎙 회의 ${sid}\n${sessionReplyText(i)}`, session: sid });
+        created++;
+      }
+    }
+    const summary = renderSessionSummary({ sid, title: ss.title, host: ss.host, started_at: ss.started_at, ...(ss.ended_at ? { ended_at: ss.ended_at } : {}), ...(notesUrl ? { notesUrl } : {}), items });
+    await this.emit(epic, "session.published", { sid, items: items.length, summary, ...(notesUrl ? { notes_url: notesUrl } : {}) });
+    await this.sync(epic);
+    await this.commitSessionSummaries(epic).catch((e) => this.warnings.push(`회의 요약 파일을 커밋하지 못했다: ${e instanceof Error ? e.message : e}`));
+    return { replies, created, epicItems: items.filter((i) => "epic" in i.target).length };
+  }
+
+  /** 게시된 회의의 sessions/<sid>.md를 에픽 브랜치에 커밋한다 (G4: 조종수의 작업 폴더에서만). 커밋한 파일 */
+  async commitSessionSummaries(epic: string): Promise<string[]> {
+    const dataDir = await this.eng.dataDir();
+    if (!existsSync(statePath(dataDir, epic)) || (await this.role(epic)) !== "owner") return [];
+    const s = await this.epicState(epic);
+    if (writerOf(s) !== this.cfg.member) return [];
+    const wt = await this.worktree(epic);
+    const done: string[] = [];
+    for (const ss of s.sessions.values()) {
+      if (!ss.published) continue;
+      const rel = `.flightdeck/epics/${epic}/sessions/${ss.sid}.md`;
+      if (existsSync(path.join(wt, rel))) continue;
+      await mkdir(path.dirname(path.join(wt, rel)), { recursive: true });
+      await writeFile(path.join(wt, rel), ss.published.summary);
+      // Flightdeck 렌더링으로 기록해 coverage가 설명을 요구하지 않게 한다
+      await appendEditRecords(dataDir, epic, diffRecords(epic, rel, null, ss.published.summary, { kind: "flightdeck", member: this.cfg.member, reason: "thread_render" }, nowIso()));
+      done.push(rel);
+    }
+    if (done.length) {
+      await this.eng.commit(wt, done, `${epic}: 회의 요약 ${done.length}건`, { "Flightdeck-Epic": epic });
+      if (this.cfg.remote) await this.eng.pushEpicBranch(epic, this.gitRemote);
+    }
+    return done;
   }
 
   /** 조종수가 고른 관찰자 의견을 에이전트 전달 대기열에 넣는다 (§8.4, L7) */
@@ -1085,7 +1197,7 @@ export class EpicWorkflow {
   }
 
   /** 코드 쓰레드 (§3.3, Y2): 앵커 = 리뷰 커밋(또는 담당자 작업 폴더의 HEAD) 기준 줄 범위와 앞뒤 3줄 */
-  async createCodeThread(epic: string, t: { file: string; range: [number, number]; kind: "question" | "change_request" | "note"; to: string[]; body: string; patch?: string }): Promise<string> {
+  async createCodeThread(epic: string, t: { file: string; range: [number, number]; kind: "question" | "change_request" | "note"; to: string[]; body: string; patch?: string; session?: string }): Promise<string> {
     const s = await this.epicState(epic);
     const wt = await this.worktree(epic);
     const role = await this.role(epic);
@@ -1097,13 +1209,12 @@ export class EpicWorkflow {
     const id = ulid();
     const thread = threadIdFrom(id);
     const anchor: Anchor = { type: "code", file: t.file, rev, range: [a, Math.max(a, b)], context };
-    await this.emit(epic, "thread.created", { thread, phase: s.phase, file: t.file, anchor, kind: t.kind, to: t.to, body: t.body, commit: rev, ...(t.patch ? { patch: t.patch } : {}) }, this.cfg.member, id);
+    await this.emit(epic, "thread.created", { thread, phase: s.phase, file: t.file, anchor, kind: t.kind, to: t.to, body: t.body, commit: rev, ...(t.patch ? { patch: t.patch } : {}), ...(t.session ? { source: "session" as const, sid: t.session } : {}) }, this.cfg.member, id);
     await this.sync(epic);
     await this.mention(epic, t.to, `${t.kind === "change_request" ? (t.patch ? "수정 제안" : "수정 요청") : t.kind === "question" ? "질문" : "메모"} 1건 · ${t.file}`, thread);
     return thread;
   }
 
-  /** 코드 쓰레드의 지금 위치 (Y2): 앵커 커밋 → 이 창의 작업 트리 diff로 줄을 옮긴다 */
   /**
    * 코드 쓰레드의 지금 위치 (§3.5). 담당자 작업 폴더에서는 편집 기록으로 옮긴다(M7 E5): rev 커밋의 Flightdeck-Seq 뒤 편집을 따라가므로
    * 그 줄 자체가 고쳐져도 위치를 잃지 않는다. 편집 기록으로 따라갈 수 없으면(rev에 위치가 없거나 기록이 이어지지 않음) diff 줄 매핑(M5)

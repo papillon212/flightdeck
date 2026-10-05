@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { Anchor } from "./anchor.ts";
-import { EpicId, GitSha, MemberId, Phase, Sha256, ThreadId, Timestamp, Ulid } from "./common.ts";
+import { EpicId, GitSha, MemberId, Phase, SessionId, Sha256, ThreadId, Timestamp, Ulid } from "./common.ts";
 
 /** 구현 관문 명령의 실행 결과 (§7.5). 전체 로그는 세션 원본 ref에 두고 해시만 남긴다 */
 export const GateCommands = z.array(z.object({ cmd: z.string().min(1), exit: z.number().int(), summary: z.string(), log_hash: Sha256 }));
@@ -30,16 +30,20 @@ const data = {
     body: z.string().min(1),
     /** 문서 공유 커밋: 질문 대상이 이 커밋으로 문서를 본다 (§3.1, §2.4) */
     commit: GitSha.optional(),
-    /** 에이전트가 쓴 쓰레드 초안을 사람이 올렸으면 agent (§3.2) */
-    source: z.enum(["human", "agent"]).optional(),
+    /** 에이전트가 쓴 쓰레드 초안을 사람이 올렸으면 agent (§3.2), 회의 요약을 주최자가 게시했으면 session (§10.1 ⑧) */
+    source: z.enum(["human", "agent", "session"]).optional(),
     /** 수정 제안 (M5 제안 Y3): 리뷰 사본의 diff. change_request에만 */
     patch: Patch.optional(),
+    /** source=session: 어느 회의의 요약인가 (M6 G4) */
+    sid: SessionId.optional(),
   }),
   "thread.replied": z.object({
     thread: ThreadId,
     body: z.string().min(1),
     source: z.enum(["human", "agent", "session"]),
     patch: Patch.optional(), // 수정 제안 (§9.3)
+    /** source=session: 어느 회의의 요약인가 (M6 G4) */
+    sid: SessionId.optional(),
   }),
   "thread.resolved": z.object({ thread: ThreadId }),
   "thread.reopened": z.object({ thread: ThreadId }),
@@ -83,9 +87,29 @@ const data = {
    * | invalid(재검증 실패 → IMPLEMENTATION). rebased_sha는 needs_report에만
    */
   "land.rejected": z.object({ reason: z.string().min(1), rebased_sha: GitSha.optional(), details: z.unknown().optional() }),
-  "session.started": z.looseObject({ sid: z.string().min(1) }),
-  "session.ended": z.looseObject({ sid: z.string().min(1) }),
-  "session.published": z.looseObject({ sid: z.string().min(1) }),
+  // 회의 (§10, M6). sid = s-<ULID 뒤 8자>
+  "session.started": z.object({
+    sid: SessionId,
+    title: z.string().min(1).max(200),
+    /** Meet 공간 (§10.1 ①) */
+    space: z.object({ name: z.string().min(1), uri: z.string().min(1), code: z.string().optional() }).optional(),
+    /** 만들 때 요청한 회의록·전사 자동 생성 (M6 G2): ON | OFF | 알 수 없음 */
+    artifacts: z.object({ notes: z.string(), transcript: z.string() }).optional(),
+  }),
+  "session.ended": z.object({ sid: SessionId }),
+  /** 회의 중 내 포커스 (§10.1 ③, M6 G1): 회의가 끝나면 멤버마다 한 번 */
+  "session.focus": z.object({
+    sid: SessionId,
+    entries: z.array(z.object({ ts: Timestamp, file: z.string().min(1), range: z.tuple([z.number().int().positive(), z.number().int().positive()]) })).max(1000),
+  }),
+  "session.published": z.object({
+    sid: SessionId,
+    items: z.number().int().nonnegative(),
+    /** 회의록 문서 링크 (있으면) */
+    notes_url: z.string().optional(),
+    /** sessions/<sid>.md 내용: 조종수 확장이 에픽 브랜치에 커밋한다 (M6 G4) */
+    summary: z.string().max(65536),
+  }),
 } as const;
 
 export type EventType = keyof typeof data;
