@@ -1,4 +1,4 @@
-# Flightdeck — 설계 문서 v0.14
+# Flightdeck — 설계 문서 v0.15
 
 > 코딩 에이전트 시대의 원격 페어 프로그래밍 워크플로우 도구
 > 작성일: 2026-10-01 · 상태: 초안(Draft)
@@ -73,6 +73,13 @@
 >   - 테스트 결과 보고(`gate.reported`)를 M4로 당겼다. `phase.completed(IMPLEMENTATION)`에 검사한 커밋을 적고, 같은 커밋의 통과 보고가 있어야 한다(§3.1, §4.1, §7.5).
 >   - 복원도 편집 기록에 남기고 출처를 되살린다. 복원은 제품 코드만 되돌린다(§8.1, §8.6).
 >   - 훅은 ref를 백그라운드로 올리고, 세션 원본은 턴마다 저장한다. 비밀값은 이름이 비밀 같은 환경변수·토큰 패턴·`.env` 값만 가린다(§6.4, §8.1). 실패한 도구 호출 훅(`PostToolUseFailure`)도 등록한다(§6.1).
+> - **v0.15** (M5 구현·완료 확인 반영, 근거: [m5-plan.md](m5-plan.md) Y1~Y9)
+>   - 검증 리뷰도 서버 서명 `review.requested`로 시작한다. **같은 커밋의 통과 테스트 보고**가 있어야 요청할 수 있다. 구현 완료 직후 첫 요청을 내고, 수정 제안을 반영한 뒤의 "다시 요청"은 관문 검사 → 커밋 → 테스트 → 보고 → 요청 순서다(§4.1, §4.2).
+>   - 검증 리뷰어의 창 자체가 **쓰기 가능한 리뷰 사본**이다. 수정 제안은 사본의 diff를 `change_request` 쓰레드(만들 때 또는 답글)에 패치로 붙인다. 반영은 패치 적용이고 편집 출처는 `patch`다(§2.4, §3.1, §9.3).
+>   - 코드 쓰레드 위치는 M7 전까지 리뷰 커밋 기준 **diff 줄 매핑**으로 계산한다(§3.3, §3.5).
+>   - 반영 작업은 **서버가 마지막 승인에 서명할 때 바로 건다.** `land.requested`를 없앴다(§11.1).
+>   - main이 움직였으면 rebase 대신 **main을 에픽 브랜치에 병합한 커밋**을 서버가 올린다. 담당자 확장이 자동으로 테스트를 다시 보고하면 서버가 다시 반영한다(§11.3).
+>   - squash에는 `keep` 목록의 기록만 남기고, 코드 쓰레드 기록은 서버가 만든다. main 감사는 가장 오래된 에픽의 base부터 보고, 예외 목록을 둔다(§5, §11.3, §11.4).
 
 ---
 
@@ -133,7 +140,7 @@
 │ flightdeck-server                              │◄── 확장: REST + WebSocket (Google 로그인)
 │  ① 설정·서명: 어드민 화면(파이프라인·멤버),      │◄── 관리자: 어드민 웹
 │     설정 배포, 단계 통과 이벤트 검증·서명         │
-│  ② 반영: 검증 → rebase → main push             │
+│  ② 반영: 검증 → squash → main push             │
 │  ③ 편집 기록: 편집 순서열 저장, 출처·위치 조회     │
 │  ④ 실시간 중계: 조종수 → 관찰자 (대화·편집 스트림), │
 │     관찰자 → 조종수 (의견), 조종 넘기기            │
@@ -220,7 +227,7 @@ interface TrackerAdapter {
 |---|---|
 | `main` | 서버(반영 모듈)만 |
 | `flightdeck-meta` | fast-forward만. 새 커밋은 `epics/<epic>/events/`에 **파일 추가만** 한다(수정·삭제 거부). 일반 이벤트의 `author`와 파일 이름의 멤버가 push한 멤버와 같아야 한다. 서버 서명 이벤트는 서버만 추가한다 |
-| `flightdeck/<epic>` | 그 에픽의 담당자·현재 조종수, 서버(반영 시 rebase) |
+| `flightdeck/<epic>` | 그 에픽의 담당자·현재 조종수(fast-forward만), 서버(main 병합 커밋, 반영 후 삭제) |
 | `refs/flightdeck/ckpt/<epic>/<member>` | 그 멤버만 |
 | `refs/flightdeck/runs/<epic>` | 그 에픽의 실행자, 서버(정리) |
 | 그 밖의 ref | 거부 |
@@ -280,8 +287,7 @@ flightdeck-meta/
 
 | 경로 | 용도 |
 |---|---|
-| `../<repo>.flightdeck/<epic-id>` | 에픽 작업 폴더 (담당자). 질문 받은 사람은 에픽 브랜치를 **읽기 전용**으로 연다. 쓰레드 블록 렌더링은 그 사람의 편집 기록에 남기지 않는다 |
-| `../<repo>.flightdeck/<epic-id>#review-<member>` | 리뷰 전용 사본 (§9.3) |
+| `../<repo>.flightdeck/<epic-id>` | 에픽 작업 폴더 (담당자). 질문 받은 사람과 설계 리뷰어는 에픽 브랜치를 **읽기 전용**으로 연다. 검증 리뷰어에게는 같은 경로가 리뷰 요청 커밋의 **쓰기 가능한 리뷰 사본**이다(§9.3). 쓰레드 블록 렌더링과 리뷰 사본의 편집은 편집 기록에 남기지 않는다 |
 | `../<repo>.flightdeck/<epic-id>@live` | 관찰자용 읽기 전용 창. 조종수의 편집 스트림이 실시간 적용됨 (§8.3) |
 | `../<repo>.flightdeck/<epic-id>#ask` | 조종수의 개인 질문용 읽기 전용 사본. 현재 체크포인트 기준 (§3.6) |
 
@@ -333,21 +339,20 @@ flightdeck-server DB
 |---|---|---|
 | `epic.started` | tracker_ref, owner, base_sha, config_version | ✅ |
 | `epic.config_upgraded` | from_version, to_version | ✅ |
-| `thread.created` | thread, phase, file, anchor(§3.5), kind, to[], body, commit?(문서 공유 커밋), source?(`human`\|`agent`, 쓰레드 초안 §3.2) | |
+| `thread.created` | thread, phase, file, anchor(§3.3, §3.5), kind, to[], body, commit?(문서 공유 커밋), source?(`human`\|`agent`, 쓰레드 초안 §3.2), patch?(수정 제안, `change_request`만, §9.3) | |
 | `thread.replied` | thread, body, source(`human`\|`agent`\|`session`), patch?(수정 제안, §9.3) | |
 | `thread.resolved` / `thread.reopened` | thread | |
 | `thread.moved` | thread, anchor | |
-| `patch.applied` | thread, commit | |
+| `patch.applied` | thread, commit(패치를 만든 리뷰 커밋). 담당자만 | |
 | `phase.completed` | phase, artifact_hash, commit?(IMPLEMENTATION: 검사한 에픽 브랜치 커밋. 같은 커밋의 통과 `gate.reported`가 있어야 한다) (담당자의 "분석 완료", "구현 완료") | ✅ |
-| `review.requested` | phase, artifact_hash, commit (담당자의 리뷰 요청, §4.2) | ✅ |
+| `review.requested` | phase, artifact_hash, commit (담당자의 리뷰 요청, §4.2. VERIFICATION은 `artifact_hash`=`tree:<tree>`, 같은 커밋의 통과 `gate.reported`가 있어야 한다) | ✅ |
 | `review.approved` | phase, tier, artifact_hash (§4.2) | ✅ |
-| `phase.reverted` | from, to, reason | |
+| `phase.reverted` | from, to, reason (DESIGN→ANALYSIS, VERIFICATION→IMPLEMENTATION, §4.3) | |
 | `run.started` / `run.finished` | run_id, phase, member, ckpt_from, ckpt_to | |
-| `gate.reported` | commit, commands[{cmd, exit, summary, log_hash}] (§7.5) | ✅ |
+| `gate.reported` | commit, commands[{cmd, exit, summary, log_hash}] (§7.5). IMPLEMENTATION·VERIFICATION·LANDING(재보고)에서 | ✅ |
 | `pilot.changed` | from, to, reason(`handoff`\|`request`\|`takeover`), ckpt, handoff_run (§8.5) | |
-| `land.requested` | head_sha | |
 | `epic.landed` | main_commit, approvals[] | ✅ |
-| `land.rejected` | reason, details | ✅ |
+| `land.rejected` | reason(`needs_report`\|`conflict`\|`invalid`), rebased_sha?(needs_report: 서버가 올린 병합 커밋), details? (§11.3) | ✅ |
 | `session.started` / `session.ended` / `session.published` | sid, … | |
 
 - **서버 서명 이벤트**는 단계를 넘기는 효력이 있는 이벤트다(§12). 확장이 서버에 요청하면 서버가 요청자(로그인한 멤버)·파이프라인·현재 상태를 검증하고, `author`에 요청자를 적어 서버 키로 서명한 뒤 메타 브랜치에 push한다. 서명 대상은 `sig`를 뺀 이벤트의 **정규화 JSON**(RFC 8785 JCS: 키 정렬, 공백 없음, UTF-8)이고, `sig`는 `ed25519:<base64>`다.
@@ -412,7 +417,9 @@ flightdeck-server DB
 
 ### 3.3 코드 쓰레드
 
-- 앵커: `{file, ckpt|commit, range, context(앞뒤 3줄), symbol?}`
+- 앵커: `{type: code, file, rev(리뷰 요청 커밋), range, context(앞뒤 3줄), symbol?}`
+- **M7 전까지의 위치 계산**: 편집 기록 기반 이동(§3.5)은 편집 기록 서버(M7)부터다. 그 전에는 리뷰어의 사본에서는 앵커 줄 그대로, 담당자 작업 폴더에서는 `rev → 작업 트리` diff(`git diff -U0`)로 줄을 옮긴다(§3.5 대체 수단 3번). 줄이 지워졌으면 가장 가까운 줄에 "위치 잃음"으로 표시한다.
+- 리뷰 사본(§9.3)에서 만든 쓰레드에는 수정 제안 패치를 바로 붙일 수 있다(`thread.created.patch`).
 - VS Code **Comments API**로 거터에 표시한다. markdown 문서(분석·설계)의 텍스트 에디터에서도 동작한다(M0 확인). markdown 미리보기 화면에는 표시되지 않는다.
 - **쓰레드 위치의 기준은 편집 기록이다.** VS Code는 편집에 따라 쓰레드를 **화면에서는** 옮기지만, 확장이 읽는 `CommentThread.range` 값은 갱신하지 않는다(M0 확인). 그래서 앵커를 저장·전송할 때 `thread.range`를 읽지 않고 편집 기록으로 계산한 위치(§3.5)를 쓴다. 창을 다시 열 때는 그 위치로 쓰레드를 만든다.
 - `kind`
@@ -442,7 +449,7 @@ flightdeck-server DB
 |---|---|---|
 | 1 | **편집 기록 변환** (기본) | 조종수의 에디터·에이전트·셸 편집, 수정 제안 반영 |
 | 2 | **문단 고정 ID** (§3.2) | 분석/설계 문서. 편집 기록과 함께 이중 안전장치 |
-| 3 | **diff 줄 매핑** + `git blame -M -C` | 편집 기록 밖에서 들어온 변경(main rebase 등). 가져온 diff도 "외부 반영" 편집으로 기록되므로 대부분 1번으로 처리됨 |
+| 3 | **diff 줄 매핑** + `git blame -M -C` | 편집 기록 밖에서 들어온 변경(main 병합 등). 가져온 diff도 "외부 반영" 편집으로 기록되므로 대부분 1번으로 처리됨. M7 전까지 코드 쓰레드는 이 방법만 쓴다(§3.3) |
 | 4 | **심볼 기준** (LSP 문서 심볼) | 편집 기록 누락 시 |
 | 5 | 유사도 검색(임계 0.6) → 실패하면 **고아 쓰레드** | 최후 수단 |
 
@@ -494,17 +501,19 @@ INTAKE → ANALYSIS → DESIGN → IMPLEMENTATION → VERIFICATION → LANDING �
 | ANALYSIS | `agent_drafting` → `questioning` → `owner_review` | `analysis.md`, handoff | 쓰레드 전부 resolved + `phase.completed` |
 | DESIGN | `agent_drafting` → `owner_review` → (`review.requested`) → `tier[k]_review` … | `design.md`, handoff | 리뷰어가 있는 모든 티어의 `review.approved` + 열린 쓰레드 0. 마지막 승인으로 자동 전환 |
 | IMPLEMENTATION | `agent_working` → `log_finalizing` → `gate_check` | 코드, impl-log, trace, handoff | 스키마 + coverage 100% + 명령 통과. 담당자의 "구현 완료" → 확장이 관문 검사·커밋·명령 실행 → `gate.reported` → `phase.completed(commit)` (§7.5) |
-| VERIFICATION | `owner_review` → `tier[1..n]_review` | 코드 쓰레드 | 각 티어 `review.approved` + 열린 change_request 0 |
-| LANDING | `requested` → `server_verifying` → `pushing` | main 커밋 | 서버의 `epic.landed` (§11) |
+| VERIFICATION | (`review.requested`) → `tier[1..n]_review` | 코드 쓰레드, 수정 제안 | 리뷰어가 있는 모든 티어의 `review.approved` + 열린 쓰레드 0. 마지막 승인으로 자동 전환. 첫 리뷰 요청은 구현 완료 직후 확장이 낸다 |
+| LANDING | `pending` → (`needs_report` → `pending`) | main 커밋 | 서버의 `epic.landed` (§11). `land.rejected(conflict\|invalid)`면 IMPLEMENTATION |
 | DONE | — | — | — |
 
 ### 4.2 티어 승인 (서버 서명 이벤트)
 
 - **티어는 일감의 검증 단계**다. 파이프라인이 단계별로 티어 순서(예: lead → architect)와 티어마다 심사하는 리뷰어를 정한다. **리뷰어가 없는 티어는 건너뛴다.** 건너뛰기는 그때그때 판단하지 않고 설정으로 정한다(§5).
 - **리뷰 요청** = `review.requested {phase, artifact_hash, commit}` (서버 서명). 담당자가 산출물을 에픽 브랜치에 공유하고 요청하면, 서버가 원격 문서의 형식(§6.3)과 해시를 확인해 서명한다. 리뷰어는 이 커밋을 읽기 전용 창으로 본다(§2.4).
+  - **검증 단계**: `artifact_hash`=`tree:<커밋의 tree>`. 서버는 그 커밋이 원격 에픽 브랜치 끝이고 **같은 커밋의 서명된 테스트 보고가 모두 통과**일 때만 서명한다. 리뷰어는 이 커밋의 쓰기 가능한 리뷰 사본으로 본다(§9.3).
+  - 구현 완료(`phase.completed`) 직후 확장이 첫 검증 리뷰 요청을 낸다. 수정 제안을 반영한 뒤의 **검증 다시 요청**은 관문 검사(§7.3) → 커밋·공유 → 명령 실행 → `gate.reported` → `review.requested` 순서다.
 - 티어 차례가 되면 행위자의 확장이 그 티어 리뷰어에게 VS Code 알림과 일감 도구 멘션을 보낸다.
 - 승인 = `review.approved` 이벤트다. 리뷰어가 확장에서 승인을 누르면 확장이 서버에 요청하고, 서버가 아래 조건을 검증한 뒤 서버 키로 서명해 기록한다(§12). 담당자의 단계 완료(`phase.completed`)도 같은 방식이다.
-  - `artifact_hash`: 승인하는 산출물의 해시. 설계 단계는 `design.md`, 검증 단계는 에픽 브랜치 tree 해시.
+  - `artifact_hash`: 승인하는 산출물의 해시. 설계 단계는 `design.md`, 검증 단계는 에픽 브랜치 tree 해시(`tree:<tree>`).
 - **현재 산출물** = 마지막 `review.requested`의 해시. reducer는 파일을 보지 않으므로 이것을 기준으로 삼는다. 담당자가 문서를 고치면 다시 요청해야 한다.
 - 서버(서명 전)와 reducer(받은 뒤)가 승인을 유효로 인정하는 조건
   - 서버 서명이 유효하다.
@@ -524,7 +533,7 @@ INTAKE → ANALYSIS → DESIGN → IMPLEMENTATION → VERIFICATION → LANDING �
 - VERIFICATION에서 "구현 재개"를 누르면 IMPLEMENTATION으로 돌아간다.
   - 에이전트는 change_request 쓰레드와 직전 handoff를 입력으로 작업한다.
   - impl-log에는 **새 Step을 추가**한다.
-- LANDING 실패(충돌, 게이트 재검사 실패)도 IMPLEMENTATION으로 돌아간다(§11).
+- LANDING 실패(충돌, 재검증 실패)도 IMPLEMENTATION으로 돌아간다(§11). main 이동으로 인한 재보고(`needs_report`)는 되돌림이 아니다.
 - DESIGN에서 분석 누락이 발견되면 ANALYSIS로 되돌릴 수 있다.
 
 ---
@@ -607,11 +616,12 @@ session:
 landing:
   target: main
   strategy: squash                 # squash | merge
-  on_main_moved: recheck           # recheck: 서버 재검증 + 실행자 재보고 통과 시 재승인 불필요
+  on_main_moved: recheck           # recheck: 서버가 main 병합 커밋을 올리고, 실행자 재보고 통과 시 재승인 불필요
   test_verification: reported      # reported(A안: 서명된 보고 신뢰) | server_run(B안, 이후)
-  records:
+  records:                         # squash 커밋의 .flightdeck/epics/<epic>/ 아래에는 keep에 맞는 것만 남는다
     keep: [epic.md, analysis.md, design.md, impl-log.md, runs/, threads/, sessions/]
-    drop: [trace.jsonl, state.json]
+    drop: [trace.jsonl, state.json]   # 문서화용 (keep에 없으면 어차피 빠진다)
+  audit_allow: []                  # main 감사 예외 커밋 sha (어드민이 확인한 것, §11.4)
 
 pilot:
   takeover_after_minutes: 10       # 조종수 연결 끊김 후 강제 인수 가능 시간
@@ -745,8 +755,9 @@ retention:
 | ANALYSIS | `analysis.md`, `runs/<run-id>/handoff.md` | 읽기 전용 허용 목록 |
 | DESIGN | `design.md`, `runs/<run-id>/handoff.md` | 읽기 전용 허용 목록 |
 | IMPLEMENTATION | `.flightdeck/` 제외 전체 + 이번 실행의 handoff. impl-log는 `flightdeck_log_step`으로만, trace는 훅이 쓴다 | 허용 (**모든 git 명령 차단**, `rm -rf` 등 차단) |
-| VERIFICATION | 없음 | 테스트 실행만 |
-| 읽기 전용 창 (질문 대상·리뷰어, 단계 무관) | 산출물 문서의 **쓰레드 초안 블록**만 (§3.2). 그 밖의 변경은 확장이 되돌린다 | 읽기 전용 허용 목록 |
+| VERIFICATION (담당자) | 없음 | 테스트 실행만(관문 명령) |
+| 리뷰 사본 (검증 리뷰어, §9.3) | `.flightdeck/` 제외 전체. 기록하지 않는다 | 허용 (**모든 git 명령 차단**) |
+| 읽기 전용 창 (질문 대상·설계 리뷰어, 단계 무관) | 산출물 문서의 **쓰레드 초안 블록**만 (§3.2). 그 밖의 변경은 확장이 되돌린다 | 읽기 전용 허용 목록 |
 
 - 에이전트도 git 명령을 쓸 수 없다. 버전 관리는 확장만 한다(D12).
 - 모든 단계에서 다음 경로의 읽기·쓰기를 차단한다. 설정 캐시와 훅·MCP 설정을 에이전트가 조작하는 것을 막기 위해서다.
@@ -1100,7 +1111,7 @@ XP 페어 프로그래밍에서는 드라이버가 작성하고 내비게이터�
 | 수정 제안 반영 | 패치 적용 | `patch:<thread>/<member>` |
 | Flightdeck 렌더링 (문단 ID 부여·복원, 쓰레드 블록) | 확장이 문서를 다시 그릴 때 전후 diff를 편집으로 변환. 기록하지 않으면 편집 기록 재적용 결과가 디스크와 어긋난다(M1: 실제 초안 뒤 어긋남 확인) | `flightdeck:<member>/<paragraph_ids \| thread_render>`. coverage(§7.3)에서 설명이 필요 없는 출처 |
 | 체크포인트 복원 | 바뀐 파일마다 파일 전체 교체 (§8.1) | `restore:<member>/<ckpt>/<seq>` |
-| 외부 반영 (main rebase 등) | diff를 편집으로 변환 | `external:<commit>` |
+| 외부 반영 (반영 서버의 main 병합 커밋으로 fast-forward 등, §11.3) | diff를 편집으로 변환 | `external:<commit>` |
 | 외부 도구 변경 (Flightdeck 밖 에이전트·에디터·터미널) | 파일 감시. 위 경로에 해당하지 않는 디스크 변경 | `external:unknown` (메모 필수, §7.4) |
 
 ```json
@@ -1173,7 +1184,8 @@ XP 페어 프로그래밍에서는 드라이버가 작성하고 내비게이터�
 
 ### 9.3 리뷰 (Delta의 리뷰 하위 스레드에 해당)
 
-1. 리뷰어가 `리뷰 시작`을 누르면 **리뷰 전용 사본**(`<epic-id>#review-<member>`)이 에픽 HEAD 기준으로 생긴다.
+1. 검증 리뷰어의 에픽 창은 **리뷰 요청 커밋의 쓰기 가능한 사본**이다(경로는 다른 리뷰어의 읽기 전용 창과 같다, §2.4). 창이 둘이면 어디서 쓰레드를 다는지 헷갈리므로 따로 만들지 않는다. 다시 요청되면 사본이 새 리뷰 커밋으로 옮겨진다(고치던 내용은 옮겨 담는다).
+   - 리뷰어와 그 에이전트는 사본을 자유롭게 고치고 테스트를 돌릴 수 있다. 기록하지 않고, git 명령만 막는다(§6.2).
 2. 리뷰어의 에이전트는 다음을 컨텍스트로 받는다.
    - 결과물
    - 모든 handoff
@@ -1186,9 +1198,11 @@ XP 페어 프로그래밍에서는 드라이버가 작성하고 내비게이터�
    - 구현 기록에서 Step별 의도와 리뷰 포인트를 읽는다.
    - 필요한 Step만 골라 diff를 연다.
    - coverage에서 강조된 hunk(`human`/`agent_shell`)를 확인한다.
-4. 리뷰어가 사본에서 고친 내용은 쓰레드에 **수정 제안(패치)**으로 첨부한다. **조종수**가 `수정 제안 반영`을 누르면 에픽 브랜치에 적용되고 `patch.applied`가 남는다. 리뷰어는 에픽 브랜치에 직접 쓰지 않는다.
+4. 리뷰어가 사본에서 고친 내용은 쓰레드에 **수정 제안(패치)**으로 첨부한다. 리뷰어는 에픽 브랜치에 직접 쓰지 않는다.
+   - `수정 제안 만들기` = 사본의 리뷰 커밋 대비 diff(`.flightdeck/` 제외)를 새 `change_request` 쓰레드(`thread.created.patch`) 또는 답글(`thread.replied.patch`)에 붙인다. 패치는 메타 이벤트에 그대로 넣고 **64KB**로 제한한다. 붙인 뒤 사본은 리뷰 커밋으로 되돌린다.
+   - **조종수**가 `수정 제안 반영`을 누르면 작업 폴더에 `git apply`로 적용한다(맞지 않으면 이유를 알리고 중단, 제안자에게 다시 만들어 달라고 답글). 바뀐 파일은 출처 `patch:<thread>/<member>`로 편집 기록에 남아 메모가 필요 없다(§7.4). `patch.applied {thread, commit: 패치를 만든 리뷰 커밋}`이 남고, 이어서 검증 다시 요청(§4.2)을 한다.
    - 설계 문서 리뷰(M3)는 리뷰 요청 커밋의 읽기 전용 창에서 한다. 리뷰어의 에이전트가 문서·쓰레드를 검사하고, 지시받은 질문·수정 요청·답글을 쓰레드 초안으로 쓴다(§3.2, §3.6). 리뷰어가 확인해 올린다.
-5. 승인을 누르면 서버가 검증해 `review.approved`(서버 서명)를 남긴다. 리뷰 사본은 정리 대상이 된다.
+5. 승인을 누르면 서버가 검증해 `review.approved`(서버 서명)를 남긴다. 반영 후 리뷰 사본은 정리 대상이 된다.
 
 ---
 
@@ -1247,9 +1261,9 @@ PR 없이 반영한다. 사용자에게는 "반영 중 → 완료"만 보인다.
 
 ### 11.1 흐름
 
-1. 마지막 검증 티어가 승인하면 승인자의 확장이 `land.requested` 이벤트를 남기고 `POST /land`를 호출한다.
-2. 서버는 작업(job)을 비동기로 처리하고, 결과를 `epic.landed` 또는 `land.rejected` 이벤트로 메타 브랜치에 남긴다. 확장은 이 이벤트를 기다린다.
-3. **보조 경로**: 서버도 1분마다 메타 브랜치를 확인한다. LANDING 상태인데 처리되지 않은 에픽이 있으면 처리한다. 확장의 호출이 실패했을 때를 위한 것이다.
+1. 서버가 마지막 검증 티어 승인(→ LANDING)에 서명하면 **바로 반영 작업(job)을 등록**한다. 승인 서명은 서버가 하므로 확장을 거칠 필요가 없다. `land.requested` 이벤트는 쓰지 않는다.
+2. 서버는 작업을 비동기로 처리하고, 결과를 `epic.landed` 또는 `land.rejected` 이벤트로 메타 브랜치에 남긴다. 확장은 이 이벤트를 기다린다.
+3. **보조 경로**: 서버는 1분마다 메타 브랜치를 확인해, LANDING(`pending`)인데 처리되지 않은 에픽을 처리한다(재시작 복구). 담당자는 `POST /land`로 다시 걸 수 있다.
 
 ### 11.2 서버 API
 
@@ -1259,7 +1273,7 @@ PR 없이 반영한다. 사용자에게는 "반영 중 → 완료"만 보인다.
 | `GET /me` | 로그인한 멤버 정보(멤버 ID, 그룹) |
 | `GET /config?product=<p>` | 서버가 서명한 설정 (§2.5) |
 | `POST /events` | 서버 서명 이벤트 요청 `{type, epic, data}` → 검증 후 서명·메타 push → `{event}` (§3.1, §12) |
-| `POST /land` | `{epic, head_sha}` → `202 {job}` |
+| `POST /land` | `{product, epic}` → `202 {job}` (재시도용. 보통은 서버가 스스로 건다) |
 | `GET /land/<job>` | 진행 상태 |
 | `GET /health` | 상태 확인 |
 | `/admin/*` | 어드민 화면: 멤버 등록·비활성, 제품별 파이프라인·룰 편집, 설정 버전·변경 이력 (어드민 멤버만) |
@@ -1272,35 +1286,40 @@ PR 없이 반영한다. 사용자에게는 "반영 중 → 완료"만 보인다.
 서버는 클라이언트가 계산한 결과를 믿지 않고 **처음부터 다시 계산**한다. 같은 `packages/core`를 쓰므로 판정 기준은 같다.
 
 ```
-1. fetch: main, flightdeck/<epic>, flightdeck-meta, refs/flightdeck/ckpt|runs/<epic>
+1. fetch: main, flightdeck/<epic>, flightdeck-meta
 2. epic.started의 config_version으로 서버 DB에서 파이프라인 로드
 3. reducer 재실행
    - 서버 서명 이벤트의 서명 검증
    - 단계 순서, 각 티어 승인의 유효성 (멤버·순서·artifact_hash)
    - 열린 쓰레드 / change_request 0
-4. 형식 검증: analysis·design 섹션, impl-log, handoff
-5. coverage 재계산: 서버 ③의 편집 기록으로 hunk별 출처·Step 조회
-   (기록 누락 구간은 체크포인트 체인 diff로 보조)
-6. 테스트 보고 확인 (A안): head_sha에 대한 gate.reported의 서명 유효, 모든 exit 0
-   └─ 3~6 중 하나라도 실패 → land.rejected(reason) → 담당자에게 알림
-7. main 위로 rebase (서버 작업 디렉터리)
-   ├─ 충돌 → land.rejected(conflict) → IMPLEMENTATION으로 되돌림
+   - 검증한 커밋(landing.commit) = 원격 에픽 브랜치 끝
+4. 형식 검증: impl-log (analysis·design·handoff는 단계 통과 때 이미 검증)
+5. coverage 재계산: 서버 ③의 편집 기록으로 hunk별 출처·Step 조회 (M7 이후.
+   그 전에는 담당자 확장의 관문 검사와 서명된 단계 완료를 신뢰)
+6. 테스트 보고 확인 (A안): 검증한 커밋의 gate.reported 서명 유효, 모든 exit 0
+   └─ 3~6 중 하나라도 실패 → land.rejected(invalid) → IMPLEMENTATION
+7. main이 검증한 커밋의 조상이 아니면 (main이 움직였음, on_main_moved: recheck)
+   main을 에픽 브랜치에 병합한다. rebase하지 않는다: 에픽 브랜치 이력을 다시 쓰지 않아
+   담당자 작업 폴더·체크포인트가 갈라지지 않고, squash라 이력 모양은 main에 남지 않는다
+   ├─ git merge-tree로 작업 폴더 없이 판정. 충돌 → land.rejected(conflict) → IMPLEMENTATION
    │        에이전트가 충돌 해결 Step 추가 → 검증 단계 재진입 (reapproval 정책 적용)
-   └─ main이 base 이후 움직였음 (on_main_moved: recheck)
-        → rebase 결과를 에픽 브랜치에 push (force-with-lease)
-        → 서버가 rebase 결과로 coverage 재계산
-        → land.rejected(needs_report, rebased_sha)
-        → 담당자 확장이 자동으로 commands 실행 → gate.reported → POST /land 재요청
-          (사람의 재승인은 필요 없음)
-8. landing.records.drop 제거 → squash 커밋. trailer는 다음과 같다:
+   └─ 병합 커밋(부모: 검증한 커밋, main)을 에픽 브랜치에 push (fast-forward)
+        → land.rejected(needs_report, rebased_sha=병합 커밋) → LANDING(needs_report)
+        → 담당자 확장이 작업 폴더를 그 커밋으로 fast-forward(바뀐 파일은 external:<commit>)
+          → commands 실행 → gate.reported(병합 커밋)
+        → 서버가 그 보고에 서명하면서 LANDING(pending)으로 돌리고 바로 반영 작업을 다시 건다
+          (사람의 재승인은 필요 없음. 확장이 꺼져 있으면 열 때 이어서 한다)
+8. squash 커밋 = main 위에 검증한 커밋의 tree. `.flightdeck/epics/<epic>/` 아래는
+   landing.records.keep에 맞는 것만 남기고, threads/code.json은 그 시점 코드 쓰레드로 서버가 만든다.
+   메시지 = 일감 제목 + trailer:
      Flightdeck-Epic: CU-86abc123
      Flightdeck-Config: <config_version>
      Flightdeck-Approvals: <review.approved 이벤트 id 목록>
      Flightdeck-Landed-By: flightdeck-server
 9. main fast-forward push (봇 자격 증명)
    └─ 경합으로 거절 → 1부터 재시도 (최대 3회)
-10. epic.landed (서버 서명) → 메타 push
-11. 정리 예약: 에픽 브랜치 삭제, 메타 디렉터리 정리, ckpt/runs ref는 retention 후 삭제
+10. epic.landed (서버 서명) → 메타 push → DONE
+11. 정리: 에픽 브랜치 삭제. 메타 디렉터리 정리, ckpt/runs ref는 retention 후 삭제(예약, 이후)
 ```
 
 - 일감 상태를 DONE으로 바꾸는 일은 `epic.landed`를 받은 확장이 개인 토큰으로 한다(§1.4 reconcile). 서버는 일감 도구 토큰을 갖지 않는다.
@@ -1313,8 +1332,10 @@ PR 없이 반영한다. 사용자에게는 "반영 중 → 완료"만 보인다.
   - 개발자 계정과 에이전트는 main에 쓸 수 없다.
 - **감사(이중 안전장치)**
   - 확장은 계속 main 이력을 검사한다.
-  - trailer가 없거나 대응하는 `epic.landed` 서버 서명이 없는 커밋이 보이면 관리자에게 경고한다.
-  - 봇 자격 증명 유출을 감지하기 위한 장치다.
+  - 시작점은 메타 브랜치의 가장 오래된 `epic.started.base_sha`다. Flightdeck 도입 전 커밋은 보지 않는다.
+  - 그 뒤 main first-parent 커밋 중 trailer `Flightdeck-Epic`이 없거나, 그 에픽의 서명된 `epic.landed.main_commit`과 다른 커밋이 보이면 경고한다(VS Code 알림, 출력 창).
+  - 어드민이 확인한 커밋은 `landing.audit_allow`(§5)에 넣어 예외로 둔다.
+  - 봇 자격 증명 유출과 외부 git의 보호 설정 누락을 감지하기 위한 장치다(M5: 시험 레포에 직접 push한 커밋 2개를 잡음).
 
 ### 11.5 서버 운영
 
@@ -1366,7 +1387,7 @@ flightdeck/
 ├── packages/
 │   ├── schema/    # zod 스키마: 이벤트, pipeline.yaml, impl-log, handoff, state
 │   ├── core/      # reducer, 서버 서명 검증, 쓰레드 렌더/파싱, 위치 추적, coverage (순수 로직)
-│   ├── git/       # GitEngine: worktree·체크포인트·ref·rebase·push (확장 내부 전용)
+│   ├── git/       # GitEngine: worktree·체크포인트·ref·세션 원본·push (확장 내부 전용)
 │   ├── tracker/   # TrackerAdapter + clickup
 │   ├── agent/     # AgentAdapter 인터페이스 + claude-code 구현 (codex, gemini-cli는 이후)
 │   ├── hook/      # flightdeck-hook: 모든 에이전트 훅의 공통 진입점. 어댑터로 입출력 변환 후 공통 처리 (세션 등록·룰 주입·권한·편집 기록·의견 전달·체크포인트), 확장과 로컬 IPC
@@ -1388,7 +1409,7 @@ flightdeck/
 | **M2 원격 협업** | 서버 서명 이벤트, 메타 브랜치 EventStore, 알림, ClickUp 일감 수신, **서버 어드민(멤버·설정) + 설정 배포**, Google 로그인<br>**결과(2026-10-04, 완료)**: 실제 VS Code 두 창(멤버 둘, 한 PC) + GitHub + 서버 + ClickUp으로 분석 Q&A 전 단계 통과 ([m2-plan.md](m2-plan.md)). Google 로그인(OAuth 클라이언트 없음, 개발용 로그인으로 진행)과 실제 여러 사람의 사용은 완성 뒤 확인한다 | 2인이 원격으로 분석 Q&A |
 | **M3 설계 티어** | 리뷰 요청·티어 승인(서버 서명), reapproval, 리뷰어 없는 티어 건너뛰기, 수정 요청 쓰레드, 리뷰어 창의 에이전트(리뷰 정책, 쓰레드 초안 블록)<br>**결과(2026-10-04, 완료)**: 실제 VS Code 세 창(담당자·lead·architect)에서 리뷰어의 에이전트(실제 claude)가 쓴 수정 요청 초안 → 올리기 → 담당자 수정·재요청 → 1티어부터 재승인 → 2티어 승인으로 IMPLEMENTATION ([m3-plan.md](m3-plan.md)) | 설계가 2티어 통과 |
 | **M4 구현·기록** | 구현 에이전트, **체크포인트**, impl-log·trace, Step별 coverage, **세션 원본 저장·검색**, 테스트 결과 보고(M5에서 당김)<br>**결과(2026-10-05, 완료)**: 실제 VS Code 두 창에서 에이전트(실제 claude)가 2 Step 구현·기록 → 사람 직접 수정·외부 변경으로 제출 차단 → 메모 → 서명된 테스트 보고·구현 완료로 VERIFICATION → 다른 멤버의 에이전트가 세션 원본을 검색해 결정 근거를 찾음 ([m4-plan.md](m4-plan.md)) | 설명 없는 hunk 차단 확인 |
-| **M5 검증·반영** | 코드 쓰레드, **리뷰 사본 + 수정 제안**, **반영 서버 검증·rebase·main push**, main 보호 설정, 감사 | 실제 에픽 1개가 서버를 통해 main까지 |
+| **M5 검증·반영** | 코드 쓰레드, **리뷰 사본 + 수정 제안**, **반영 서버 검증·main 병합·squash·main push**, main 보호 설정, 감사<br>**결과(2026-10-05, 완료)**: 실제 VS Code 세 창(담당자·검증 lead·qa)에서 리뷰어의 에이전트(실제 claude)가 리뷰 사본에서 고친 수정 제안 → 담당자 반영·다시 요청 → 1티어부터 재승인 → 2티어 승인 → main 이동으로 병합 커밋·자동 재보고 → 서버가 main에 squash push·`epic.landed`로 DONE → main 감사가 직접 push 커밋을 잡음 ([m5-plan.md](m5-plan.md)). GitHub main 보호 설정은 봇 방식 결정 뒤(§15) | 실제 에픽 1개가 서버를 통해 main까지 |
 | **M6 회의** | Meet 연동, 포커스 이벤트, 회의록 앵커링. Flightdeck OAuth 앱으로 만든 회의 공간의 회의록 자동 켜기·`meetings.space.created` 범위 확인(M0에서 넘어옴) | 회의 요약이 올바른 쓰레드에 게시 |
 | **M7 편집 기록** | 서버 ③, 편집 경로 4종 수집, 줄 단위 출처 조회, 앵커·coverage를 편집 기록 기반으로 전환, impl-log `changes` 자동 생성 | 모든 hunk의 출처가 조회되고, 쓰레드가 대규모 수정 후에도 위치 유지 |
 | **M8 조종수 모델** | 서버 ④, 대화·편집 실시간 스트림, 관찰자 읽기 전용 창, 의견 보내기·처리, 조종 요청·넘기기·강제 인수 | 관찰자가 1초 안에 조종수 작업을 보고, 의견이 에이전트까지 전달됨 |
