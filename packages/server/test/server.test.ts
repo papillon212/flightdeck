@@ -293,4 +293,18 @@ describe.skipIf(!process.env.FD_TEST_PG)("PgStore", () => {
     expect((await pgs.currentConfig(product))?.version).toBe(`${product}-v3`);
     expect((await pgs.listProducts()).find((p) => p.product === product)?.current).toBe(`${product}-v3`);
   });
+
+  it("편집 기록: seq가 이어질 때만, 동시에 붙여도 한쪽만, 큰 from도 (M7)", async () => {
+    const product = `p${Date.now()}`;
+    const rec = (seq: number) => ({ epic: "CU-1", file: "f", seq, base_hash: null, range: [0, 0] as [number, number], insert: `${seq}`, source: { kind: "human" as const, member: "x" }, ts: "2026-10-05T00:00:00.000Z" });
+    expect(await pgs.appendEditlog(product, "CU-1", [rec(2)])).toBe(false);
+    const both = await Promise.all([pgs.appendEditlog(product, "CU-1", [rec(1), rec(2)]), pgs.appendEditlog(product, "CU-1", [rec(1)])]);
+    expect(both.filter(Boolean)).toHaveLength(1);
+    const last = await pgs.editlogLast(product, "CU-1");
+    expect(last).toBeGreaterThanOrEqual(1);
+    expect(await pgs.editlog(product, "CU-1", Number.MAX_SAFE_INTEGER)).toEqual([]);
+    expect((await pgs.editlog(product, "CU-1")).map((r) => r.seq)).toEqual(Array.from({ length: last }, (_, i) => i + 1));
+    await pgs.setMemos(product, "CU-1", [{ epic: "CU-1", file: "f", seqs: [1, 1], memo: "m", member: "x", at: "2026-10-05T00:00:00.000Z" }]);
+    expect((await pgs.memos(product, "CU-1")).map((m) => m.memo)).toEqual(["m"]);
+  });
 });

@@ -138,7 +138,9 @@ export class PgStore implements ServerStore {
     }
   }
   async editlog(product: string, epic: string, fromSeq = 1) {
-    return (await this.q("select record from fd_editlog where product=$1 and epic=$2 and seq >= $3 order by seq", [product, epic, fromSeq])).rows.map((r) => r.record as EditRecord);
+    // seq는 integer 칼럼이다. "마지막 seq만" 묻는 큰 from은 범위 안으로 (M7 시나리오에서 PG만 실패)
+    const from = Math.max(1, Math.min(fromSeq, 2_147_483_647));
+    return (await this.q("select record from fd_editlog where product=$1 and epic=$2 and seq >= $3 order by seq", [product, epic, from])).rows.map((r) => r.record as EditRecord);
   }
   async setMemos(product: string, epic: string, memos: EditMemo[]) {
     await this.q("insert into fd_memos values ($1,$2,$3) on conflict (product, epic) do update set memos=$3", [product, epic, JSON.stringify(memos)]);

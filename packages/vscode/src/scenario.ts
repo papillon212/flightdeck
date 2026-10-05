@@ -68,6 +68,7 @@ export async function runScenario(h: ScenarioHooks, dir: string): Promise<void> 
     if (process.env.FLIGHTDECK_SCENARIO_KIND === "m3") return await runM3(h, log);
     if (process.env.FLIGHTDECK_SCENARIO_KIND === "m4") return await runM4(h, log);
     if (process.env.FLIGHTDECK_SCENARIO_KIND === "m5" || process.env.FLIGHTDECK_SCENARIO_KIND === "m55") return await runM5(h, log);
+    if (process.env.FLIGHTDECK_SCENARIO_KIND === "m7") return await runM7(h, log);
     if (me === "dh.lee" && !h.epic) return await ownerStart(h, log);
     if (me === "dh.lee" && h.role === "owner") return await ownerAsk(h, log);
     if (me === "park" && !h.epic) return await viewerWait(h, log);
@@ -450,7 +451,8 @@ async function m4Viewer(h: ScenarioHooks, log: Log) {
 
 /** M5.5(FLIGHTDECK_SCENARIO_KIND=m55)는 같은 흐름을 내장 git 서버로 돌린다: park는 직접 고치고(구독 사용 절약), choi의 main 직접 push는 거부돼야 한다 */
 const M55 = process.env.FLIGHTDECK_SCENARIO_KIND === "m55";
-const M5_TASK = M55 ? "[M5.5 시나리오]" : "[M5 시나리오]";
+const M7 = process.env.FLIGHTDECK_SCENARIO_KIND === "m7";
+const M5_TASK = M7 ? "[M7 시나리오]" : M55 ? "[M5.5 시나리오]" : "[M5 시나리오]";
 const M5_TOKEN = [
   'const crypto = require("crypto");',
   "",
@@ -644,4 +646,129 @@ async function m5Qa(h: ScenarioHooks, log: Log) {
   if (pushError) await git(["reset", "-q", "--hard", "origin/main"], { cwd: repo });
   const s = await h.wf.approve(epic);
   await log("qa 승인", { phase: s.phase, landing: s.landing, mainPush: pushError ?? "성공", head: (await git(["rev-parse", "HEAD"], { cwd: repo })).trim() });
+}
+
+// ---------------------------------------------------------------- M7: 편집 기록 서버 (docs/m7-plan.md)
+// M5와 같은 사람·설정. 담당자 구현(에이전트 출처 Step 1) → 제출 → park이 리뷰 사본에서 hover로 출처를 읽고 코드 쓰레드(질문)를 단다
+// → 담당자가 실제 에디터로 큰 수정(위에 30줄, 그 줄 자체 고침) + 터미널식 외부 변경 → 쓰레드 위치·외부 변경 기록 확인
+// → 메모 → 다시 요청 → park·choi 승인 → 반영 서버가 서버 편집 기록으로 coverage를 다시 계산하고 반영.
+
+async function runM7(h: ScenarioHooks, log: Log) {
+  const me = h.wf.cfg.member;
+  if (me === "dh.lee" && !h.epic) return m5OwnerStart(h, log);
+  if (me === "dh.lee") return m7Owner(h, log);
+  if (!h.epic) return m5ReviewerWait(h, log);
+  if (me === "park") return m7Lead(h, log);
+  if (me === "choi") return m7Qa(h, log);
+}
+
+/** [park] 리뷰 사본: 줄마다 hover(실제 VS Code hover 명령)로 출처 → 코드 쓰레드 질문 → 다시 요청을 기다려 승인 */
+async function m7Lead(h: ScenarioHooks, log: Log) {
+  const epic = h.epic!;
+  const wt = h.worktree!;
+  await h.refresh();
+  const s0 = await h.wf.epicState(epic);
+  if (![...s0.threads.values()].some((t) => t.author === "park")) {
+    const uri = vscode.Uri.file(path.join(wt, "src/token.js"));
+    const doc = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(doc);
+    const t1 = Date.now();
+    const hovers: string[] = [];
+    for (let line = 0; line < doc.lineCount; line++) {
+      const hs = (await vscode.commands.executeCommand<vscode.Hover[]>("vscode.executeHoverProvider", uri, new vscode.Position(line, 0))) ?? [];
+      const mine = hs.flatMap((x) => x.contents.map((c) => (typeof c === "string" ? c : "value" in c ? c.value : ""))).find((v) => v.includes("Flightdeck 출처"));
+      hovers.push(`${line + 1}: ${(mine ?? "(없음)").replace("**Flightdeck 출처** · ", "")}`);
+    }
+    await log("hover 출처 (리뷰 사본, 서버 편집 기록)", { ms: Date.now() - t1, hovers });
+    const line = doc.getText().split("\n").findIndex((l) => l.includes("cur.used = true")) + 1;
+    const tid = await h.wf.createCodeThread(epic, { file: "src/token.js", range: [line, line], kind: "question", to: ["dh.lee"], body: "재사용 표시를 저장 전에 하는 이유가 있나요?" });
+    await log("코드 쓰레드", { thread: tid, line });
+  }
+  const first = (await h.wf.epicState(epic)).review.requested!.event;
+  await until("담당자 다시 요청", async () => {
+    const s = await h.wf.epicState(epic);
+    if (s.review.requested?.event === first) {
+      await h.wf.pull();
+      return false;
+    }
+    await h.wf.openAsViewer(epic);
+    return true;
+  }, 15 * 60_000, 5000);
+  await h.refresh();
+  const mine = [...(await h.wf.epicState(epic)).threads.values()].find((t) => t.author === "park")!;
+  await vscode.commands.executeCommand("flightdeck.resolve", h.commentThread(mine.id));
+  const s2 = await h.wf.approve(epic);
+  await log("lead 승인", { replies: mine.replies.map((r) => `@${r.author}: ${r.body}`), next: s2.review.requested ? "qa" : s2.phase });
+}
+
+/** [choi] qa 차례 → 승인 (반영 서버가 서버 편집 기록으로 coverage 재계산) */
+async function m7Qa(h: ScenarioHooks, log: Log) {
+  const epic = h.epic!;
+  await h.refresh();
+  const item = await until("qa 차례", async () => (await h.wf.reviewInbox()).find((i) => i.epic === epic && i.tier === "qa"), 20 * 60_000, 5000);
+  await h.wf.openAsViewer(epic, item.commit);
+  const s = await h.wf.approve(epic);
+  await log("qa 승인", { phase: s.phase, landing: s.landing });
+}
+
+/** [dh.lee] 질문 알림 → 실제 에디터로 큰 수정 → 쓰레드 위치 → 외부 변경 → 메모 → 답글·다시 요청 → DONE */
+async function m7Owner(h: ScenarioHooks, log: Log) {
+  const epic = h.epic!;
+  const wt = h.worktree!;
+  await h.refresh();
+  let s = await h.wf.epicState(epic);
+  if (s.phase === "VERIFICATION" && ![...s.threads.values()].some((t) => t.replies.some((r) => r.author === "dh.lee"))) {
+    await until("park의 질문", async () => {
+      await h.wf.pull();
+      return [...(await h.wf.epicState(epic)).threads.values()].find((t) => t.author === "park");
+    }, 15 * 60_000, 3000);
+    await h.refresh();
+    s = await h.wf.epicState(epic);
+    const t = [...s.threads.values()].find((x) => x.author === "park")!;
+    const before = h.commentThread(t.id)?.range?.start.line;
+    // 실제 에디터 편집 (onDidChangeTextDocument → 사람 편집 기록): 위에 30줄, 쓰레드가 달린 줄 자체를 고친다
+    const uri = vscode.Uri.file(path.join(wt, "src/token.js"));
+    const doc = await vscode.workspace.openTextDocument(uri);
+    const ed = await vscode.window.showTextDocument(doc);
+    await ed.edit((b) => b.insert(new vscode.Position(0, 0), Array.from({ length: 30 }, (_, i) => `// 머리말 ${i + 1}`).join("\n") + "\n"));
+    const at = doc.getText().split("\n").findIndex((l) => l.includes("cur.used = true"));
+    await ed.edit((b) => b.replace(new vscode.Range(at, 0, at, doc.lineAt(at).text.length), "  cur.used = true; // 저장 전에 표시해 동시 재사용을 막는다"));
+    await doc.save();
+    await sleep(1500);
+    await h.refresh();
+    const pos = (await h.wf.codeThreadPositions(epic)).find((x) => x.thread.id === t.id)!;
+    const drawn = h.commentThread(t.id)?.range?.start.line;
+    // 터미널에서 고친 것처럼 (Flightdeck 밖): 파일 감시(1초 디바운스)가 잡아야 한다. 제출 검사도 잡으므로 그 전에 기다린다
+    const f = path.join(wt, "src/token.js");
+    const { readEditLog } = await import("@flightdeck/hook");
+    const dataDir = await h.wf.eng.dataDir();
+    const beforeSeq = (await readEditLog(dataDir, epic)).at(-1)?.seq ?? 0;
+    await writeFile(f, (await readFile(f, "utf8")) + "// 터미널에서 덧붙인 줄\n");
+    const t2 = Date.now();
+    const ext = await until("외부 변경 기록 (파일 감시)", async () => (await readEditLog(dataDir, epic)).find((r) => r.seq > beforeSeq && r.source.kind === "external" && r.file === "src/token.js"), 60_000, 200);
+    await log("큰 수정 뒤 쓰레드 위치 · 외부 변경", {
+      thread: t.id,
+      anchor: t.anchor,
+      position: pos,
+      drawnLine: drawn === undefined ? null : drawn + 1,
+      beforeLine: before === undefined ? null : before + 1,
+      lineText: (await readFile(f, "utf8")).split("\n")[pos.range[0] - 1],
+      external: { seq: ext.seq, ms: Date.now() - t2 },
+      status: h.statusText(),
+    });
+    const st = await h.wf.implementationStatus(epic);
+    for (const g of st.coverage.groups) await h.wf.addMemo(epic, g, g.kind === "external" ? "터미널에서 남긴 메모 줄" : "머리말과 재사용 표시 이유 주석");
+    await vscode.commands.executeCommand("flightdeck.reply", { thread: h.commentThread(t.id), text: "동시 재사용을 막기 위해서입니다. 주석으로 남겼습니다." });
+    const r = await h.wf.requestVerification(epic);
+    const server = await h.wf.cfg.remote!.server.editlog(h.wf.cfg.remote!.product, epic, Number.MAX_SAFE_INTEGER);
+    await log("메모·다시 요청", { groups: st.coverage.groups.map((g) => `${g.file}:${g.kind}:${g.seqs.join("-")}`), r: r.ok ? "ok" : r, serverLast: server.last, localLast: (await readEditLog(dataDir, epic)).at(-1)?.seq });
+  }
+  const t3 = Date.now();
+  s = await until("DONE", async () => {
+    await h.refresh();
+    const x = await h.wf.epicState(epic);
+    return x.phase === "DONE" || x.phase === "IMPLEMENTATION" ? x : null; // IMPLEMENTATION = 반영 거부
+  }, 20 * 60_000, 5000);
+  const rejected = (await h.wf.store.list(epic)).filter((e) => e.type === "land.rejected").map((e) => e.data);
+  await log("반영", { phase: s.phase, waitSec: Math.round((Date.now() - t3) / 1000), main: s.landed?.main_commit ?? null, rejected, status: h.statusText(), warnings: h.wf.warnings.splice(0) });
 }
