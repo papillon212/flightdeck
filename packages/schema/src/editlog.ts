@@ -63,3 +63,14 @@ export const EditMemo = z.object({
   at: Timestamp,
 });
 export type EditMemo = z.infer<typeof EditMemo>;
+
+/**
+ * 편집 기록 업로드 묶음 (M7 제안 E1·E8). records는 서버의 마지막 seq 바로 다음부터 이어져야 한다.
+ * memos는 그 에픽의 메모 전체(서버가 통째로 바꾼다. 메모는 적고, 고쳐질 수 있다)
+ */
+export const EditUpload = z.object({
+  epic: EpicId,
+  records: z.array(EditRecord).max(5000),
+  memos: z.array(EditMemo).max(2000).optional(),
+});
+export type EditUpload = z.infer<typeof EditUpload>;

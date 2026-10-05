@@ -2,13 +2,15 @@
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { verifyConfig, type ConfigPayload, type SignedConfig } from "@flightdeck/core";
-import type { Event } from "@flightdeck/schema";
+import { verifyConfig, type BlameResult, type ConfigPayload, type SignedConfig } from "@flightdeck/core";
+import type { EditMemo, EditRecord, Event } from "@flightdeck/schema";
 
 export class ServerRequestError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    /** 응답 본문 (JSON이면) */
+    readonly data: any = null,
   ) {
     super(message);
   }
@@ -49,7 +51,7 @@ export class ServerClient {
     } catch {
       /* JSON 아님 */
     }
-    if (!r.ok) throw new ServerRequestError(r.status, data?.error ?? `${r.status} ${text.slice(0, 200)}`);
+    if (!r.ok) throw new ServerRequestError(r.status, data?.error ?? `${r.status} ${text.slice(0, 200)}`, data);
     return data as T;
   }
 
@@ -68,6 +70,23 @@ export class ServerClient {
   async config(product: string, version?: string): Promise<ConfigPayload> {
     const q = new URLSearchParams({ product, ...(version ? { version } : {}) });
     return verifyConfig(await this.call<SignedConfig>("GET", `/config?${q}`), this.fingerprint);
+  }
+
+  // ---- 편집 기록 (서버 ③, M7) ----
+
+  /** 편집 기록 올리기. seq가 이어지지 않으면 409 (data.last = 서버의 마지막 seq) */
+  uploadEditlog(product: string, body: { epic: string; records: EditRecord[]; memos?: EditMemo[] }): Promise<{ last: number }> {
+    return this.call("POST", `/editlog?product=${encodeURIComponent(product)}`, body);
+  }
+
+  editlog(product: string, epic: string, from = 1): Promise<{ records: EditRecord[]; memos: EditMemo[]; last: number }> {
+    return this.call("GET", `/editlog/${encodeURIComponent(epic)}?product=${encodeURIComponent(product)}&from=${from}`);
+  }
+
+  /** 줄 단위 출처 (E6): rev 커밋의 편집 기록 위치까지 */
+  blame(product: string, epic: string, file: string, rev: string): Promise<BlameResult & { upto: number | null; matches: boolean }> {
+    const q = new URLSearchParams({ product, file, rev });
+    return this.call("GET", `/editlog/${encodeURIComponent(epic)}/blame?${q}`);
   }
 
   /** 내장 git 전용 토큰 (M5.5 Z3). git 경로에만 쓸 수 있다 */

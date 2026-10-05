@@ -13,3 +13,4 @@ export * from "./coverage.ts";
 export * from "./search.ts";
 export * from "./redact.ts";
 export * from "./landing.ts";
+export * from "./blame.ts";

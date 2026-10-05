@@ -4,9 +4,10 @@
 import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import { artifactHash, checkImplLog, checkSections, configHash, configVersionOf, nowIso, reduce, reviewOf, signEvent, ulid } from "@flightdeck/core";
+import { artifactHash, checkImplLog, checkSections, configHash, configVersionOf, nowIso, reduce, reviewOf, signEvent, ulid, writerOf } from "@flightdeck/core";
 import { git, GitEngine, GitError, RemoteEventStore } from "@flightdeck/git";
-import { Event as EventSchema, GateCommands, parsePipeline, PHASE_ARTIFACT, type Event, type Phase, type Trust } from "@flightdeck/schema";
+import { Event as EventSchema, GateCommands, parsePipeline, PHASE_ARTIFACT, type EditMemo, type EditRecord, type Event, type Phase, type Trust } from "@flightdeck/schema";
+import { parseUpload, serverBlame } from "./editlog.ts";
 import { BUILTIN_REPO, type GitHost } from "./githost.ts";
 import { landEpic, type LandDeps } from "./landing.ts";
 import type { Member, ServerStore } from "./store.ts";
@@ -183,7 +184,53 @@ export class EventSigner {
       load: (product) => this.loadProduct(product),
       sign: (e) => signEvent(e, this.deps.privateKeyPem),
       config: (product, version) => this.deps.store.getConfigVersion(product, version),
+      editlog: async (product, epic) => ({ records: await this.deps.store.editlog(product, epic), memos: await this.deps.store.memos(product, epic) }),
     };
+  }
+
+  // ---- 편집 기록 (서버 ③, M7) ----
+
+  /** 업로드 권한 확인용 담당자 캐시: 업로드는 몇 초마다 오므로 매번 메타 브랜치를 받지 않는다 (조종수 바뀜은 M8) */
+  private writers = new Map<string, { writer: string | null; at: number }>();
+
+  private async writerOf(product: string, epic: string, fresh = false): Promise<string | null> {
+    const key = `${product}\0${epic}`;
+    const hit = this.writers.get(key);
+    if (!fresh && hit && Date.now() - hit.at < 60_000) return hit.writer;
+    const s = await this.enqueue(product, async () => (await this.loadProduct(product)).state(epic));
+    const writer = writerOf(s);
+    this.writers.set(key, { writer, at: Date.now() });
+    return writer;
+  }
+
+  /** 편집 기록 올리기 (E1·E4·E8). seq가 이어지지 않으면 409와 서버의 마지막 seq */
+  async uploadEditlog(member: Member, product: string, body: unknown): Promise<{ last: number }> {
+    const u = parseUpload(body);
+    let writer = await this.writerOf(product, u.epic);
+    if (writer !== member.id) writer = await this.writerOf(product, u.epic, true);
+    if (writer !== member.id) throw new RequestError(403, `편집 기록은 조종수(@${writer ?? "없음"})만 올린다`);
+    if (u.records.length && !(await this.deps.store.appendEditlog(product, u.epic, u.records))) {
+      throw new RequestError(409, JSON.stringify({ last: await this.deps.store.editlogLast(product, u.epic) }));
+    }
+    if (u.memos) await this.deps.store.setMemos(product, u.epic, u.memos);
+    return { last: await this.deps.store.editlogLast(product, u.epic) };
+  }
+
+  async getEditlog(product: string, epic: string, from = 1): Promise<{ records: EditRecord[]; memos: EditMemo[]; last: number }> {
+    return { records: await this.deps.store.editlog(product, epic, from), memos: await this.deps.store.memos(product, epic), last: await this.deps.store.editlogLast(product, epic) };
+  }
+
+  /** 줄 단위 출처 (E6): rev(리뷰 커밋 등)의 편집 기록 위치까지 */
+  async blame(product: string, epic: string, file: string, rev: string) {
+    if (!/^[0-9a-f]{40}$/.test(rev)) throw new RequestError(400, "rev는 커밋 sha");
+    return this.enqueue(product, async () => {
+      const ctx = await this.loadProduct(product);
+      const s = await ctx.state(epic);
+      if (!s.base_sha) throw new RequestError(404, "시작하지 않은 에픽");
+      const has = await git(["cat-file", "-e", `${rev}^{commit}`], { cwd: ctx.dir }).then(() => true, () => false);
+      if (!has) await new GitEngine(ctx.dir).fetchEpicBranch(epic).catch(() => null);
+      return serverBlame({ dir: ctx.dir, base: s.base_sha, rev, file, records: await this.deps.store.editlog(product, epic), memos: await this.deps.store.memos(product, epic) });
+    });
   }
 
   private async handle(member: Member, req: EventRequest): Promise<{ event: Event; pushed: boolean }> {

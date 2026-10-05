@@ -74,7 +74,9 @@ export function createApp(opts: AppOptions) {
     const token = sessionToken(req);
     const memberId = token ? await opts.store.sessionMember(token) : null;
     const member = memberId ? await opts.store.getMember(memberId) : null;
-    const ctx: Ctx = { req, res, url, opts, member: member?.active ? member : null, body: () => (bodyCache ??= readBody(req)) };
+    // 편집 기록 묶음은 큰 파일의 내용을 담을 수 있다 (M7)
+    const limit = url.pathname === "/editlog" ? 16 << 20 : 1 << 20;
+    const ctx: Ctx = { req, res, url, opts, member: member?.active ? member : null, body: () => (bodyCache ??= readBody(req, limit)) };
     const p = url.pathname;
     try {
       if (p === "/health") return json(res, 200, { ok: true, server_key_fingerprint: keyFingerprint(opts.keys.publicKey) });
@@ -151,6 +153,24 @@ export function createApp(opts: AppOptions) {
         const c = await buildConfig(opts.store, product, opts.keys, url.searchParams.get("version") ?? undefined);
         if (!c) throw new RequestError(404, `설정이 없는 제품·버전: ${product}`);
         return json(res, 200, c);
+      }
+      // ── 편집 기록 (서버 ③, M7) ──
+      if (p === "/editlog" && req.method === "POST") {
+        const product = url.searchParams.get("product") ?? "";
+        try {
+          return json(res, 200, await opts.signer.uploadEditlog(ctx.member, product, JSON.parse(await ctx.body())));
+        } catch (e) {
+          // seq가 이어지지 않으면 서버의 마지막 seq를 그대로 돌려준다 (확장은 그 다음부터 다시 보낸다)
+          if (e instanceof RequestError && e.status === 409 && e.message.startsWith("{")) return json(res, 409, { error: "편집 기록 seq가 이어지지 않는다", ...JSON.parse(e.message) });
+          throw e;
+        }
+      }
+      const el = /^\/editlog\/([^/]+)(\/blame)?$/.exec(p);
+      if (el && req.method === "GET") {
+        const product = url.searchParams.get("product") ?? "";
+        const epic = decodeURIComponent(el[1]!);
+        if (el[2]) return json(res, 200, await opts.signer.blame(product, epic, url.searchParams.get("file") ?? "", url.searchParams.get("rev") ?? ""));
+        return json(res, 200, await opts.signer.getEditlog(product, epic, Number(url.searchParams.get("from")) || 1));
       }
       if (p === "/git/token" && req.method === "POST") {
         if (!opts.githost) throw new RequestError(404, "내장 git 서버가 꺼져 있다");

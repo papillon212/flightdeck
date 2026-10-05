@@ -5,13 +5,13 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
-import { applyTextEdit, artifactHash, auditMain, checkSections, configHash, configVersionOf, diffRecords, diffToEdits, draftText, ensureParagraphIds, insertDrafts, linesLabel, mapLines, myOpenThreads, type AuditFinding, type MainCommit, needsServerSignature, nowIso, parseDrafts, parseImplLog, pipelineFromDir, reduce, removeDrafts, renderThreads, replay, restoreParagraphIds, reviewOf, sha256, stripThreads, threadIdFrom, trustFromConfig, ulid, type ConfigPayload, type CoverageReport, type Draft, type EpicState, type MemoGroup, type Thread } from "@flightdeck/core";
-import { git, GitEngine, LocalEventStore, MetaRewriteError, RAW_ARGS, RAW_ENV, RemoteEventStore, RunStore } from "@flightdeck/git";
+import { applyTextEdit, artifactHash, auditMain, blame, checkSections, configHash, moveLines, type BlameEntry, configVersionOf, diffRecords, diffToEdits, draftText, ensureParagraphIds, insertDrafts, linesLabel, mapLines, myOpenThreads, type AuditFinding, type MainCommit, needsServerSignature, nowIso, parseDrafts, parseImplLog, pipelineFromDir, reduce, removeDrafts, renderThreads, replay, restoreParagraphIds, reviewOf, sha256, stripThreads, threadIdFrom, trustFromConfig, ulid, type ConfigPayload, type CoverageReport, type Draft, type EpicState, type MemoGroup, type Thread } from "@flightdeck/core";
+import { git, gitBuffer, GitEngine, LocalEventStore, MetaRewriteError, RAW_ARGS, RAW_ENV, RemoteEventStore, RunStore, seqTrailer } from "@flightdeck/git";
 import { DEV_TRUST, HANDOFF_SECTIONS, parsePipeline, PHASE_ARTIFACT, type Anchor, type EditMemo, type EditRecord, type EditSource, type Event, type EventOf, type EventType, type LocalEpicStateInput, type Phase, type Pipeline, type Trust } from "@flightdeck/schema";
 import type { AgentAdapter } from "@flightdeck/agent";
 import type { TrackerAdapter, TrackerEpic } from "@flightdeck/tracker";
-import { appendEditRecords, appendMemo, checkImplLogFile, computeCoverage, implLogRel, readEditLog, readMemos, readState, recordDrift, renderMemos, statePath, writeState, type ImplContext } from "@flightdeck/hook";
-import { cacheConfig, configCacheDir, loadCachedConfig, type ServerClient } from "./server-client.ts";
+import { appendEditRecords, appendMemo, baseContent, checkImplLogFile, computeCoverage, implLogRel, lastSeq, readEditLog, readMemos, readState, recordDrift, renderMemos, statePath, toolInProgress, writeState, type ImplContext } from "@flightdeck/hook";
+import { cacheConfig, configCacheDir, loadCachedConfig, ServerRequestError, type ServerClient } from "./server-client.ts";
 
 /** 서버 모드 (M2 원격 협업). 없으면 개발 모드: 로컬 설정 폴더, 로컬 메타 브랜치, 서명 없음 */
 export interface RemoteConfig {
@@ -100,6 +100,8 @@ export class EpicWorkflow {
   private async passEvent<T extends EventType>(epic: string, type: T, data: Record<string, unknown>): Promise<Event> {
     const r = this.cfg.remote;
     if (!r) return this.emit(epic, type, data as EventOf<T>["data"]) as Promise<Event>;
+    // 서버가 판정에 편집 기록을 쓸 수 있게 먼저 올린다 (M7: 반영 coverage)
+    await this.syncEditlog(epic).catch((err) => this.warnings.push(`편집 기록을 서버에 올리지 못했다: ${err instanceof Error ? err.message : err}`));
     const e = await r.server.requestEvent(r.product, epic, type, data);
     await this.pull();
     return e;
@@ -890,7 +892,9 @@ export class EpicWorkflow {
     if (problems.length) return { ok: false, problems, coverage: st.coverage };
 
     const wt = await this.worktree(epic);
-    await this.eng.commitAll(wt, `${epic}: ${label} (Step ${st.step})`, { "Flightdeck-Epic": epic, "Flightdeck-Phase": phase });
+    // 이 커밋이 편집 기록의 어디까지인가 (M7 E3): 반영 서버가 이 위치까지 재적용해 coverage를 다시 계산한다
+    const seq = await lastSeq(await this.eng.dataDir(), epic);
+    await this.eng.commitAll(wt, `${epic}: ${label} (Step ${st.step})`, { "Flightdeck-Epic": epic, "Flightdeck-Phase": phase, "Flightdeck-Seq": String(seq) });
     const commit = this.cfg.remote ? await this.eng.pushEpicBranch(epic, this.gitRemote) : await this.eng.revParse("HEAD", wt);
     const commands = await this.runGateCommands(epic, commit, opts.onOutput);
     await this.passEvent(epic, "gate.reported", { commit, commands });
@@ -969,17 +973,100 @@ export class EpicWorkflow {
   }
 
   /** 코드 쓰레드의 지금 위치 (Y2): 앵커 커밋 → 이 창의 작업 트리 diff로 줄을 옮긴다 */
-  async codeThreadPositions(epic: string): Promise<{ thread: Thread; file: string; range: [number, number]; lost: boolean }[]> {
+  /**
+   * 코드 쓰레드의 지금 위치 (§3.5). 담당자 작업 폴더에서는 편집 기록으로 옮긴다(M7 E5): rev 커밋의 Flightdeck-Seq 뒤 편집을 따라가므로
+   * 그 줄 자체가 고쳐져도 위치를 잃지 않는다. 편집 기록으로 따라갈 수 없으면(rev에 위치가 없거나 기록이 이어지지 않음) diff 줄 매핑(M5)
+   */
+  async codeThreadPositions(epic: string): Promise<{ thread: Thread; file: string; range: [number, number]; lost: boolean; via: "editlog" | "diff" }[]> {
     const s = await this.epicState(epic);
     const wt = await this.worktree(epic);
-    const out: { thread: Thread; file: string; range: [number, number]; lost: boolean }[] = [];
+    const owner = (await this.role(epic)) === "owner";
+    const log = owner ? await readEditLog(await this.eng.dataDir(), epic) : [];
+    const out: { thread: Thread; file: string; range: [number, number]; lost: boolean; via: "editlog" | "diff" }[] = [];
     for (const t of s.threads.values()) {
       if (t.anchor.type !== "code") continue;
-      const diff = await git(["diff", "-U0", "--no-color", t.anchor.rev, "--", t.anchor.file], { cwd: wt }).catch(() => "");
-      const m = mapLines(diff, t.anchor.range);
-      out.push({ thread: t, file: t.anchor.file, ...m });
+      const a = t.anchor;
+      if (owner) {
+        const seq = seqTrailer(await git(["log", "-1", "--format=%B", a.rev], { cwd: wt }).catch(() => ""));
+        const revText = seq === null ? null : await gitBuffer(["cat-file", "blob", `${a.rev}:${a.file}`], { cwd: wt }).then((b) => b.toString("utf8"), () => null);
+        const m = seq !== null && revText !== null ? moveLines(a.file, revText, seq, log, a.range) : null;
+        // 작업 트리 내용과 맞는지도 본다 (기록되지 않은 변경이 있으면 diff로)
+        if (m && (await readFile(path.join(wt, a.file), "utf8").catch(() => null)) === m.text) {
+          out.push({ thread: t, file: a.file, range: m.range, lost: m.lost, via: "editlog" });
+          continue;
+        }
+      }
+      const diff = await git(["diff", "-U0", "--no-color", a.rev, "--", a.file], { cwd: wt }).catch(() => "");
+      out.push({ thread: t, file: a.file, ...mapLines(diff, a.range), via: "diff" });
     }
     return out;
+  }
+
+  // ---- 편집 기록 서버 (서버 ③, M7) ----
+
+  private uploaded = new Map<string, { last: number; memos: string }>();
+
+  /**
+   * 로컬 편집 기록·메모를 서버에 올린다 (E1·E8). 이 PC가 그 에픽의 작업 폴더(담당자 창)일 때만.
+   * 서버의 마지막 seq 다음부터 보내고, 어긋나면(409) 서버가 알려 준 위치부터 다시 보낸다. 올린 마지막 seq
+   */
+  async syncEditlog(epic: string): Promise<number | null> {
+    const r = this.cfg.remote;
+    if (!r) return null;
+    const dataDir = await this.eng.dataDir();
+    if (!existsSync(statePath(dataDir, epic)) || (await readState(dataDir, epic)).role !== "owner") return null;
+    const log = await readEditLog(dataDir, epic);
+    const memos = await readMemos(dataDir, epic);
+    const memoKey = sha256(JSON.stringify(memos))!;
+    let cur = this.uploaded.get(epic) ?? { last: (await r.server.editlog(r.product, epic, Number.MAX_SAFE_INTEGER)).last, memos: "" };
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const records = log.filter((x) => x.seq > cur.last).slice(0, 2000);
+      if (!records.length && cur.memos === memoKey) break;
+      try {
+        const res = await r.server.uploadEditlog(r.product, { epic, records, ...(cur.memos !== memoKey ? { memos } : {}) });
+        cur = { last: res.last, memos: memoKey };
+      } catch (e) {
+        if (e instanceof ServerRequestError && e.status === 409 && typeof e.data?.last === "number") {
+          cur = { last: e.data.last, memos: cur.memos };
+          continue;
+        }
+        throw e;
+      }
+    }
+    this.uploaded.set(epic, cur);
+    return cur.last;
+  }
+
+  /**
+   * 코드 파일 외부 변경 감지 (§7.4, M7 E7): 편집 기록 재적용 ≠ 디스크인 파일을 external:unknown으로 기록한다.
+   * 에이전트 도구가 실행 중이면(훅이 곧 기록) null: 호출하는 쪽이 나중에 다시 부른다. 기록한 파일 목록
+   */
+  async recordExternal(epic: string): Promise<string[] | null> {
+    const dataDir = await this.eng.dataDir();
+    if (toolInProgress(dataDir, epic)) return null;
+    const ctx = await this.implContext(epic);
+    // 구현·검증(수정 제안 반영 뒤 다시 요청) 중에만 코드가 바뀐다
+    if (ctx.state.role !== "owner" || !["IMPLEMENTATION", "VERIFICATION"].includes(ctx.state.phase)) return [];
+    return recordDrift(ctx);
+  }
+
+  /**
+   * 줄 단위 출처 (E6): 담당자 창은 로컬 편집 기록, 다른 창(리뷰·질문)은 서버에서 그 창의 커밋 기준으로.
+   * text는 계산한 내용: 에디터 내용과 다르면(저장 안 한 편집, 리뷰 사본의 수정) 호출하는 쪽이 그 줄을 "확인 안 됨"으로 본다
+   */
+  async lineBlame(epic: string, file: string): Promise<{ lines: (BlameEntry | null)[]; text: string | null; via: "local" | "server" }> {
+    const role = await this.role(epic);
+    if (role === "owner") {
+      const ctx = await this.implContext(epic);
+      const base = await baseContent(this.cfg.repo, ctx.baseSha, file);
+      const b = blame(file, base, await readEditLog(ctx.dataDir, epic), { memos: await readMemos(ctx.dataDir, epic) });
+      return { lines: b.lines, text: b.text, via: "local" };
+    }
+    const r = this.cfg.remote;
+    if (!r) return { lines: [], text: null, via: "server" };
+    const rev = await this.eng.revParse("HEAD", await this.worktree(epic));
+    const b = await r.server.blame(r.product, epic, file, rev);
+    return { lines: b.lines, text: b.text, via: "server" };
   }
 
   /**

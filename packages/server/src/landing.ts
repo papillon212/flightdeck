@@ -10,13 +10,16 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { checkImplLog, keepRecord, nowIso, ulid, type EpicState } from "@flightdeck/core";
 import { git, GitEngine, GitError, type RemoteEventStore } from "@flightdeck/git";
-import { Event as EventSchema, type Event, type Trust } from "@flightdeck/schema";
+import { Event as EventSchema, type EditMemo, type EditRecord, type Event, type Trust } from "@flightdeck/schema";
+import { serverCoverage } from "./editlog.ts";
 import type { ConfigVersion } from "./store.ts";
 
 export interface LandDeps {
   load(product: string): Promise<{ dir: string; target: string; store: RemoteEventStore; trust: Trust; state(epic: string): Promise<EpicState & { events: Event[] }> }>;
   sign(e: Event): Event;
   config(product: string, version: string): Promise<ConfigVersion | null>;
+  /** 서버 편집 기록과 메모 (M7) */
+  editlog(product: string, epic: string): Promise<{ records: EditRecord[]; memos: EditMemo[] }>;
 }
 
 export interface LandResult {
@@ -52,12 +55,19 @@ export async function landEpic(deps: LandDeps, product: string, epic: string): P
     const head = await new GitEngine(dir).fetchEpicBranch(epic);
     if (head !== commit) return reject("invalid", `에픽 브랜치 끝(${head?.slice(0, 10) ?? "없음"})이 검증한 커밋(${commit.slice(0, 10)})과 다르다`);
 
-    // 재검증 (§11.3 3·4·6). coverage 재계산은 서버 편집 기록(M7) 뒤
+    // 재검증 (§11.3 3·4·5·6)
     const problems: string[] = [];
     const gate = s.gates.get(commit);
     if (!gate?.ok) problems.push("검증한 커밋의 통과 테스트 보고가 없다");
     const show = (f: string) => g(["show", `${commit}:.flightdeck/epics/${epic}/${f}`]).catch(() => null);
     problems.push(...checkImplLog(await show("impl-log.md"), await show("design.md")).map((p) => `impl-log: ${p}`));
+    // coverage 재계산: 서버 편집 기록으로 (M7 제안 E3)
+    if (s.pipeline && s.base_sha) {
+      const log = await deps.editlog(product, epic);
+      const cov = await serverCoverage({ dir, epic, base: s.base_sha, commit, pipeline: s.pipeline, records: log.records, memos: log.memos });
+      problems.push(...cov.problems.map((p) => `coverage: ${p}`));
+      if (!cov.checked && cov.note) console.log(`[land ${epic}] ${cov.note}`);
+    }
     if (problems.length) return reject("invalid", problems.join("; "), { problems });
 
     const target = ctx.target;

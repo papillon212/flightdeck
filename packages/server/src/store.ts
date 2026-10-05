@@ -1,7 +1,8 @@
-// 서버 저장소 (설계 §2.5, §11.5): 멤버, 로그인 세션, 제품별 설정 버전, 변경 이력.
+// 서버 저장소 (설계 §2.5, §11.5): 멤버, 로그인 세션, 제품별 설정 버전, 변경 이력, 편집 기록(M7).
 // 운영은 PostgreSQL(pg.ts), 테스트는 메모리 구현.
 import { createHash, randomBytes } from "node:crypto";
 import { nowIso } from "@flightdeck/core";
+import type { EditMemo, EditRecord } from "@flightdeck/schema";
 
 export interface Member {
   id: string;
@@ -54,9 +55,23 @@ export interface ServerStore {
   listConfigVersions(product: string): Promise<ConfigVersion[]>;
 
   audit(limit?: number): Promise<AuditEntry[]>;
+  // ---- 편집 기록 (서버 ③, M7) ----
+  /** 그 에픽의 마지막 편집 기록 seq (없으면 0) */
+  editlogLast(product: string, epic: string): Promise<number>;
+  /** 이어 붙인다. records[0].seq가 마지막 + 1이 아니거나 seq가 이어지지 않으면 false (아무것도 쓰지 않음) */
+  appendEditlog(product: string, epic: string, records: EditRecord[]): Promise<boolean>;
+  editlog(product: string, epic: string, fromSeq?: number): Promise<EditRecord[]>;
+  setMemos(product: string, epic: string, memos: EditMemo[]): Promise<void>;
+  memos(product: string, epic: string): Promise<EditMemo[]>;
+
   /** 저장소 밖의 어드민 작업(내장 레포 가져오기 등)을 변경 이력에 남긴다 */
   addAudit(actor: string, action: string, detail: unknown): Promise<void>;
   close(): Promise<void>;
+}
+
+/** records가 last 바로 다음부터 빈칸 없이 이어지는가 */
+export function contiguous(last: number, records: { seq: number }[]): boolean {
+  return records.every((r, i) => r.seq === last + 1 + i);
 }
 
 /** 세션 토큰은 해시로만 저장한다 */
@@ -133,6 +148,28 @@ export class MemoryStore implements ServerStore {
   }
   async addAudit(actor: string, action: string, detail: unknown) {
     this.record(actor, action, detail);
+  }
+
+  private edits = new Map<string, EditRecord[]>();
+  private memoMap = new Map<string, EditMemo[]>();
+  async editlogLast(product: string, epic: string) {
+    return this.edits.get(`${product}\0${epic}`)?.at(-1)?.seq ?? 0;
+  }
+  async appendEditlog(product: string, epic: string, records: EditRecord[]) {
+    const key = `${product}\0${epic}`;
+    const list = this.edits.get(key) ?? [];
+    if (!contiguous(list.at(-1)?.seq ?? 0, records)) return false;
+    this.edits.set(key, [...list, ...records]);
+    return true;
+  }
+  async editlog(product: string, epic: string, fromSeq = 1) {
+    return (this.edits.get(`${product}\0${epic}`) ?? []).filter((r) => r.seq >= fromSeq);
+  }
+  async setMemos(product: string, epic: string, memos: EditMemo[]) {
+    this.memoMap.set(`${product}\0${epic}`, memos);
+  }
+  async memos(product: string, epic: string) {
+    return this.memoMap.get(`${product}\0${epic}`) ?? [];
   }
   async close() {}
 }

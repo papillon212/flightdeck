@@ -280,3 +280,16 @@ export function isSecret(file: string, patterns: string[]): boolean {
   const base = path.posix.basename(file);
   return patterns.some((p) => (p.includes("/") ? path.matchesGlob(file, p) : path.matchesGlob(base, p)));
 }
+
+/** coverage 대상 파일인가: Flightdeck 기록(.flightdeck/)·coverage_ignore·비밀 파일은 뺀다 (§7.3, M4 X3). 확장·훅·반영 서버가 같이 쓴다 */
+export function isCoverageTarget(file: string, excludeSecrets: string[], coverageIgnore: string[]): boolean {
+  if (file.startsWith(".flightdeck/")) return false;
+  if (isSecret(file, excludeSecrets)) return false;
+  return !coverageIgnore.some((g) => path.matchesGlob(file, g) || path.matchesGlob(path.posix.basename(file), g));
+}
+
+/** 커밋 메시지의 편집 기록 위치 trailer (M7 제안 E3). 없으면 null */
+export function seqTrailer(message: string): number | null {
+  const m = /^Flightdeck-Seq: (\d+)$/m.exec(message);
+  return m ? Number(m[1]) : null;
+}

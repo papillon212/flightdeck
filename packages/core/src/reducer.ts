@@ -130,6 +130,11 @@ export function reduce(epic: string, events: Event[], trust: Trust, opts: Reduce
   return s;
 }
 
+/** 에픽 작업 폴더에 쓰는 사람: 편집 기록을 올리고 에픽 브랜치에 쓴다 (§8.2). 조종수 모델(M8) 전에는 담당자 */
+export function writerOf(s: EpicState): string | null {
+  return s.owner;
+}
+
 /** 이 에픽이 고정한 설정 버전 (epic.started). 파이프라인을 미리 불러올 때 쓴다 */
 export function configVersionOf(events: Event[], epic: string): string | null {
   const e = events.find((x) => x.epic === epic && x.type === "epic.started") as EventOf<"epic.started"> | undefined;

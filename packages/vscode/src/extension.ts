@@ -9,6 +9,7 @@ import path from "node:path";
 import * as vscode from "vscode";
 import { ClaudeCodeAdapter, cleanEnv } from "@flightdeck/agent";
 import { coalesce, linesLabel, nowIso, parseBlocks, parseDrafts, PID_LINE, restoreParagraphIds, reviewOf, sha256, type ConfigPayload, type EpicState, type Thread } from "@flightdeck/core";
+import { blameLabel } from "./blame-label.ts";
 import { git, RemoteEventStore } from "@flightdeck/git";
 import { appendEditRecords, readEditLog, readState } from "@flightdeck/hook";
 import { parsePipeline, type EditRecord, type LocalEpicState, type Phase } from "@flightdeck/schema";
@@ -689,7 +690,10 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       human = new HumanEdits(ctx, await ctx.wf.eng.dataDir(), ctx.wf.cfg.member, refresh);
       ext.subscriptions.push(human);
       ext.subscriptions.push(checkpointTimers(ctx as Ctx & { epic: string; worktree: string }, out, refresh));
+      ext.subscriptions.push(editlogTimers(ctx as Ctx & { epic: string; worktree: string }, out, refresh));
     }
+    // 줄 단위 출처 hover (M7 E6): 담당자 창은 로컬 편집 기록, 다른 창은 서버
+    ext.subscriptions.push(vscode.languages.registerHoverProvider({ scheme: "file" }, new BlameHover(ctx as Ctx & { epic: string; worktree: string }, out)));
     // 에이전트가 산출물을 고치면(디스크 변경) 다시 그린다: 담당자 창은 문단 ID·쓰레드, 읽기 전용 창은 초안만 남기고 되돌림
     const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.join(ctx.worktree, ".flightdeck", "epics", ctx.epic), "{analysis,design}.md"));
     let t: NodeJS.Timeout | null = null;
@@ -1297,6 +1301,69 @@ function unsavedIn(worktree: string): boolean {
  * 체크포인트 시점 (§8.1): 사람은 저장 후 10초(디바운스), 에이전트는 마지막 편집 후 idle_seconds(기본 30초) 유휴.
  * Step 끝(flightdeck_log_step)과 턴 종료(Stop 훅)의 체크포인트는 훅·MCP가 만든다
  */
+/**
+ * 편집 기록 서버 (M7): 5초마다 편집 기록·메모를 올린다(E1). 작업 폴더를 감시해 Flightdeck 밖의 코드 변경을 잡는다(E7, 1초 디바운스).
+ * 저장 안 한 에디터 편집이 있거나 에이전트 도구가 실행 중이면 외부 변경 확인을 미룬다
+ */
+function editlogTimers(ctx: Ctx & { epic: string; worktree: string }, out: vscode.OutputChannel, refresh: () => Promise<void>): vscode.Disposable {
+  const wf = ctx.wf;
+  const upload = setInterval(() => void wf.syncEditlog(ctx.epic).catch((e) => out.appendLine(`[편집 기록] 서버에 올리지 못했다: ${(e as Error).message}`)), Number(process.env.FLIGHTDECK_EDITLOG_SYNC_MS) || 5_000);
+  let timer: NodeJS.Timeout | null = null;
+  const check = async () => {
+    timer = null;
+    if (unsavedIn(ctx.worktree)) return;
+    const files = await wf.recordExternal(ctx.epic);
+    if (files === null) {
+      timer = setTimeout(() => void check().catch(() => undefined), 2_000); // 도구 실행 중: 끝난 뒤 다시
+      return;
+    }
+    if (!files.length) return;
+    out.appendLine(`[외부 변경] ${files.join(", ")}`);
+    void vscode.window.showWarningMessage(`Flightdeck 밖에서 수정됨: ${files.join(", ")} — 제출 전에 메모가 필요합니다`, "메모 쓰기").then((pick) => (pick ? vscode.commands.executeCommand("flightdeck.unexplained") : undefined));
+    await refresh();
+  };
+  const w = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(ctx.worktree, "**/*"));
+  const onFs = (u: vscode.Uri) => {
+    const rel = path.relative(ctx.worktree, u.fsPath).split(path.sep).join("/");
+    if (!rel || rel.startsWith("..") || rel.startsWith(".flightdeck/") || rel.startsWith(".git") || rel.startsWith(".claude/")) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => void check().catch((e) => out.appendLine(`[외부 변경] ${e}`)), 1_000);
+  };
+  const subs = [w.onDidChange(onFs), w.onDidCreate(onFs), w.onDidDelete(onFs)];
+  return { dispose: () => (clearInterval(upload), timer && clearTimeout(timer), w.dispose(), subs.forEach((s) => s.dispose())) };
+}
+
+/** 줄 단위 출처 hover (§8.6 에디터 통합, M7 E6) */
+class BlameHover implements vscode.HoverProvider {
+  private cache = new Map<string, { at: number; version: number; r: Awaited<ReturnType<EpicWorkflow["lineBlame"]>> }>();
+  constructor(
+    private ctx: Ctx & { epic: string; worktree: string },
+    private out: vscode.OutputChannel,
+  ) {}
+
+  async provideHover(doc: vscode.TextDocument, pos: vscode.Position): Promise<vscode.Hover | null> {
+    const rel = path.relative(this.ctx.worktree, doc.uri.fsPath).split(path.sep).join("/");
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel) || rel.startsWith(".flightdeck/") || rel.startsWith(".git/")) return null;
+    let hit = this.cache.get(rel);
+    if (!hit || hit.version !== doc.version || Date.now() - hit.at > 10_000) {
+      try {
+        hit = { at: Date.now(), version: doc.version, r: await this.ctx.wf.lineBlame(this.ctx.epic, rel) };
+        this.cache.set(rel, hit);
+      } catch (e) {
+        this.out.appendLine(`[출처] ${(e as Error).message}`);
+        return null;
+      }
+    }
+    const { r } = hit;
+    if (r.text === null) return null;
+    // 계산한 내용과 에디터 내용이 다르면(저장 안 한 편집, 리뷰 사본의 수정) 그 줄이 같은지만 보고 보여 준다
+    const same = r.text === doc.getText() || r.text.split("\n")[pos.line] === doc.lineAt(pos.line).text;
+    if (!same) return new vscode.Hover(new vscode.MarkdownString("Flightdeck 출처: 이 줄은 아직 기록된 내용과 다릅니다 (저장 전 또는 이 창에서 고침)"));
+    const e = r.lines[pos.line];
+    return new vscode.Hover(new vscode.MarkdownString(`**Flightdeck 출처** · ${blameLabel(e)}${r.via === "server" ? " · 서버 편집 기록" : ""}`));
+  }
+}
+
 function checkpointTimers(ctx: Ctx & { epic: string; worktree: string }, out: vscode.OutputChannel, refresh: () => Promise<void>): vscode.Disposable {
   const wf = ctx.wf;
   const make = async (why: string, source: "human" | "agent") => {

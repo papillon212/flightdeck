@@ -25,7 +25,7 @@ import {
   type ImplStep,
   type TranscriptDoc,
 } from "@flightdeck/core";
-import { git, gitBuffer, GitEngine, isSecret, RAW_ARGS, RAW_ENV, RunStore } from "@flightdeck/git";
+import { git, gitBuffer, GitEngine, isCoverageTarget, RAW_ARGS, RAW_ENV, RunStore } from "@flightdeck/git";
 import type { EditMemo, EditRecord, LocalEpicState } from "@flightdeck/schema";
 import { appendEditRecords, readEditLog, readMemos, updateState } from "./store.ts";
 
@@ -43,9 +43,7 @@ export interface ImplContext {
 
 /** coverage 대상 파일인가: Flightdeck 기록(.flightdeck/)·coverage_ignore·비밀 파일은 뺀다 (X3) */
 export function coverageTarget(file: string, ctx: ImplContext): boolean {
-  if (file.startsWith(".flightdeck/")) return false;
-  if (isSecret(file, ctx.state.excludeSecrets)) return false;
-  return !ctx.coverageIgnore.some((g) => path.matchesGlob(file, g) || path.matchesGlob(path.posix.basename(file), g));
+  return isCoverageTarget(file, ctx.state.excludeSecrets, ctx.coverageIgnore);
 }
 
 async function readOrNull(f: string): Promise<string | null> {

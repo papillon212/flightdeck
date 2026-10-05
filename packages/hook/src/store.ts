@@ -1,6 +1,6 @@
 // 훅이 쓰는 로컬 저장소: 상태 파일, 편집 기록, 도구 전후 스냅샷, 훅 로그.
 // 위치는 모두 <git common dir>/flightdeck/ 아래다(docs/m1-plan.md).
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { appendFile, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { EditMemo, EditRecord, LocalEpicState, type LocalEpicStateInput } from "@flightdeck/schema";
@@ -111,6 +111,12 @@ export async function takeSnapshot(dataDir: string, epic: string, toolUseId: str
 }
 
 const safe = (id: string) => id.replace(/[^A-Za-z0-9_-]/g, "_");
+
+/** 에이전트 도구가 실행 중인가 (PreToolUse가 남긴 스냅샷이 아직 있다). 그동안의 디스크 변경은 훅이 곧 기록한다 (M7 E7) */
+export function toolInProgress(dataDir: string, epic: string): boolean {
+  const d = snapDir(dataDir, epic);
+  return existsSync(d) && readdirSync(d).some((f) => f.endsWith(".json"));
+}
 
 /** 훅 로그: 오류와 판단 근거를 남긴다 (§6.1 "훅 오류 n건" 표시의 원천) */
 export async function hookLog(dataDir: string, epic: string, entry: Record<string, unknown>): Promise<void> {
