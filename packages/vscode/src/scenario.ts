@@ -67,7 +67,7 @@ export async function runScenario(h: ScenarioHooks, dir: string): Promise<void> 
   try {
     if (process.env.FLIGHTDECK_SCENARIO_KIND === "m3") return await runM3(h, log);
     if (process.env.FLIGHTDECK_SCENARIO_KIND === "m4") return await runM4(h, log);
-    if (process.env.FLIGHTDECK_SCENARIO_KIND === "m5") return await runM5(h, log);
+    if (process.env.FLIGHTDECK_SCENARIO_KIND === "m5" || process.env.FLIGHTDECK_SCENARIO_KIND === "m55") return await runM5(h, log);
     if (me === "dh.lee" && !h.epic) return await ownerStart(h, log);
     if (me === "dh.lee" && h.role === "owner") return await ownerAsk(h, log);
     if (me === "park" && !h.epic) return await viewerWait(h, log);
@@ -448,7 +448,9 @@ async function m4Viewer(h: ScenarioHooks, log: Log) {
 // park의 에이전트(실제 claude haiku 1회)가 리뷰 사본에서 고친 것을 park이 수정 제안으로 올린다.
 // choi는 승인 직전에 main에 다른 커밋을 넣어(Flightdeck 밖) main 이동 → 병합 → 재보고 경로와 감사를 확인한다.
 
-const M5_TASK = "[M5 시나리오]";
+/** M5.5(FLIGHTDECK_SCENARIO_KIND=m55)는 같은 흐름을 내장 git 서버로 돌린다: park는 직접 고치고(구독 사용 절약), choi의 main 직접 push는 거부돼야 한다 */
+const M55 = process.env.FLIGHTDECK_SCENARIO_KIND === "m55";
+const M5_TASK = M55 ? "[M5.5 시나리오]" : "[M5 시나리오]";
 const M5_TOKEN = [
   'const crypto = require("crypto");',
   "",
@@ -585,7 +587,15 @@ async function m5Lead(h: ScenarioHooks, log: Log) {
       "다른 동작은 바꾸지 마세요. node check.js로 확인하고, 결과를 한 줄로 알려 주세요.",
     ].join("\n");
     const t1 = Date.now();
-    const r = await h.wf.cfg.adapter.headless!(prompt, { cwd: wt, model: "haiku", maxTurns: 10, allowedTools: ["Read", "Edit", "Write", "Bash", "mcp__flightdeck"] });
+    const r = M55
+      ? await (async () => {
+          // 에이전트가 하는 수정과 같은 것 (M5에서 실제 claude로 확인)
+          const f = path.join(wt, "src/token.js");
+          const text = await readFile(f, "utf8");
+          await writeFile(f, text.replace(/(function rotate\([^)]*\) \{\n)/, "$1  if (typeof token !== 'string') throw new TypeError('token must be a string');\n"));
+          return { result: "직접 수정 (M5.5: 구독 사용 절약)" };
+        })()
+      : await h.wf.cfg.adapter.headless!(prompt, { cwd: wt, model: "haiku", maxTurns: 10, allowedTools: ["Read", "Edit", "Write", "Bash", "mcp__flightdeck"] });
     const changed = await git(["status", "--short"], { cwd: wt });
     await log("에이전트 수정 (리뷰 사본)", { sec: Math.round((Date.now() - t1) / 1000), result: r.result.slice(0, 300), changed: changed.trim() });
     // "수정 제안 만들기": src/token.js의 rotate 줄을 골라 실행한 것과 같다
@@ -626,10 +636,12 @@ async function m5Qa(h: ScenarioHooks, log: Log) {
   await git(["fetch", "-q", "origin", "main"], { cwd: repo });
   await git(["checkout", "-q", "main"], { cwd: repo });
   await git(["merge", "-q", "--ff-only", "origin/main"], { cwd: repo });
-  await writeFile(path.join(repo, "NOTICE.md"), "M5 시나리오: 검증 중에 main에 들어온 다른 변경\n");
+  await writeFile(path.join(repo, "NOTICE.md"), `${M55 ? "M5.5" : "M5"} 시나리오: 검증 중에 main에 들어온 다른 변경\n`);
   await git(["add", "NOTICE.md"], { cwd: repo });
-  await git(["-c", "user.name=choi", "-c", "user.email=choi@test.local", "commit", "-q", "-m", "M5 시나리오: main 이동"], { cwd: repo });
-  await git(["push", "-q", "origin", "main"], { cwd: repo });
+  await git(["-c", "user.name=choi", "-c", "user.email=choi@test.local", "commit", "-q", "-m", `${M55 ? "M5.5" : "M5"} 시나리오: main 이동`], { cwd: repo });
+  // 내장 git(M5.5)에서는 서버가 거부해야 한다 (§1.5 pre-receive)
+  const pushError = await git(["push", "-q", "origin", "main"], { cwd: repo }).then(() => null, (e) => (e as Error).message);
+  if (pushError) await git(["reset", "-q", "--hard", "origin/main"], { cwd: repo });
   const s = await h.wf.approve(epic);
-  await log("qa 승인", { phase: s.phase, landing: s.landing, mainMoved: (await git(["rev-parse", "HEAD"], { cwd: repo })).trim() });
+  await log("qa 승인", { phase: s.phase, landing: s.landing, mainPush: pushError ?? "성공", head: (await git(["rev-parse", "HEAD"], { cwd: repo })).trim() });
 }

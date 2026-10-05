@@ -61,7 +61,8 @@ export class EventSigner {
     if (source === BUILTIN_REPO) {
       if (!this.deps.githost) throw new RequestError(503, "내장 git 서버가 꺼져 있다");
       source = this.deps.githost.repoDir(product);
-      if (!existsSync(source)) await this.deps.githost.ensureRepo(product, { target: pipeline.landing.target });
+      // 내장 레포는 서버 시작 때만 만든다(가져오기 또는 빈 레포). 여기서 만들면 설정을 바꾼 직후의 스캔이 빈 레포를 먼저 만들어 가져오기를 막는다 (M5.5 시나리오)
+      if (!existsSync(source)) throw new RequestError(503, `내장 레포가 아직 없다: ${product}. 서버를 다시 시작하면 만든다(기존 레포는 --import-repo)`);
     }
     const dir = path.join(this.deps.dataDir, "repos", `${product}.git`);
     if (!existsSync(dir)) {
@@ -145,13 +146,18 @@ export class EventSigner {
   async scanLanding(): Promise<LandJob[]> {
     const out: LandJob[] = [];
     for (const { product } of await this.deps.store.listProducts()) {
-      await this.enqueue(product, () => this.mirrorQuietly(product)); // 미러 실패분 재시도 (Z5)
-      const ctx = await this.loadProduct(product).catch(() => null);
-      if (!ctx) continue;
-      for (const epic of await ctx.store.listEpics()) {
-        const s = await ctx.state(epic);
-        if (s.phase === "LANDING" && s.landing?.status === "pending") out.push(this.land(product, epic));
-      }
+      // 서버 사본·메타 브랜치를 서명 요청과 함께 쓰므로 제품 대기열 안에서 돈다 (밖에서 돌면 같은 추적 ref를 동시에 갱신해 요청이 실패한다, M5.5 시나리오)
+      const pending = await this.enqueue(product, async () => {
+        await this.mirrorQuietly(product); // 미러 실패분 재시도 (Z5)
+        const ctx = await this.loadProduct(product).catch(() => null);
+        const epics: string[] = [];
+        for (const epic of ctx ? await ctx.store.listEpics() : []) {
+          const s = await ctx!.state(epic);
+          if (s.phase === "LANDING" && s.landing?.status === "pending") epics.push(epic);
+        }
+        return epics;
+      });
+      for (const epic of pending) out.push(this.land(product, epic));
     }
     return out;
   }

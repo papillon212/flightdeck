@@ -8,8 +8,9 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 CODE="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
 curl -sf http://127.0.0.1:8787/health >/dev/null || { echo "서버가 꺼져 있다 (http://127.0.0.1:8787)"; exit 1; }
 # FD_MEMBERS로 창을 고른다 (기본: dh.lee park. M3·M5는 "dh.lee park choi")
+# FD_REPO_DIR로 레포 폴더 이름을 고른다 (기본: test-flightdeck. M5.5 내장 git은 hosted-flightdeck)
 for m in ${FD_MEMBERS:-dh.lee park}; do
   FLIGHTDECK_TRACKER_TOKEN=$([ "$m" = dh.lee ] && echo "${CLICKUP_TOKEN:-}" || true) \
-    "$CODE" --user-data-dir "/tmp/fd-m2/$m/vscode" --extensionDevelopmentPath="$ROOT/packages/vscode/ext" --new-window "/tmp/fd-m2/$m/test-flightdeck"
+    "$CODE" --user-data-dir "/tmp/fd-m2/$m/vscode" --extensionDevelopmentPath="$ROOT/packages/vscode/ext" --new-window "/tmp/fd-m2/$m/${FD_REPO_DIR:-test-flightdeck}"
 done
 echo "창을 열었다: ${FD_MEMBERS:-dh.lee park}"
