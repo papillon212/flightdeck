@@ -72,6 +72,7 @@ export async function runScenario(h: ScenarioHooks, dir: string): Promise<void> 
     if (process.env.FLIGHTDECK_SCENARIO_KIND === "m4") return await runM4(h, log);
     if (process.env.FLIGHTDECK_SCENARIO_KIND === "m5" || process.env.FLIGHTDECK_SCENARIO_KIND === "m55") return await runM5(h, log);
     if (process.env.FLIGHTDECK_SCENARIO_KIND === "m7") return await runM7(h, log);
+    if (process.env.FLIGHTDECK_SCENARIO_KIND === "m8") return await runM8(h, log);
     if (me === "dh.lee" && !h.epic) return await ownerStart(h, log);
     if (me === "dh.lee" && h.role === "owner") return await ownerAsk(h, log);
     if (me === "park" && !h.epic) return await viewerWait(h, log);
@@ -774,4 +775,187 @@ async function m7Owner(h: ScenarioHooks, log: Log) {
   }, 20 * 60_000, 5000);
   const rejected = (await h.wf.store.list(epic)).filter((e) => e.type === "land.rejected").map((e) => e.data);
   await log("반영", { phase: s.phase, waitSec: Math.round((Date.now() - t3) / 1000), main: s.landed?.main_commit ?? null, rejected, status: h.statusText(), warnings: h.wf.warnings.splice(0) });
+}
+
+// ---------------------------------------------------------------- M8: 조종수 모델 (docs/m8-plan.md)
+// dh.lee(담당자·처음 조종수)가 실제 claude(haiku 1회)로 3 Step 구현을 돌리는 동안 park이 관찰 창(@live)으로 보고
+// 일반 의견 → 급한 의견을 보낸다. dh.lee 쪽은 받은 의견을 조종수가 고른 것처럼 전달한다(일반 / "[급함]"이면 급한 의견).
+// 실행이 끝나면 park이 조종을 요청하고, dh.lee가 넘기고, park이 자기 작업 폴더에서 이어받아 Step을 더해 제출한다.
+
+const M8_TASK = "[M8 시나리오]";
+const M8_DESIGN = [
+  "## 개요", "src/revoke.js에 모든 토큰을 무효로 하는 revokeAll을 만든다. CommonJS 모듈(module.exports)이다.", "",
+  "## 변경 컴포넌트", "- src/revoke.js: revokeAll(store)", "",
+  "## 인터페이스", "- revokeAll(store) → 무효로 바꾼 토큰 수. store는 Map(토큰 → { used: boolean }). 모든 값을 used: true로 바꾼다", "",
+  "## 데이터 변경", "- 없음 (메모리 Map)", "",
+  "## 테스트 계획", "- 레포의 node check.js (rotate)는 그대로 통과해야 한다", "",
+  "## 리스크", "- 없음", "",
+].join("\n");
+
+async function runM8(h: ScenarioHooks, log: Log) {
+  const me = h.wf.cfg.member;
+  if (me === "dh.lee" && !h.epic) return m8OwnerStart(h, log);
+  if (me === "dh.lee" && h.role === "owner") return m8Pilot(h, log);
+  if (me === "park" && !h.epic) return m8ParkHome(h, log);
+  if (me === "park" && h.role === "live") return m8Live(h, log);
+  if (me === "park" && h.role === "owner") return m8NewPilot(h, log);
+}
+
+/** [dh.lee] 시작 → 분석 → 설계(자기 승인) → IMPLEMENTATION → 작업 폴더 */
+async function m8OwnerStart(h: ScenarioHooks, log: Log) {
+  const t = (await h.wf.assignedEpics()).find((e) => e.title.includes(M8_TASK));
+  if (!t) throw new Error("M8 시나리오 일감이 내 일감에 없다");
+  const r = await h.wf.startFromTracker(t);
+  const dir = path.join(r.worktree, ".flightdeck/epics", t.epicId);
+  await writeFile(path.join(dir, "analysis.md"), ANALYSIS);
+  await h.wf.completePhase(t.epicId);
+  await writeFile(path.join(dir, "design.md"), M8_DESIGN);
+  await h.wf.requestReview(t.epicId);
+  const s = await h.wf.approve(t.epicId);
+  // 관찰자가 붙을 수 있게 첫 체크포인트를 올린다 (관찰은 조종수의 체크포인트에서 시작한다, L8)
+  await h.wf.checkpoint(t.epicId, "구현 시작");
+  await log("에픽 시작 → IMPLEMENTATION", { epic: t.epicId, phase: s.phase });
+  await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(r.worktree), { forceNewWindow: false });
+}
+
+/** [dh.lee] 조종수 창: 실제 claude로 구현, 받은 의견을 전달, 끝나면 조종 요청을 받아 넘긴다 */
+async function m8Pilot(h: ScenarioHooks, log: Log) {
+  const epic = h.epic!;
+  const s0 = await h.wf.epicState(epic);
+  if (s0.pilotHistory.length) return; // 이미 넘겼다
+  await until("조종수 창 실시간", async () => h.pilot?.(), 30_000, 500);
+  // 받은 의견을 조종수가 고른 것처럼 처리한다: "[급함]"으로 시작하면 급한 의견, 아니면 에이전트에 전달
+  const { handleOpinion } = await import("./live-ui.ts");
+  const handled = new Set<string>();
+  const opinionLoop = setInterval(() => {
+    const pw = h.pilot?.();
+    if (!pw) return;
+    for (const o of pw.opinions.list.filter((x) => x.status === "new" && !handled.has(x.id))) {
+      handled.add(o.id);
+      const urgent = o.body.startsWith("[급함]");
+      void handleOpinion({ wf: h.wf, epic, worktree: h.worktree! }, pw.opinions, o, urgent ? "urgent" : "deliver", o.body.replace("[급함]", "").trim())
+        .then(() => log("의견 처리", { id: o.id, from: o.from, body: o.body, as: urgent ? "급한 의견" : "에이전트에 전달", at: new Date().toISOString() }))
+        .catch((e) => log("오류", { error: String(e) }));
+    }
+  }, 300);
+  // park이 관찰 창을 열 때까지 기다렸다가 실행 (관찰 시작 전 편집은 체크포인트로만 보인다)
+  await until("관찰자 접속", async () => {
+    const r = h.wf.cfg.remote!;
+    return (await r.server.livePresence(r.product, epic))["park"]?.online;
+  }, 10 * 60_000, 2000);
+  const prompt = [
+    `.flightdeck/epics/${epic}/design.md의 설계대로 구현하세요. 세 Step으로 나눠서 한 번에 하나씩 하세요.`,
+    "Step 1: src/revoke.js에 revokeAll(store)의 기본 동작(모든 값을 used: true로)을 쓰고 module.exports로 내보냅니다.",
+    "Step 2: revokeAll이 무효로 바꾼 토큰 수를 돌려주게 합니다.",
+    "Step 3: src/revoke.js 맨 위에 모듈 설명 주석을 답니다.",
+    "각 Step이 끝날 때마다 node check.js를 실행하고 flightdeck_log_step으로 그 Step을 기록하세요(Step 하나를 구현·확인·기록한 뒤 다음 Step).",
+    "작업 중에 관찰자 의견이 전달되면 그 의견을 따르세요.",
+  ].join("\n");
+  const t1 = Date.now();
+  const r = await h.wf.cfg.adapter.headless!(prompt, { cwd: h.worktree!, model: "haiku", maxTurns: 40, allowedTools: ["Read", "Edit", "Write", "Bash", "mcp__flightdeck"] });
+  clearInterval(opinionLoop);
+  const { readEditLog } = await import("@flightdeck/hook");
+  const dataDir = await h.wf.eng.dataDir();
+  const hookLog = (await readFile(path.join(dataDir, "hook", epic, "hook-log.jsonl"), "utf8").catch(() => "")).split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  await log("에이전트 실행 (조종수)", {
+    sec: Math.round((Date.now() - t1) / 1000),
+    result: r.result.slice(0, 600),
+    opinionDeliveries: hookLog.filter((x) => x.kind === "opinion" || x.kind === "urgent_deny"),
+    revoke: await readFile(path.join(h.worktree!, "src/revoke.js"), "utf8").catch(() => null),
+    edits: (await readEditLog(dataDir, epic)).filter((x) => x.source.kind === "agent").length,
+    implStep: (await (await import("@flightdeck/hook")).readState(dataDir, epic)).impl_step,
+  });
+  // 조종 요청을 기다려 넘긴다 (알림의 "수락" 버튼 = flightdeck.handOff)
+  await until("조종 요청", async () => h.notifications.find((n) => n.includes("조종을 요청했습니다")), 15 * 60_000, 1000);
+  await vscode.commands.executeCommand("flightdeck.handOff", "park");
+  const s = await h.wf.epicState(epic);
+  await log("조종 넘김", { pilot: s.pilot, history: s.pilotHistory, role: await h.wf.role(epic), status: h.statusText() });
+}
+
+/** [park] 레포 창: 조종수가 체크포인트를 올리면 관찰을 시작하고, 조종을 넘겨받으면 이어서 작업한다 */
+async function m8ParkHome(h: ScenarioHooks, log: Log) {
+  // 다시 실행: 이미 넘겨받은 에픽이 있으면 바로 이어서 작업
+  await h.wf.pull();
+  for (const e of await h.wf.store.listEpics()) {
+    const s = await h.wf.epicState(e);
+    if (s.pilot === "park" && s.pilotHistory.length && s.phase === "IMPLEMENTATION") {
+      await log("넘겨받은 에픽 (다시 실행)", { epic: e });
+      await vscode.commands.executeCommand("flightdeck.adoptPilot", e);
+      return;
+    }
+  }
+  const epic = await until("M8 에픽", async () => {
+    await h.wf.pull();
+    for (const e of await h.wf.store.listEpics()) {
+      const s = await h.wf.epicState(e);
+      if (s.phase === "IMPLEMENTATION" && s.owner === "dh.lee" && !s.pilotHistory.length && (await h.wf.eng.fetchCheckpoint(e, "dh.lee", h.wf.gitRemote).catch(() => null))) {
+        const evs = await h.wf.store.list(e);
+        const started = evs.find((x) => x.type === "epic.started");
+        if (started && Date.now() - Date.parse(started.at) < 30 * 60_000) return e;
+      }
+    }
+    return null;
+  }, 15 * 60_000, 3000);
+  await log("관찰 시작", { epic });
+  await vscode.commands.executeCommand("flightdeck.watch", epic);
+  const note = await until("조종 넘겨받음", async () => h.notifications.find((n) => n.includes("조종을 넘겨받았습니다")), 30 * 60_000, 1000);
+  await log("넘겨받음 알림", { note });
+  await vscode.commands.executeCommand("flightdeck.adoptPilot", epic); // 알림의 "이어서 작업"
+}
+
+/** [park] 관찰 창: 적용 지연, 대화, 의견 보내기(일반 → 급한), 실행이 끝나면 조종 요청 */
+async function m8Live(h: ScenarioHooks, log: Log) {
+  const epic = h.epic!;
+  const lw = await until("관찰 창 실시간", async () => h.live?.(), 60_000, 500);
+  const r = h.wf.cfg.remote!;
+  await until("첫 편집 적용", async () => lw.follower.latencies.length > 0, 10 * 60_000, 300);
+  await log("첫 편집 적용", { latencies: lw.follower.latencies, chat: lw.chat.count, status: h.statusText() });
+  await r.server.liveSend(r.product, epic, "opinion", { id: "m8-op1", body: "src/revoke.js의 store가 Map이 아니면 TypeError를 던지게 해 주세요", target: "src/revoke.js" }, [lw.pilot]);
+  await until("일반 의견 전달됨", async () => h.notifications.find((n) => n.includes("내 의견을 에이전트에 전달")), 5 * 60_000, 300);
+  await sleep(4000);
+  await r.server.liveSend(r.product, epic, "opinion", { id: "m8-op2", body: "[급함] 멈추세요: check.js는 절대 고치지 마세요. src/revoke.js만 고치세요" }, [lw.pilot]);
+  await until("급한 의견 전달됨", async () => h.notifications.find((n) => n.includes("급한 의견으로 전달")), 5 * 60_000, 300);
+  // 조종수의 실행이 끝날 때까지 (편집이 30초 동안 없으면)
+  let last = lw.follower.seq;
+  let quietSince = Date.now();
+  await until("실행 끝", async () => {
+    if (lw.follower.seq !== last) {
+      last = lw.follower.seq;
+      quietSince = Date.now();
+    }
+    return Date.now() - quietSince > 30_000;
+  }, 20 * 60_000, 1000);
+  const lat = lw.follower.latencies;
+  const sorted = [...lat].sort((a, b) => a - b);
+  await log("관찰 결과", {
+    applied: lat.length,
+    latencyMs: { max: sorted.at(-1), p50: sorted[Math.floor(sorted.length / 2)], p90: sorted[Math.floor(sorted.length * 0.9)] },
+    chatBlocks: lw.chat.count,
+    revoke: await readFile(path.join(h.worktree!, "src/revoke.js"), "utf8").catch(() => null),
+    status: h.statusText(),
+  });
+  await vscode.commands.executeCommand("flightdeck.requestPilot");
+  await log("조종 요청", {});
+}
+
+/** [park] 넘겨받은 작업 폴더: 이전 조종수의 공유 안 된 작업까지 이어받았는지 보고, Step을 더해 제출한다 */
+async function m8NewPilot(h: ScenarioHooks, log: Log) {
+  const epic = h.epic!;
+  const wt = h.worktree!;
+  const s = await h.wf.epicState(epic);
+  const { readEditLog, readState, logStep } = await import("@flightdeck/hook");
+  const dataDir = await h.wf.eng.dataDir();
+  await log("넘겨받은 작업 폴더", { pilot: s.pilot, history: s.pilotHistory.map((x) => `${x.from}→${x.to}:${x.reason}`), revoke: await readFile(path.join(wt, "src/revoke.js"), "utf8").catch(() => null), editlog: (await readEditLog(dataDir, epic)).length, implStep: (await readState(dataDir, epic)).impl_step, status: h.statusText() });
+  // 실제 에디터 편집으로 Step 하나 더 (사람 편집 → 메모)
+  const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(path.join(wt, "src/revoke.js")));
+  const ed = await vscode.window.showTextDocument(doc);
+  await ed.edit((b) => b.insert(new vscode.Position(doc.lineCount, 0), "// park: 조종을 넘겨받아 마무리함\n"));
+  await doc.save();
+  await sleep(1500);
+  const st = await h.wf.implementationStatus(epic);
+  for (const g of st.coverage.groups) await h.wf.addMemo(epic, g, "조종 인계 뒤 마무리 주석");
+  const r = await h.wf.submitImplementation(epic);
+  const s2 = await h.wf.epicState(epic);
+  void logStep;
+  await log("제출 (새 조종수)", { r: r.ok ? { ok: true, phase: s2.phase } : r, unexplained: st.coverage.unexplained.length, groups: st.coverage.groups.length, warnings: h.wf.warnings.splice(0) });
 }

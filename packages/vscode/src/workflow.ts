@@ -446,6 +446,8 @@ export class EpicWorkflow {
     const ckptSeq = seqTrailer(await git(["log", "-1", "--format=%B", ckpt], { cwd: this.cfg.repo })) ?? 0;
     const log = await r.server.editlog(r.product, epic, 1);
     await replaceEditLog(dataDir, epic, log.records, log.memos);
+    // 세션 원본·테스트 로그 ref도 이어받는다. 받지 않으면 내가 처음 쓰는 기록이 원격과 갈라져 push가 거절된다 (M8 시나리오)
+    await new RunStore(this.cfg.repo).fetch(epic, this.gitRemote).catch(() => false);
     const a = await applyRecords(wt, log.records.filter((x) => x.seq > ckptSeq));
     if (a.mismatch !== null) this.warnings.push(`편집 기록 ${a.mismatch}가 체크포인트 내용과 맞지 않아 그 뒤를 적용하지 못했습니다`);
     const implLog = path.join(wt, implLogRel(epic));
@@ -470,6 +472,22 @@ export class EpicWorkflow {
     await this.cfg.adapter.installConfig(wt, this.hookCommand(epic), { name: "flightdeck", command: "node", args: [path.join(this.cfg.distDir, "flightdeck-mcp.mjs"), "--repo", this.cfg.repo, "--epic", epic] }, { model: this.cfg.model });
     this.uploaded.set(epic, { last: log.last, memos: sha256(JSON.stringify(log.memos))! });
     return { worktree: wt, state: await this.sync(epic), applied: a.applied };
+  }
+
+  /**
+   * 관찰의 시작점 (L8): 조종수의 체크포인트가 원격에 없으면 지금 상태로 하나 만들어 올린다.
+   * 바뀐 것이 없으면 체크포인트를 만들지 않으므로, 시작 직후에는 관찰자가 붙을 곳이 없다(M8 시나리오 1차)
+   */
+  async ensureCheckpoint(epic: string): Promise<string | null> {
+    if (!this.cfg.remote || (await this.role(epic)) !== "owner") return null;
+    const ref = GitEngine.checkpointRef(epic, this.cfg.member);
+    const remote = await git(["ls-remote", this.gitRemote, ref], { cwd: this.cfg.repo }).catch(() => "");
+    if (remote.trim()) return remote.split("\t")[0]!;
+    const dataDir = await this.eng.dataDir();
+    const sha = await this.eng.checkpoint(await this.worktree(epic), { epic, member: this.cfg.member, message: "관찰 시작점", trailers: { "Flightdeck-Source": "human", "Flightdeck-Seq": String(await lastSeq(dataDir, epic)) } });
+    await this.eng.pushCheckpoint(epic, this.cfg.member, this.gitRemote);
+    await this.syncEditlog(epic).catch(() => undefined);
+    return sha;
   }
 
   /** 조종수가 고른 관찰자 의견을 에이전트 전달 대기열에 넣는다 (§8.4, L7) */

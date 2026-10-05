@@ -176,6 +176,8 @@ export interface PilotWindow {
 export async function startPilotWindow(c: LiveCtx, out: vscode.OutputChannel, notify: Notify, refresh: () => void, onRequest: (from: string) => void): Promise<PilotWindow> {
   const r = c.wf.cfg.remote!;
   const dataDir = await c.wf.eng.dataDir();
+  // 관찰자가 붙을 시작점 (L8)
+  await c.wf.ensureCheckpoint(c.epic).catch((e) => out.appendLine(`[실시간] 시작 체크포인트를 올리지 못했다: ${e instanceof Error ? e.message : e}`));
   const streamer = await new PilotStreamer({
     server: r.server,
     product: r.product,

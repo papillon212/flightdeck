@@ -654,8 +654,10 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
             pilotWin = null;
           }
         }
+        // 넘겨받은 조종 (L4). 같은 레포의 다른 창이 먼저 메타 브랜치를 받으면 이 창의 감시는 바뀐 것을 못 본다.
+        // 그래서 관찰 창(그 에픽)도 포함해 모든 창이 확인한다. 알림은 창마다 한 번
         for (const e of await ctx.wf.store.listEpics()) {
-          if (e === ctx.epic) continue;
+          if (e === ctx.epic && ctx.role === "owner") continue;
           const s = await ctx.wf.epicState(e);
           if (adoptedButNotOpened(s, ctx.wf.cfg.member, null)) await offerAdopt(e);
         }

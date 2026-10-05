@@ -172,6 +172,8 @@ describe("조종수 모델 (M8 완료 기준)", { timeout: 90_000 }, () => {
 
   it("조종 넘기기: 체크포인트·편집 기록을 올리고 pilot.changed → 새 조종수가 공유 안 된 작업까지 이어받아 제출한다 (L3·L4)", async () => {
     streamer.stop();
+    // 이전 조종수가 테스트 로그(세션 원본 ref)를 이미 올렸다: 새 조종수의 첫 테스트 로그 push가 거절되면 안 된다
+    await A.runGateCommands(EPIC, (await git(["rev-parse", "HEAD"], { cwd: await A.worktree(EPIC) })).trim());
     await edit(A, "src/token.js", (s) => s + "// 넘기기 직전, 공유 안 된 작업\n");
     const s = await A.handOff(EPIC, "park", "request");
     expect([writerOf(s), s.owner, await A.role(EPIC)]).toEqual(["park", "dh.lee", "viewer"]);
@@ -193,6 +195,7 @@ describe("조종수 모델 (M8 완료 기준)", { timeout: 90_000 }, () => {
     const st = await P.implementationStatus(EPIC);
     for (const g of st.coverage.groups) await P.addMemo(EPIC, g, "조종 넘기기 전후의 정리 주석");
     expect(await P.submitImplementation(EPIC)).toMatchObject({ ok: true, phase: "VERIFICATION" });
+    expect(P.warnings.filter((w) => w.includes("테스트 로그"))).toEqual([]);
     const commit = (await P.epicState(EPIC)).review.requested!.commit;
     expect((await git(["log", "-1", "--format=%an", commit], { cwd: P.cfg.repo })).trim()).toBe("park");
   });
