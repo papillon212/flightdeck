@@ -3,5 +3,6 @@ dist/
 *.vsix
 .flightdeck/.runtime/
 .flightdeck-server/
+deploy/server/server.env
 packages/vscode/ext/dist/
 packages/vscode/ext/config/

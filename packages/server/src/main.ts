@@ -106,7 +106,16 @@ async function main() {
   // 그 밖에는 어드민 화면에서 가져오거나 만든다 (M5.5 Z8: 빈 레포를 저절로 만들면 가져오기가 막힌다)
   for (const { product } of await store.listProducts()) {
     const cfg = await store.currentConfig(product);
-    if (!cfg || parsePipeline(cfg.pipeline_yaml).repo !== BUILTIN_REPO) continue;
+    if (!cfg) continue;
+    // 설정 하나가 깨져도 서버는 뜬다: 그 제품만 건너뛰고 알린다 (어드민 화면에서 고친다)
+    let repo: string;
+    try { repo = parsePipeline(cfg.pipeline_yaml).repo; } catch (e) {
+      const issue = (e as { issues?: { path: PropertyKey[]; message: string }[] }).issues?.[0];
+      const why = issue ? `${issue.path.join(".") || "(전체)"}: ${issue.message}` : e instanceof Error ? e.message.split("\n")[0] : String(e);
+      console.error(`[config] ${product}: 설정을 읽지 못해 건너뛴다 (${why})`);
+      continue;
+    }
+    if (repo !== BUILTIN_REPO) continue;
     const importUrl = product === imported ? arg("--import-repo") : undefined;
     if ((await githost.repoInfo(product)).exists || importUrl) await githost.ensureRepo(product, importUrl ? { importUrl } : {});
     else console.log(`[git] ${product}: 내장 레포가 없다. 어드민 화면에서 가져오거나 만드세요`);

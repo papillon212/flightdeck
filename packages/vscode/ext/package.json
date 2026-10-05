@@ -1,7 +1,7 @@
 {
   "name": "flightdeck",
   "displayName": "Flightdeck",
-  "description": "코딩 에이전트 시대의 원격 페어 프로그래밍 워크플로우 (M2: 원격 협업)",
+  "description": "코딩 에이전트 시대의 원격 페어 프로그래밍 워크플로우",
   "publisher": "flightdeck",
   "version": "0.1.0",
   "private": true,
