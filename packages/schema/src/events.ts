@@ -16,6 +16,8 @@ const data = {
     owner: MemberId,
     base_sha: GitSha,
     config_version: z.string().min(1),
+    /** 그 설정 버전의 내용 해시 (M5.5 Z9). 이 필드가 없던 때 시작한 에픽은 버전 ID만으로 판정한다 */
+    config_hash: z.string().regex(/^sha256:[0-9a-f]{64}$/).optional(),
   }),
   "epic.config_upgraded": z.object({ from_version: z.string().min(1), to_version: z.string().min(1) }),
   "thread.created": z.object({

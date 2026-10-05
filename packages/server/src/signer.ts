@@ -4,7 +4,7 @@
 import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import { artifactHash, checkImplLog, checkSections, configVersionOf, nowIso, reduce, reviewOf, signEvent, ulid } from "@flightdeck/core";
+import { artifactHash, checkImplLog, checkSections, configHash, configVersionOf, nowIso, reduce, reviewOf, signEvent, ulid } from "@flightdeck/core";
 import { git, GitEngine, GitError, RemoteEventStore } from "@flightdeck/git";
 import { Event as EventSchema, GateCommands, parsePipeline, PHASE_ARTIFACT, type Event, type Phase, type Trust } from "@flightdeck/schema";
 import { BUILTIN_REPO, type GitHost } from "./githost.ts";
@@ -173,7 +173,7 @@ export class EventSigner {
       const version = configVersionOf(events, epic);
       const cv = version ? await this.deps.store.getConfigVersion(product, version) : null;
       const pipeline = cv ? parsePipeline(cv.pipeline_yaml) : undefined;
-      return Object.assign(reduce(epic, events, trust, { pipelines: () => pipeline }), { events });
+      return Object.assign(reduce(epic, events, trust, { pipelines: () => pipeline, configHash: () => (cv ? configHash(cv) : undefined) }), { events });
     };
     return { dir, target, store, trust, state };
   }
@@ -201,8 +201,12 @@ export class EventSigner {
     const version = configVersionOf(events, req.epic);
     const cv = version ? await this.deps.store.getConfigVersion(req.product, version) : null;
     const pipeline = cv ? parsePipeline(cv.pipeline_yaml) : undefined;
-    const opts = { pipelines: () => pipeline };
+    const opts = { pipelines: () => pipeline, configHash: () => (cv ? configHash(cv) : undefined) };
     const state = reduce(req.epic, events, trust, opts);
+    if (state.config_mismatch) {
+      // 같은 버전 ID에 다른 내용 (서버 DB 교체·이전 등, M5.5 Z9). 다른 규칙으로 서명하지 않는다
+      throw new RequestError(409, `설정 불일치: 이 에픽은 ${state.config_mismatch.version}(${state.config_mismatch.signed.slice(7, 19)})로 시작했는데 서버의 ${state.config_mismatch.version} 내용이 다르다(${state.config_mismatch.actual.slice(7, 19)}). 관리자가 원래 설정을 복구해야 한다`);
+    }
     const eng = new GitEngine(dir);
 
     /** 원격 에픽 브랜치의 단계 산출물: 형식 검사(§6.3) 후 해시 */
@@ -242,7 +246,7 @@ export class EventSigner {
         if (!/^[0-9a-f]{40}$/.test(base) || !(await isAncestor(dir, base, `refs/remotes/origin/${target}`))) {
           throw new RequestError(409, `base_sha가 원격 ${target}에 없음: ${base || "(없음)"}`);
         }
-        data = { tracker_ref: String(req.data.tracker_ref ?? req.epic), owner: member.id, base_sha: base, config_version: cfg.version };
+        data = { tracker_ref: String(req.data.tracker_ref ?? req.epic), owner: member.id, base_sha: base, config_version: cfg.version, config_hash: configHash(cfg) };
         break;
       }
       case "gate.reported": {

@@ -563,8 +563,10 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       const st = await ctx.wf.implementationStatus(ctx.epic).catch((e) => (out.appendLine(`[impl] ${e}`), null));
       if (st) implLabel = ` · Step ${st.step + 1}${st.coverage.unexplained.length ? ` · 설명 필요 ${st.coverage.unexplained.length}` : ""}`;
     } else if (s.phase !== "IMPLEMENTATION") implLabel = "";
-    status.text = `$(rocket) Flightdeck · ${ctx.epic} · ${s.phase}${tier}${implLabel}${landing}${ro}${myTurn ? " · 내 리뷰 차례" : ""}${open ? ` · 열린 쓰레드 ${open}` : ""}${drafts ? ` · 초안 ${drafts}` : ""}${ctx.offline ? " · 서버 연결 안 됨" : ""}`;
-    status.tooltip = ctx.role === "viewer" ? "읽기 전용 창: 받은 쓰레드에 답글, 리뷰 차례면 수정 요청·승인" : "Flightdeck: 단계 완료·리뷰 요청 / 초안 / 이어서 작업";
+    status.text = `$(rocket) Flightdeck · ${ctx.epic} · ${s.phase}${tier}${implLabel}${landing}${ro}${myTurn ? " · 내 리뷰 차례" : ""}${open ? ` · 열린 쓰레드 ${open}` : ""}${drafts ? ` · 초안 ${drafts}` : ""}${ctx.offline ? " · 서버 연결 안 됨" : ""}${s.config_mismatch ? " · ⚠ 설정 불일치" : ""}`;
+    status.tooltip = s.config_mismatch
+      ? `설정 불일치 (M5.5 Z9): 이 에픽은 ${s.config_mismatch.version}로 시작했는데 서버의 ${s.config_mismatch.version} 내용이 다릅니다. 단계 통과를 판정하지 않습니다. 관리자에게 원래 설정 복구를 요청하세요`
+      : ctx.role === "viewer" ? "읽기 전용 창: 받은 쓰레드에 답글, 리뷰 차례면 수정 요청·승인" : "Flightdeck: 단계 완료·리뷰 요청 / 초안 / 이어서 작업";
     status.command = "flightdeck.menu";
     status.show();
     await view?.refresh(s);

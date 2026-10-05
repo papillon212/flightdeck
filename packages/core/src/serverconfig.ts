@@ -1,6 +1,7 @@
 // 서버가 서명해 배포하는 설정 (설계 §2.5 배포, §12 서버 키 최초 신뢰). 서버와 확장이 같이 쓴다.
 import { parsePipeline, type Trust } from "@flightdeck/schema";
-import { keyFingerprint, verifyPayload } from "./sign.ts";
+import { canonicalJson, keyFingerprint, verifyPayload } from "./sign.ts";
+import { sha256 } from "./util.ts";
 
 export interface ConfigPayload {
   product: string;
@@ -19,6 +20,14 @@ export interface ConfigPayload {
 export interface SignedConfig {
   payload: ConfigPayload;
   sig: string;
+}
+
+/**
+ * 설정 내용 해시 (M5.5 Z9): pipeline.yaml과 룰 전체의 정규화 JSON sha256.
+ * 설정 버전 ID는 서버 DB 안에서만 유일하므로, epic.started에 이 해시를 함께 서명해 다른 내용의 같은 ID를 잡는다
+ */
+export function configHash(c: { pipeline_yaml: string; rules: Record<string, string> }): string {
+  return `sha256:${sha256(canonicalJson({ pipeline_yaml: c.pipeline_yaml, rules: c.rules }))}`;
 }
 
 /** 확장 쪽 검증: 지문이 맞는 키로 서명됐고 파이프라인이 유효한가. 문제가 있으면 이유를 던진다 */

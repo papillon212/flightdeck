@@ -20,7 +20,7 @@ export interface LandDeps {
 }
 
 export interface LandResult {
-  status: "landed" | "rejected" | "skipped";
+  status: "landed" | "rejected" | "skipped" | "error";
   main_commit?: string;
   reason?: string;
   message?: string;
@@ -33,6 +33,7 @@ export async function landEpic(deps: LandDeps, product: string, epic: string): P
   for (let attempt = 1; ; attempt++) {
     const ctx = await deps.load(product);
     const s = await ctx.state(epic);
+    if (s.config_mismatch) return { status: "error", message: `설정 불일치: ${s.config_mismatch.version}의 내용이 에픽 시작 때와 다르다 (반영하지 않음, M5.5 Z9)` };
     if (s.phase !== "LANDING") return { status: "skipped", message: `${s.phase} 단계 (반영 대기가 아님)` };
     if (s.landing?.status !== "pending") return { status: "skipped", message: "main 이동 뒤 테스트 재보고를 기다리는 중 (needs_report)" };
     const dir = ctx.dir;

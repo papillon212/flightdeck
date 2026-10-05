@@ -1,4 +1,4 @@
-# Flightdeck — 설계 문서 v0.15
+# Flightdeck — 설계 문서 v0.16
 
 > 코딩 에이전트 시대의 원격 페어 프로그래밍 워크플로우 도구
 > 작성일: 2026-10-01 · 상태: 초안(Draft)
@@ -80,6 +80,8 @@
 >   - 반영 작업은 **서버가 마지막 승인에 서명할 때 바로 건다.** `land.requested`를 없앴다(§11.1).
 >   - main이 움직였으면 rebase 대신 **main을 에픽 브랜치에 병합한 커밋**을 서버가 올린다. 담당자 확장이 자동으로 테스트를 다시 보고하면 서버가 다시 반영한다(§11.3).
 >   - squash에는 `keep` 목록의 기록만 남기고, 코드 쓰레드 기록은 서버가 만든다. main 감사는 가장 오래된 에픽의 base부터 보고, 예외 목록을 둔다(§5, §11.3, §11.4).
+> - **v0.16** (M5.5 시나리오에서 찾은 문제, 근거: [m5.5-plan.md](m5.5-plan.md) Z9. Z1~Z8은 결정 대기)
+>   - `epic.started`에 **설정 내용 해시**를 서명한다. 같은 버전 ID에 다른 내용이면 "설정 불일치"로 표시하고 판정하지 않는다(§2.5, §3.1).
 
 ---
 
@@ -313,6 +315,11 @@ flightdeck-server DB
   - 개발용으로 로컬 설정 폴더(`flightdeck.configDir`)를 쓰는 모드는 **개발 모드에서만** 켤 수 있다. 이 모드의 에픽은 서버 서명이 없어 서버 검증을 통과하지 못한다.
 - **버전 고정**
   - `epic.started`에 `config_version`을 기록한다. reducer와 서버는 그 에픽을 **고정된 버전의 파이프라인**으로 판정한다.
+  - **설정 내용 해시**: 버전 ID는 서버 DB 안에서만 유일하다(DB 교체·이전, 백업 일부 복원 때 같은 ID가 다른 내용을 가리킬 수 있다). 그래서 `epic.started`에 `config_hash`(pipeline.yaml과 룰 전체의 정규화 JSON sha256)도 서명한다.
+    - 서버·확장은 받은 설정의 해시를 비교한다. 다르면 그 에픽을 **설정 불일치**로 표시하고, 이후 서버 서명 이벤트를 판정하지 않는다. 다른 규칙으로 조용히 계산하지 않는다. 서버는 서명·반영을 거부하고, 확장은 상태 바에 표시하며, main 감사는 우회와 구별해 알린다.
+    - 확장은 받은 설정·캐시·서버 가운데 해시가 맞는 것을 쓴다.
+    - 복구는 관리자가 원래 설정을 같은 내용으로 다시 넣는 것이다. 해시가 맞으면 그대로 이어진다.
+    - 해시가 없던 때 시작한 에픽은 버전 ID만으로 판정한다.
   - 진행 중 에픽에 새 설정을 적용하려면 담당자가 "설정 업그레이드"를 해야 한다. `epic.config_upgraded` 이벤트(서버 서명)가 남고, 이미 받은 승인은 새 규칙으로 다시 판정한다.
 - 에픽 브랜치에서 설정을 고칠 수 없다. 레포 안에 설정 파일이 없고, 에이전트의 `.flightdeck/.runtime/` 쓰기도 차단한다.
 - 멤버 정보는 설정 버전과 별도로 **현재 값**을 쓴다. 멤버를 비활성으로 바꾸면 그 뒤로 서버가 그 멤버의 요청을 받지 않는다. 이미 서명된 이벤트는 그대로 유효하다.
@@ -337,7 +344,7 @@ flightdeck-server DB
 
 | 이벤트 타입 | data | 서버 서명 |
 |---|---|---|
-| `epic.started` | tracker_ref, owner, base_sha, config_version | ✅ |
+| `epic.started` | tracker_ref, owner, base_sha, config_version, config_hash(설정 내용 해시, §2.5) | ✅ |
 | `epic.config_upgraded` | from_version, to_version | ✅ |
 | `thread.created` | thread, phase, file, anchor(§3.3, §3.5), kind, to[], body, commit?(문서 공유 커밋), source?(`human`\|`agent`, 쓰레드 초안 §3.2), patch?(수정 제안, `change_request`만, §9.3) | |
 | `thread.replied` | thread, body, source(`human`\|`agent`\|`session`), patch?(수정 제안, §9.3) | |

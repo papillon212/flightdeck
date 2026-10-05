@@ -68,6 +68,11 @@ export interface EpicState {
   review: ReviewState;
   /** 에픽에 고정된 설정 버전의 파이프라인 (호출하는 쪽이 넘긴 것) */
   pipeline: Pipeline | undefined;
+  /**
+   * 설정 불일치 (M5.5 Z9): 받은 설정 버전의 내용 해시가 epic.started에 서명된 해시와 다르다.
+   * 이때는 파이프라인을 쓰지 않고, 이후 서버 서명 이벤트를 판정하지 않는다(다른 규칙으로 조용히 계산하지 않는다)
+   */
+  config_mismatch: { version: string; signed: string; actual: string } | null;
   /** 테스트 결과 보고 (§7.5): 커밋 → 마지막 보고. ok = 모든 명령 종료 코드 0 */
   gates: Map<string, { ok: boolean; event: string; author: string; at: string }>;
   /** LANDING 단계의 반영 진행 */
@@ -81,6 +86,8 @@ export interface EpicState {
 export interface ReduceOptions {
   /** 설정 버전 → 파이프라인. epic.started.config_version으로 찾는다. 없으면 티어 리뷰 이벤트를 처리하지 못한다 */
   pipelines?: ReadonlyMap<string, Pipeline> | ((version: string) => Pipeline | undefined);
+  /** 설정 버전 → 내용 해시(configHash). 주면 epic.started.config_hash와 비교한다 (M5.5 Z9) */
+  configHash?: (version: string) => string | undefined;
 }
 
 export function initialState(epic: string): EpicState {
@@ -97,6 +104,7 @@ export function initialState(epic: string): EpicState {
     ignored: [],
     review: { phase: "INTAKE", requested: null, approvals: [] },
     pipeline: undefined,
+    config_mismatch: null,
     gates: new Map(),
     landing: null,
     landed: null,
@@ -117,7 +125,7 @@ export function reduce(epic: string, events: Event[], trust: Trust, opts: Reduce
   for (const e of sorted) {
     const reason = trustProblem(e, trust);
     if (reason) s.ignored.push({ event: e.id, type: e.type, reason });
-    else apply(s, e, find);
+    else apply(s, e, find, opts.configHash);
   }
   return s;
 }
@@ -150,10 +158,11 @@ export function trustProblem(e: Event, trust: Trust): string | null {
   return null;
 }
 
-function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | undefined): void {
+function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | undefined, hashOf?: (v: string) => string | undefined): void {
   const ignore = (reason: string): void => {
     s.ignored.push({ event: e.id, type: e.type, reason });
   };
+  if (s.config_mismatch && needsServerSignature(e)) return ignore(`설정 불일치: ${s.config_mismatch.version}의 내용이 에픽 시작 때와 다르다 (판정하지 않음)`);
   const move = (to: Phase) => {
     s.history.push({ at: e.at, from: s.phase, to, by: e.author, event: e.id });
     s.phase = to;
@@ -168,7 +177,10 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
       s.owner = e.data.owner;
       s.base_sha = e.data.base_sha;
       s.config_version = e.data.config_version;
-      s.pipeline = findPipeline(e.data.config_version);
+      const actual = e.data.config_hash ? hashOf?.(e.data.config_version) : undefined;
+      if (e.data.config_hash && actual && actual !== e.data.config_hash) {
+        s.config_mismatch = { version: e.data.config_version, signed: e.data.config_hash, actual };
+      } else s.pipeline = findPipeline(e.data.config_version);
       s.tracker_ref = e.data.tracker_ref;
       move("ANALYSIS"); // INTAKE는 자동으로 지나간다 (§4.1)
       return;

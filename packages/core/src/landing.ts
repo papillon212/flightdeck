@@ -25,12 +25,14 @@ export interface AuditFinding {
  * Flightdeck-Epic trailer가 없거나, 그 에픽의 서명된 epic.landed.main_commit과 다른 것.
  * landed: 에픽 → 서명된 반영 커밋. allow: 어드민이 확인한 예외 커밋
  */
-export function auditMain(commits: MainCommit[], landed: ReadonlyMap<string, string>, allow: readonly string[] = []): AuditFinding[] {
+export function auditMain(commits: MainCommit[], landed: ReadonlyMap<string, string>, allow: readonly string[] = [], mismatched: ReadonlyMap<string, string> = new Map()): AuditFinding[] {
   const out: AuditFinding[] = [];
   for (const c of commits) {
     if (allow.some((a) => a.length >= 7 && c.sha.startsWith(a))) continue;
     const epic = c.trailers["Flightdeck-Epic"];
     if (!epic) out.push({ sha: c.sha, subject: c.subject, reason: "Flightdeck-Epic trailer가 없는 main 커밋 (반영 서버를 거치지 않음)" });
+    // 설정 불일치(M5.5 Z9): 반영이 정상이었는지 판정할 수 없다. 우회와 구별해 알린다
+    else if (mismatched.has(epic)) out.push({ sha: c.sha, subject: c.subject, reason: `에픽 ${epic}의 설정 불일치로 판정할 수 없음 (서버의 ${mismatched.get(epic)} 내용이 에픽 시작 때와 다름)` });
     else if (landed.get(epic) !== c.sha) out.push({ sha: c.sha, subject: c.subject, reason: `에픽 ${epic}의 서명된 반영(epic.landed)과 맞지 않는 커밋` });
   }
   return out;

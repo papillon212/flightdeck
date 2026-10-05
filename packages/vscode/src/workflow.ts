@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
-import { applyTextEdit, artifactHash, auditMain, checkSections, configVersionOf, diffRecords, diffToEdits, draftText, ensureParagraphIds, insertDrafts, linesLabel, mapLines, myOpenThreads, type AuditFinding, type MainCommit, needsServerSignature, nowIso, parseDrafts, parseImplLog, pipelineFromDir, reduce, removeDrafts, renderThreads, replay, restoreParagraphIds, reviewOf, sha256, stripThreads, threadIdFrom, trustFromConfig, ulid, type ConfigPayload, type CoverageReport, type Draft, type EpicState, type MemoGroup, type Thread } from "@flightdeck/core";
+import { applyTextEdit, artifactHash, auditMain, checkSections, configHash, configVersionOf, diffRecords, diffToEdits, draftText, ensureParagraphIds, insertDrafts, linesLabel, mapLines, myOpenThreads, type AuditFinding, type MainCommit, needsServerSignature, nowIso, parseDrafts, parseImplLog, pipelineFromDir, reduce, removeDrafts, renderThreads, replay, restoreParagraphIds, reviewOf, sha256, stripThreads, threadIdFrom, trustFromConfig, ulid, type ConfigPayload, type CoverageReport, type Draft, type EpicState, type MemoGroup, type Thread } from "@flightdeck/core";
 import { git, GitEngine, LocalEventStore, MetaRewriteError, RAW_ARGS, RAW_ENV, RemoteEventStore, RunStore } from "@flightdeck/git";
 import { DEV_TRUST, HANDOFF_SECTIONS, parsePipeline, PHASE_ARTIFACT, type Anchor, type EditMemo, type EditRecord, type EditSource, type Event, type EventOf, type EventType, type LocalEpicStateInput, type Phase, type Pipeline, type Trust } from "@flightdeck/schema";
 import type { AgentAdapter } from "@flightdeck/agent";
@@ -130,36 +130,61 @@ export class EpicWorkflow {
     return `node ${q(path.join(this.cfg.distDir, "flightdeck-hook.mjs"))} ${this.cfg.adapter.id} --repo ${q(this.cfg.repo)} --epic ${q(epic)}`;
   }
 
-  private pipelineCache = new Map<string, Pipeline | undefined>();
+  private pipelineCache = new Map<string, { pipeline: Pipeline; hash?: string }>();
 
   /**
    * 에픽에 고정된 설정 버전의 파이프라인 (§2.5 버전 고정, 티어 리뷰 판정).
    * 개발 모드는 설정 폴더, 서버 모드는 받은 설정 → 캐시 → 서버 순으로 찾는다
    */
   async pipelineFor(version: string | null): Promise<Pipeline | undefined> {
-    if (!version) return undefined;
-    if (this.pipelineCache.has(version)) return this.pipelineCache.get(version);
-    const r = this.cfg.remote;
-    let p: Pipeline | undefined;
-    if (!r) p = pipelineFromDir(this.cfg.configDir);
-    else if (version === r.config.version) p = parsePipeline(r.config.pipeline_yaml);
-    else {
-      const dataDir = await this.eng.dataDir();
-      let c = await loadCachedConfig(dataDir, r.product, version);
-      if (!c) {
-        c = await r.server.config(r.product, version).catch(() => null);
-        if (c) await cacheConfig(dataDir, c);
-      }
-      p = c ? parsePipeline(c.pipeline_yaml) : undefined;
-    }
-    if (p) this.pipelineCache.set(version, p);
-    return p;
+    return (await this.configFor(version))?.pipeline;
   }
 
-  /** 이벤트로 에픽 상태를 계산한다 (신뢰 기준 + 에픽의 파이프라인) */
+  /**
+   * 설정 버전의 파이프라인과 내용 해시 (M5.5 Z9).
+   * 받은 설정 → 캐시 → 서버 순으로 보고, want(에픽 시작 때 서명된 해시)가 있으면 해시가 맞는 것을 고른다.
+   * 맞는 것이 없으면 처음 찾은 것을 돌려주고, reducer가 설정 불일치로 표시한다
+   */
+  async configFor(version: string | null, want?: string): Promise<{ pipeline: Pipeline; hash?: string } | undefined> {
+    if (!version) return undefined;
+    const key = `${version}\0${want ?? ""}`;
+    if (this.pipelineCache.has(key)) return this.pipelineCache.get(key);
+    const r = this.cfg.remote;
+    let found: { pipeline: Pipeline; hash?: string } | undefined;
+    if (!r) {
+      const p = pipelineFromDir(this.cfg.configDir);
+      found = p ? { pipeline: p } : undefined;
+    } else {
+      const dataDir = await this.eng.dataDir();
+      const tries: (() => Promise<ConfigPayload | null>)[] = [
+        async () => (version === r.config.version ? r.config : null),
+        () => loadCachedConfig(dataDir, r.product, version),
+        async () => {
+          const c = await r.server.config(r.product, version).catch(() => null);
+          if (c) await cacheConfig(dataDir, c);
+          return c;
+        },
+      ];
+      for (const t of tries) {
+        const c = await t();
+        if (!c) continue;
+        const cand = { pipeline: parsePipeline(c.pipeline_yaml), hash: configHash(c) };
+        found ??= cand;
+        if (!want || cand.hash === want) {
+          found = cand;
+          break;
+        }
+      }
+    }
+    if (found) this.pipelineCache.set(key, found);
+    return found;
+  }
+
+  /** 이벤트로 에픽 상태를 계산한다 (신뢰 기준 + 에픽의 파이프라인, 설정 내용 해시 확인) */
   async reduceEvents(epic: string, events: Event[]): Promise<EpicState> {
-    const p = await this.pipelineFor(configVersionOf(events, epic));
-    return reduce(epic, events, this.trust, { pipelines: () => p });
+    const started = events.find((e) => e.epic === epic && e.type === "epic.started") as EventOf<"epic.started"> | undefined;
+    const c = await this.configFor(configVersionOf(events, epic), started?.data.config_hash);
+    return reduce(epic, events, this.trust, { pipelines: () => c?.pipeline, configHash: () => c?.hash });
   }
 
   private async emit<T extends EventType>(epic: string, type: T, data: EventOf<T>["data"], author = this.cfg.member, id = ulid()): Promise<EventOf<T>> {
@@ -1044,11 +1069,13 @@ export class EpicWorkflow {
     const target = p.landing.target;
     await git(["fetch", "-q", "--no-tags", this.gitRemote, `+refs/heads/${target}:refs/remotes/${this.gitRemote}/${target}`], { cwd: this.cfg.repo });
     const landed = new Map<string, string>();
+    const mismatched = new Map<string, string>();
     const bases: string[] = [];
     for (const epic of await this.store.listEpics()) {
       const s = await this.epicState(epic);
       if (s.base_sha) bases.push(s.base_sha);
       if (s.landed) landed.set(epic, s.landed.main_commit);
+      if (s.config_mismatch) mismatched.set(epic, s.config_mismatch.version);
     }
     if (!bases.length) return [];
     // 가장 오래된 base: 다른 base들의 조상
@@ -1068,7 +1095,7 @@ export class EpicWorkflow {
         for (const m of (tr ?? "").matchAll(/^([A-Za-z-]+): (.+)$/gm)) trailers[m[1]!] = m[2]!;
         return { sha, subject, trailers };
       });
-    return auditMain(commits, landed, p.landing.audit_allow);
+    return auditMain(commits, landed, p.landing.audit_allow, mismatched);
   }
 
   /** 자동 초안 (§6.1 headless): 백그라운드 claude -p. 끝나면 세션 ID로 이어서 작업(resume)한다 */

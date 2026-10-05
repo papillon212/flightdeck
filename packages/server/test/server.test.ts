@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { artifactHash, generateServerKey, keyFingerprint, reduce, trustFromConfig, ulid, verifyConfig, verifyEvent, type SignedConfig } from "@flightdeck/core";
+import { artifactHash, configHash, generateServerKey, keyFingerprint, reduce, trustFromConfig, ulid, verifyConfig, verifyEvent, type SignedConfig } from "@flightdeck/core";
 import { git, GitEngine, RemoteEventStore } from "@flightdeck/git";
 import type { Event } from "@flightdeck/schema";
 import { createApp, EventSigner, MemoryStore, PgStore, readProductDir, type ServerStore } from "../src/index.ts";
@@ -121,6 +121,20 @@ describe("서버 서명 이벤트 (§3.1, §4.2, §12)", { timeout: 60_000 }, ()
     expect(s).toMatchObject({ phase: "ANALYSIS", owner: "dh.lee" });
     const again = await api("dh.lee", "POST", "/events", { product: "sample", epic: EPIC, type: "epic.started", data: { base_sha: base } });
     expect(again).toMatchObject({ status: 409, data: { error: expect.stringContaining("이미 시작된 에픽") } });
+  });
+
+  it("설정 내용 해시 (M5.5 Z9): epic.started에 서명되고, 같은 버전 ID에 다른 내용을 가진 서버는 서명하지 않는다", async () => {
+    const started = (await ownerStore().list(EPIC)).find((e) => e.type === "epic.started")!;
+    expect((started.data as { config_hash?: string }).config_hash).toBe(configHash((await store.currentConfig("sample"))!));
+    // DB를 바꾼 서버: sample-v1이라는 ID는 같지만 룰 한 줄이 다르다
+    const other = new MemoryStore();
+    await other.upsertMember({ id: "dh.lee", email: "dh@e.com", active: true, admin: true }, "test");
+    const p = await readProductDir(SAMPLE, remote);
+    await other.addConfigVersion({ ...p, rules: { ...p.rules, common: p.rules.common + "\n바뀐 줄\n" }, created_by: "test" });
+    expect((await other.currentConfig("sample"))!.version).toBe("sample-v1");
+    const s2 = new EventSigner({ store: other, dataDir: path.join(root, "server2"), ...keys });
+    const m = (await other.getMember("dh.lee"))!;
+    await expect(s2.request(m, { product: "sample", epic: EPIC, type: "phase.completed", data: { phase: "ANALYSIS" } })).rejects.toThrow(/설정 불일치: 이 에픽은 sample-v1/);
   });
 
   it("단계 완료: 에픽 브랜치 공유·형식·쓰레드·담당자·artifact_hash를 모두 확인한 뒤 서명", async () => {
