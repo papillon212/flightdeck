@@ -67,6 +67,7 @@ export async function runScenario(h: ScenarioHooks, dir: string): Promise<void> 
   try {
     if (process.env.FLIGHTDECK_SCENARIO_KIND === "m3") return await runM3(h, log);
     if (process.env.FLIGHTDECK_SCENARIO_KIND === "m4") return await runM4(h, log);
+    if (process.env.FLIGHTDECK_SCENARIO_KIND === "m5") return await runM5(h, log);
     if (me === "dh.lee" && !h.epic) return await ownerStart(h, log);
     if (me === "dh.lee" && h.role === "owner") return await ownerAsk(h, log);
     if (me === "park" && !h.epic) return await viewerWait(h, log);
@@ -439,4 +440,196 @@ async function m4Viewer(h: ScenarioHooks, log: Log) {
   const r = await h.wf.cfg.adapter.headless!(prompt, { cwd: h.worktree!, model: "haiku", maxTurns: 8, allowedTools: ["Read", "Grep", "Glob", "mcp__flightdeck"] });
   const { RunStore } = await import("@flightdeck/git");
   await log("세션 원본 검색", { sec: Math.round((Date.now() - t1) / 1000), status: h.statusText(), runs: await new RunStore(h.wf.cfg.repo).files(epic), answer: r.result.slice(0, 800) });
+}
+
+// ---------------------------------------------------------------- M5: 검증·반영 (docs/m5-plan.md)
+// 담당자 dh.lee, 검증 lead park, qa choi (설정: 설계 lead = dh.lee 자기 승인, 검증 lead = park, qa = choi, 관문 명령 node check.js).
+// 담당자의 구현은 훅이 하는 일(에이전트 출처 편집 기록 + log_step)을 직접 한다(M4에서 실제 claude로 확인).
+// park의 에이전트(실제 claude haiku 1회)가 리뷰 사본에서 고친 것을 park이 수정 제안으로 올린다.
+// choi는 승인 직전에 main에 다른 커밋을 넣어(Flightdeck 밖) main 이동 → 병합 → 재보고 경로와 감사를 확인한다.
+
+const M5_TASK = "[M5 시나리오]";
+const M5_TOKEN = [
+  'const crypto = require("crypto");',
+  "",
+  "function rotate(store, token) {",
+  "  const cur = store.get(token);",
+  '  if (!cur || cur.used) throw new Error("reused");',
+  "  cur.used = true;",
+  '  const next = crypto.randomBytes(16).toString("hex");',
+  "  store.set(next, { used: false });",
+  "  return next;",
+  "}",
+  "",
+  "module.exports = { rotate };",
+  "",
+].join("\n");
+
+async function runM5(h: ScenarioHooks, log: Log) {
+  const me = h.wf.cfg.member;
+  if (me === "dh.lee" && !h.epic) return m5OwnerStart(h, log);
+  if (me === "dh.lee") return m5Owner(h, log);
+  if (!h.epic) return m5ReviewerWait(h, log);
+  if (me === "park") return m5Lead(h, log);
+  if (me === "choi") return m5Qa(h, log);
+}
+
+/** 1. [dh.lee] 시작 → 분석·설계(자기 승인) → 구현(Step 1) → 구현 제출 → VERIFICATION 리뷰 요청 */
+async function m5OwnerStart(h: ScenarioHooks, log: Log) {
+  // 다시 실행해도 이어서 한다 (이미 시작한 에픽은 "내 일감"에서 빠지므로 일감 도구에서 직접 찾는다)
+  const tracker = h.wf.cfg.remote!.tracker!;
+  const t = (await tracker.listAssignedEpics(await tracker.me())).find((e) => e.title.includes(M5_TASK));
+  if (!t) throw new Error("M5 시나리오 일감이 내 일감에 없다");
+  const epic = t.epicId;
+  await h.wf.pull();
+  const r = (await h.wf.epicState(epic)).owner ? { worktree: await h.wf.worktree(epic) } : await h.wf.startFromTracker(t);
+  const dir = path.join(r.worktree, ".flightdeck/epics", epic);
+  if ((await h.wf.epicState(epic)).phase === "ANALYSIS") {
+    await writeFile(path.join(dir, "analysis.md"), ANALYSIS);
+    await h.wf.completePhase(epic);
+  }
+  if ((await h.wf.epicState(epic)).phase === "DESIGN") {
+    await writeFile(path.join(dir, "design.md"), M4_DESIGN);
+    await h.wf.requestReview(epic);
+    await h.wf.approve(epic);
+  }
+  // 에이전트가 하는 일 (훅): src/token.js 작성 → 편집 기록(Step 1) → log_step
+  const { appendEditRecords, logStep, readEditLog, readState } = await import("@flightdeck/hook");
+  const { diffRecords, nowIso, ulid } = await import("@flightdeck/core");
+  const dataDir = await h.wf.eng.dataDir();
+  const run = ulid();
+  if (!(await readEditLog(dataDir, epic)).some((x) => x.file === "src/token.js")) {
+    await mkdir(path.join(r.worktree, "src"), { recursive: true });
+    const f = path.join(r.worktree, "src/token.js");
+    const before = await readFile(f, "utf8").catch(() => null);
+    await writeFile(f, M5_TOKEN);
+    const st = await readState(dataDir, epic);
+    await appendEditRecords(dataDir, epic, diffRecords(epic, "src/token.js", before, M5_TOKEN, { kind: "agent", member: "dh.lee", adapter: "claude-code", run, step: st.impl_step + 1 }, nowIso()));
+  }
+  if ((await readState(dataDir, epic)).impl_step === 0) {
+    const design = await readFile(path.join(dir, "design.md"), "utf8");
+    const pid = /<!-- (p:[0-9a-f]{4}) -->\n- rotate/.exec(design)?.[1] ?? /<!-- (p:[0-9a-f]{4}) -->/.exec(design)![1]!;
+    await logStep(await h.wf.implContext(epic), { title: "rotate와 재사용 탐지", design_ref: `design.md#${pid}`, intent: "설계의 rotate 구현", decision: "Map 저장, randomBytes(16) hex", alternatives: "없음", review_points: "src/token.js:5 재사용 판정", verification: "node check.js  # ok 3 passed" }, run);
+  }
+  const sub = await h.wf.submitImplementation(epic);
+  const s = await h.wf.epicState(epic);
+  await log("구현 제출 → 검증 리뷰 요청", { epic, submit: sub, phase: s.phase, tier: s.review.requested ? "lead" : "-", warnings: h.wf.warnings.splice(0) });
+  await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(r.worktree), { forceNewWindow: false });
+}
+
+/** 4·6. [dh.lee] 수정 제안 알림 → 반영 → 다시 요청 → (main 이동) 재보고 자동 → DONE */
+async function m5Owner(h: ScenarioHooks, log: Log) {
+  const epic = h.epic!;
+  await h.refresh();
+  let s = await h.wf.epicState(epic);
+  if (s.phase === "VERIFICATION" && ![...s.threads.values()].some((t) => t.applied.length)) {
+    const t1 = Date.now();
+    const note = await until("수정 제안 알림", async () => h.notifications.find((n) => n.includes("@park의 수정 요청")), 10 * 60_000);
+    s = await h.wf.epicState(epic);
+    const t = [...s.threads.values()].find((x) => x.author === "park" && x.patch)!;
+    await log("수정 제안 알림", { notification: note, waitSec: Math.round((Date.now() - t1) / 1000), thread: t.id, anchor: t.anchor, patch: t.patch });
+    const ct = h.commentThread(t.id);
+    await vscode.commands.executeCommand("flightdeck.applyPatch", ct); // 쓰레드의 "수정 제안 반영" 버튼 (끝의 확인 알림은 무시)
+    await vscode.commands.executeCommand("flightdeck.reply", { thread: h.commentThread(t.id), text: "반영했습니다. 다시 요청합니다." });
+    const st = await h.wf.implementationStatus(epic);
+    const r = await h.wf.requestVerification(epic); // "검증 다시 요청" 명령의 함수 (경고 창이 모달이라)
+    await log("반영·다시 요청", { file: await readFile(path.join(h.worktree!, "src/token.js"), "utf8"), unexplained: st.coverage.unexplained.length, r: r.ok ? { ok: true, tier: "lead" } : r, status: h.statusText() });
+  }
+  const t2 = Date.now();
+  let sawNeedsReport = false;
+  s = await until("DONE", async () => {
+    await h.refresh(); // LANDING · needs_report면 refresh가 재보고한다
+    const x = await h.wf.epicState(epic);
+    if (x.landing?.status === "needs_report") sawNeedsReport = true;
+    return x.phase === "DONE" ? x : null;
+  }, 20 * 60_000, 5000);
+  const evs = (await h.wf.store.list(epic)).filter((e) => ["gate.reported", "review.requested", "review.approved", "land.rejected", "epic.landed"].includes(e.type)).map((e) => `${e.type}${"reason" in e.data ? `(${(e.data as { reason: string }).reason})` : ""}/${e.author}/${e.sig ? "서명" : "-"}`);
+  const main = s.landed!.main_commit;
+  await git(["fetch", "-q", h.wf.gitRemote, "main"], { cwd: h.wf.cfg.repo });
+  const ref = s.tracker_ref!;
+  await sleep(3000); // 일감 조정
+  await h.refresh();
+  await log("반영 완료", {
+    waitSec: Math.round((Date.now() - t2) / 1000),
+    sawNeedsReport,
+    status: h.statusText(),
+    events: evs,
+    main,
+    message: (await git(["log", "-1", "--format=%B", main], { cwd: h.wf.cfg.repo })).trim(),
+    files: (await git(["show", "--stat", "--format=", main], { cwd: h.wf.cfg.repo })).trim().split("\n"),
+    epicBranch: (await git(["ls-remote", h.wf.gitRemote, `refs/heads/flightdeck/${epic}`], { cwd: h.wf.cfg.repo })).trim() || "(삭제됨)",
+    tracker: await h.wf.cfg.remote?.tracker?.getEpic(ref).then((x) => x.status, (e) => String(e)),
+    audit: (await h.wf.auditMain()).map((f) => `${f.sha.slice(0, 7)} ${f.subject}`),
+    warnings: h.wf.warnings.splice(0),
+  });
+}
+
+/** 2. [park·choi] 리뷰 차례 알림 → 리뷰 사본 */
+async function m5ReviewerWait(h: ScenarioHooks, log: Log) {
+  const t1 = Date.now();
+  const item = await until("검증 리뷰 차례", async () => (await h.wf.reviewInbox()).find((i) => i.phase === "VERIFICATION"), 20 * 60_000, 5000);
+  await log("리뷰 차례", { item, waitSec: Math.round((Date.now() - t1) / 1000), notified: h.notifications.find((n) => n.includes("리뷰 차례입니다")) ?? null });
+  await h.openViewer(item.epic, item.commit);
+}
+
+/** 3·5. [park] 에이전트(실제 claude)가 리뷰 사본에서 고침 → 수정 제안 → 담당자 반영·재요청 → 해결·승인 */
+async function m5Lead(h: ScenarioHooks, log: Log) {
+  const epic = h.epic!;
+  const wt = h.worktree!;
+  await h.refresh();
+  await log("리뷰 사본", { role: h.role, status: h.statusText() });
+  const s0 = await h.wf.epicState(epic);
+  if (![...s0.threads.values()].some((t) => t.author === "park")) {
+    const prompt = [
+      "이 리뷰 사본의 src/token.js를 읽고, rotate 함수 맨 앞에 token이 문자열이 아니면 TypeError('token must be a string')를 던지는 검사를 한 줄 추가하세요.",
+      "다른 동작은 바꾸지 마세요. node check.js로 확인하고, 결과를 한 줄로 알려 주세요.",
+    ].join("\n");
+    const t1 = Date.now();
+    const r = await h.wf.cfg.adapter.headless!(prompt, { cwd: wt, model: "haiku", maxTurns: 10, allowedTools: ["Read", "Edit", "Write", "Bash", "mcp__flightdeck"] });
+    const changed = await git(["status", "--short"], { cwd: wt });
+    await log("에이전트 수정 (리뷰 사본)", { sec: Math.round((Date.now() - t1) / 1000), result: r.result.slice(0, 300), changed: changed.trim() });
+    // "수정 제안 만들기": src/token.js의 rotate 줄을 골라 실행한 것과 같다
+    const doc = await vscode.workspace.openTextDocument(path.join(wt, "src/token.js"));
+    const line = doc.getText().split("\n").findIndex((l) => l.includes("function rotate"));
+    const tid = await h.wf.suggestFix(epic, { file: "src/token.js", range: [line + 1, line + 1], body: "token 형식 검사를 넣어 주세요 (리뷰 사본에서 확인: node check.js 통과)" });
+    await h.refresh();
+    const t = (await h.wf.epicState(epic)).threads.get(tid)!;
+    await log("수정 제안", { thread: tid, anchor: t.anchor, patch: t.patch, copyClean: (await git(["status", "--short"], { cwd: wt })).trim() === "", approveError: await h.wf.approve(epic).then(() => "승인됨(예상 밖)", (e) => (e as Error).message) });
+  }
+  const first = (await h.wf.epicState(epic)).review.requested!.event;
+  const t2 = Date.now();
+  await until("담당자 다시 요청", async () => {
+    const s = await h.wf.epicState(epic);
+    if (s.review.requested?.event === first) {
+      await h.wf.pull();
+      return false;
+    }
+    await h.wf.openAsViewer(epic);
+    return true;
+  }, 15 * 60_000, 5000);
+  await h.refresh();
+  const s = await h.wf.epicState(epic);
+  const mine = [...s.threads.values()].find((t) => t.author === "park")!;
+  await vscode.commands.executeCommand("flightdeck.resolve", h.commentThread(mine.id));
+  const s2 = await h.wf.approve(epic);
+  await log("lead 승인", { waitSec: Math.round((Date.now() - t2) / 1000), applied: mine.applied.length, replies: mine.replies.map((r) => `@${r.author}: ${r.body}`), copyHasFix: (await readFile(path.join(wt, "src/token.js"), "utf8")).includes("TypeError"), next: s2.review.requested ? "qa" : s2.phase });
+}
+
+/** 6. [choi] main에 다른 커밋(Flightdeck 밖) → qa 승인 → 서버가 반영 */
+async function m5Qa(h: ScenarioHooks, log: Log) {
+  const epic = h.epic!;
+  await h.refresh();
+  const item = await until("qa 차례", async () => (await h.wf.reviewInbox()).find((i) => i.epic === epic && i.tier === "qa"), 20 * 60_000, 5000);
+  await h.wf.openAsViewer(epic, item.commit);
+  // 그 사이 다른 일이 main에 들어온다 (반영 서버를 거치지 않은 직접 push → 감사에 걸려야 한다)
+  const repo = h.wf.cfg.repo;
+  await git(["fetch", "-q", "origin", "main"], { cwd: repo });
+  await git(["checkout", "-q", "main"], { cwd: repo });
+  await git(["merge", "-q", "--ff-only", "origin/main"], { cwd: repo });
+  await writeFile(path.join(repo, "NOTICE.md"), "M5 시나리오: 검증 중에 main에 들어온 다른 변경\n");
+  await git(["add", "NOTICE.md"], { cwd: repo });
+  await git(["-c", "user.name=choi", "-c", "user.email=choi@test.local", "commit", "-q", "-m", "M5 시나리오: main 이동"], { cwd: repo });
+  await git(["push", "-q", "origin", "main"], { cwd: repo });
+  const s = await h.wf.approve(epic);
+  await log("qa 승인", { phase: s.phase, landing: s.landing, mainMoved: (await git(["rev-parse", "HEAD"], { cwd: repo })).trim() });
 }

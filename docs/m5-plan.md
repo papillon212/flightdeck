@@ -53,3 +53,24 @@
 
 | 단계 | 커밋 | 결과 |
 |---|---|---|
+| M5-1~M5-4 | `b16b462`, `b8e36bd` | reducer: VERIFICATION 리뷰(통과 보고가 있는 커밋만 요청), 수정 제안(`patch`, `patch.applied`), 구현 재개, LANDING·DONE(`epic.landed`, `land.rejected` needs_report/conflict). core: 반영 기록 정리, main 감사, 코드 쓰레드 줄 옮기기. 서버: 반영 작업(재검증 → main 병합 커밋·재보고 대기 → squash → main push → `epic.landed` → 에픽 브랜치 삭제), 마지막 승인·재보고 서명 때 작업 등록, 1분 스캔, `POST /land`·`GET /land/<job>`. 훅: 리뷰 사본 정책, VERIFICATION 셸은 관문 명령만. workflow·확장: 리뷰 사본, 코드 쓰레드 표시·만들기, 수정 제안 만들기·반영, 검증 다시 요청, 구현 재개, 반영 재보고 자동, main 감사. 테스트 190개 |
+| M5-5 | (이번 커밋) | 실제 VS Code 시나리오(아래). 견본 설정에 `rules/verification.md` 추가, 시나리오 창 실행 스크립트가 멤버 목록을 받게 함 |
+
+### M5 완료 확인 결과 (2026-10-05)
+
+실제 VS Code 세 창(담당자 dh.lee, 검증 lead park, qa choi) + GitHub `test-flightdeck` + 로컬 서버 + 실제 ClickUp. 설정: 설계 lead = dh.lee(자기 승인), architect 없음, 검증 lead = park, qa = choi, 관문 명령 `node check.js`. 담당자의 구현은 훅이 하는 일을 직접 했고(실제 claude 구현은 M4에서 확인), park의 에이전트는 **실제 claude(haiku) 1회**. 경고 창(모달)과 확인 알림 버튼 대신 그것이 부르는 함수를 불렀다.
+
+| 단계 | 멤버 | 결과 |
+|---|---|---|
+| 구현 제출 → 검증 리뷰 요청 | dh.lee | 관문 통과 → 커밋·공유 → `node check.js` → 서명 `gate.reported`·`phase.completed` → 서명 `review.requested(VERIFICATION)` (tree 해시), lead 차례 |
+| 리뷰 사본 | park | 리뷰 차례 → 쓰기 가능한 리뷰 사본(`VERIFICATION(lead) · 리뷰 사본 · 내 리뷰 차례`) |
+| 에이전트 수정 → 수정 제안 | park | claude가 리뷰 사본에서 `rotate`에 형식 검사 한 줄 추가·`node check.js` 통과(19초). "수정 제안 만들기" → `change_request` 코드 쓰레드(앵커: 리뷰 커밋 3줄, 앞뒤 문맥) + 패치. 사본은 리뷰 커밋으로 되돌아감. 이 상태의 승인은 서버가 거부("승인자가 연 열린 쓰레드 1개") |
+| 반영·다시 요청 | dh.lee | "@park의 수정 요청" 알림 → 쓰레드의 "수정 제안 반영" → 설명 필요 0(출처 patch) → 답글 → 검증 다시 요청(관문·커밋·테스트·보고·요청) → lead부터 다시 |
+| lead 승인 | park | 사본이 새 리뷰 커밋으로 옮겨짐(수정 포함) → 쓰레드 해결 → 승인(서명) → qa 차례 |
+| main 이동 + qa 승인 | choi | main에 직접 커밋 push(Flightdeck 밖) → 승인(서명) → LANDING |
+| 반영 | 서버·dh.lee | 서버: main이 움직여 병합 커밋을 에픽 브랜치에 올리고 서명 `land.rejected(needs_report)`. 담당자 창: 병합 커밋으로 fast-forward·테스트 재보고(자동). 서버: 재보고 서명과 함께 다시 반영 → main에 squash `736ae1a`(trailer: 에픽·설정·승인 2개·반영자), trace 제외, `threads/code.json` 생성, 에픽 브랜치 삭제, 서명 `epic.landed` → **DONE**. 담당자 확장의 일감 조정으로 ClickUp `complete`. 승인부터 DONE까지 약 2분 |
+| main 감사 | dh.lee | 반영 서버를 거치지 않은 main 커밋 2개를 잡음: choi의 직접 push, M4 시나리오 때 시험 레포에 직접 넣은 `check.js`. 서명된 반영 커밋은 통과 |
+
+찾아 고친 것: 수정 제안 반영 명령이 끝의 확인 알림을 기다려 명령이 끝나지 않음(알림을 기다리지 않게). 시나리오 1차 시도에서 에이전트 출처 기록이 실패한 채 `src/token.js`만 남았고, 다시 실행하자 관문이 그 파일을 "Flightdeck 밖 변경"으로 막았다(의도대로 동작. 시나리오는 새 일감으로 다시 함).
+
+확인하지 못한 것: 사람이 직접 하는 클릭(거터 `+`로 코드 쓰레드, 쓰레드 버튼, 확인 창), 반영 충돌 경로(`conflict` → IMPLEMENTATION, 단위 테스트만), GitHub main 보호 설정(봇 계정이 없어 설정하지 않음 — §15 미결의 봇 방식 결정 필요), 내장 git 서버(M5.5). 이번에도 PostgreSQL 컨테이너가 응답하지 않아 시나리오 서버는 메모리 저장소로 돌렸다.

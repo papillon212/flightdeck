@@ -7,8 +7,9 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 CODE="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
 curl -sf http://127.0.0.1:8787/health >/dev/null || { echo "서버가 꺼져 있다 (http://127.0.0.1:8787)"; exit 1; }
-for m in dh.lee park; do
+# FD_MEMBERS로 창을 고른다 (기본: dh.lee park. M3·M5는 "dh.lee park choi")
+for m in ${FD_MEMBERS:-dh.lee park}; do
   FLIGHTDECK_TRACKER_TOKEN=$([ "$m" = dh.lee ] && echo "${CLICKUP_TOKEN:-}" || true) \
     "$CODE" --user-data-dir "/tmp/fd-m2/$m/vscode" --extensionDevelopmentPath="$ROOT/packages/vscode/ext" --new-window "/tmp/fd-m2/$m/test-flightdeck"
 done
-echo "창 두 개를 열었다: [dh.lee] 담당자, [park] 질문 대상"
+echo "창을 열었다: ${FD_MEMBERS:-dh.lee park}"

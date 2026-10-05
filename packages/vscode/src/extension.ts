@@ -798,8 +798,9 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       await saveAll();
       const files = await c.wf.applyPatch(c.epic, id);
       await refresh();
-      const pick = await vscode.window.showInformationMessage(`수정 제안을 반영했습니다 (${files.join(", ")}). 확인한 뒤 "검증 다시 요청"을 누르세요.`, "검증 다시 요청");
-      if (pick) await vscode.commands.executeCommand("flightdeck.requestVerification");
+      void vscode.window
+        .showInformationMessage(`수정 제안을 반영했습니다 (${files.join(", ")}). 확인한 뒤 "검증 다시 요청"을 누르세요.`, "검증 다시 요청")
+        .then((pick) => (pick ? vscode.commands.executeCommand("flightdeck.requestVerification") : undefined));
     }),
 
     run("flightdeck.requestVerification", async () => {
