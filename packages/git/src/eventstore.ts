@@ -297,16 +297,30 @@ export class RemoteEventStore extends LocalEventStore {
   watch(onChange: (r: SyncResult) => void, opts: { intervalMs?: number; onError?: (e: unknown) => void } = {}): Disposable {
     let stopped = false;
     let lastPending = 0;
+    // 마지막으로 알린 로컬 끝. 같은 레포의 다른 창·다른 코드가 먼저 받아 가도(sync는 "받은 것 없음") 로컬 끝이 바뀌었으면 알린다
+    // (M6·M8 시나리오: 다른 경로의 pull 때문에 감시가 변화를 못 봐 회의 포커스·조종 넘겨받음 알림이 빠졌다)
+    let notified: string | null | undefined;
     const tick = async () => {
       try {
+        if (notified === undefined) notified = await this.head();
         const out = (await this.g(["ls-remote", this.remote, META_REF])).trim();
         const remote = out ? out.split(/\s+/)[0]! : null;
         const tracked = await this.rev(this.trackingRef);
         const local = await this.head();
-        if (remote === tracked && local === tracked && !lastPending) return;
+        if (remote === tracked && local === tracked && !lastPending) {
+          if (local !== notified) {
+            notified = local;
+            onChange({ received: true, pushed: 0, pending: 0 });
+          }
+          return;
+        }
         const r = await this.sync();
         lastPending = r.pending;
-        if (r.received || r.pushed) onChange(r);
+        const now = await this.head();
+        if (r.received || r.pushed || now !== notified) {
+          notified = now;
+          onChange(r);
+        }
       } catch (e) {
         opts.onError?.(e);
       }

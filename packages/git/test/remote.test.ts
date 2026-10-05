@@ -126,6 +126,27 @@ describe("RemoteEventStore", { timeout: 60_000 }, () => {
       w.dispose();
     }
   });
+
+  it("watch: 같은 레포의 다른 경로가 먼저 받아 가도 로컬 끝이 바뀌었으면 알린다 (M6·M8 시나리오)", async () => {
+    const sb = store(b);
+    await sb.sync();
+    const seen: number[] = [];
+    const w = sb.watch(() => seen.push(Date.now()), { intervalMs: 50 });
+    try {
+      await new Promise((r) => setTimeout(r, 120)); // 감시가 시작점을 잡는다
+      await store(a).append(reply("dh.lee", "다른 경로"));
+      // 같은 레포를 다른 인스턴스(다른 창·대기 루프)가 먼저 받는다. 감시의 받기와 부딪치면(ref 잠금) 다시
+      for (let i = 0; i < 20; i++) {
+        if (await store(b).sync().then(() => true, () => false)) break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      const t0 = Date.now();
+      while (!seen.length && Date.now() - t0 < 5_000) await new Promise((r) => setTimeout(r, 25));
+      expect(seen.length).toBeGreaterThan(0);
+    } finally {
+      w.dispose();
+    }
+  });
 });
 
 describe("에픽 브랜치 공유 (설계 §2.4, §3.1 thread.created.commit)", () => {

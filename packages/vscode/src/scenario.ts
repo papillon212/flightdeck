@@ -73,6 +73,7 @@ export async function runScenario(h: ScenarioHooks, dir: string): Promise<void> 
     if (process.env.FLIGHTDECK_SCENARIO_KIND === "m5" || process.env.FLIGHTDECK_SCENARIO_KIND === "m55") return await runM5(h, log);
     if (process.env.FLIGHTDECK_SCENARIO_KIND === "m7") return await runM7(h, log);
     if (process.env.FLIGHTDECK_SCENARIO_KIND === "m8") return await runM8(h, log);
+    if (process.env.FLIGHTDECK_SCENARIO_KIND === "m6") return await runM6(h, log);
     if (me === "dh.lee" && !h.epic) return await ownerStart(h, log);
     if (me === "dh.lee" && h.role === "owner") return await ownerAsk(h, log);
     if (me === "park" && !h.epic) return await viewerWait(h, log);
@@ -775,6 +776,125 @@ async function m7Owner(h: ScenarioHooks, log: Log) {
   }, 20 * 60_000, 5000);
   const rejected = (await h.wf.store.list(epic)).filter((e) => e.type === "land.rejected").map((e) => e.data);
   await log("반영", { phase: s.phase, waitSec: Math.round((Date.now() - t3) / 1000), main: s.landed?.main_commit ?? null, rejected, status: h.statusText(), warnings: h.wf.warnings.splice(0) });
+}
+
+// ---------------------------------------------------------------- M6: 회의 (docs/m6-plan.md)
+// dh.lee(담당자·주최자)가 분석 중 질문 쓰레드를 park에게 달고 회의를 연다(시험용 회의 자료, FLIGHTDECK_MEET_FIXTURE).
+// park은 받은 질문을 열어 둔 창에서 회의 시작 알림을 받고 파일을 본다(포커스). 주최자가 끝내면 park의 포커스가 올라오고,
+// 주최자의 에이전트(실제 claude haiku 1회)가 회의록·전사·포커스·쓰레드로 앵커링 → 초안 → 게시 → park이 그 쓰레드의 회의 요약 답글을 본다.
+
+const M6_TASK = "[M6 시나리오]";
+
+async function runM6(h: ScenarioHooks, log: Log) {
+  const me = h.wf.cfg.member;
+  if (me === "dh.lee" && !h.epic) return m6OwnerStart(h, log);
+  if (me === "dh.lee" && h.role === "owner") return m6Host(h, log);
+  if (me === "park" && !h.epic) return m6ParkHome(h, log);
+  if (me === "park") return m6ParkViewer(h, log);
+}
+
+async function m6OwnerStart(h: ScenarioHooks, log: Log) {
+  const t = (await h.wf.assignedEpics()).find((e) => e.title.includes(M6_TASK));
+  if (!t) throw new Error("M6 시나리오 일감이 내 일감에 없다");
+  const r = await h.wf.startFromTracker(t);
+  const dir = path.join(r.worktree, ".flightdeck/epics", t.epicId);
+  await writeFile(path.join(dir, "analysis.md"), ANALYSIS);
+  await h.wf.sync(t.epicId);
+  const md = await readFile(path.join(dir, "analysis.md"), "utf8");
+  const pid = /<!-- (p:[0-9a-f]{4}) -->\n- 액세스 토큰 TTL은 몇 분인가\?/.exec(md)![1]!;
+  const thread = await h.wf.createThread(t.epicId, { file: "analysis.md", pid, kind: "question", to: ["park"], body: "액세스 토큰 TTL은 몇 분으로 할까요? 회의에서 정해요." });
+  await log("에픽 시작 · 질문", { epic: t.epicId, thread });
+  await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(r.worktree), { forceNewWindow: false });
+}
+
+/** [dh.lee] 회의 시작 → (park이 본다) → 끝 → park 포커스 → 요약 초안(실제 claude) → 게시 */
+async function m6Host(h: ScenarioHooks, log: Log) {
+  const epic = h.epic!;
+  const { FixtureMeet } = await import("./meet.ts");
+  let s = await h.wf.epicState(epic);
+  let sid = [...s.sessions.values()].at(-1)?.sid;
+  if (!sid) {
+    const r = await h.wf.startSession(epic, "TTL·재사용 탐지 논의", new FixtureMeet(process.env.FLIGHTDECK_MEET_FIXTURE!));
+    sid = r.sid;
+    await log("회의 시작", { sid, space: r.space });
+    await sleep(40_000); // 회의 중 (park이 파일을 본다)
+    await h.wf.endSession(epic, sid);
+    await log("회의 종료", { sid });
+  }
+  const t1 = Date.now();
+  await until("park 포커스", async () => {
+    await h.wf.pull();
+    return (await h.wf.epicState(epic)).sessions.get(sid!)!.focus.some((f) => f.member === "park");
+  }, 3 * 60_000, 2000);
+  await h.refresh(); // 내 포커스도
+  s = await h.wf.epicState(epic);
+  await log("포커스", { waitSec: Math.round((Date.now() - t1) / 1000), focus: s.sessions.get(sid)!.focus.map((f) => ({ member: f.member, entries: f.entries.map((e) => `${e.file}:${e.range.join("-")}`) })) });
+  const t2 = Date.now();
+  await vscode.commands.executeCommand("flightdeck.collectMeeting", sid);
+  const draft = await readFile(await h.wf.sessionDraftPath(sid), "utf8");
+  await log("요약 초안 (실제 claude 앵커링)", { sec: Math.round((Date.now() - t2) / 1000), draft });
+  await vscode.commands.executeCommand("flightdeck.publishMeeting", sid);
+  s = await h.wf.epicState(epic);
+  const head = await h.wf.eng.fetchEpicBranch(epic, h.wf.gitRemote);
+  await log("게시", {
+    published: s.sessions.get(sid)!.published ? { items: s.sessions.get(sid)!.published!.items } : null,
+    replies: [...s.threads.values()].flatMap((t) => t.replies.filter((r) => r.source === "session").map((r) => `${t.id}: ${r.body.split("\n")[0]}`)),
+    sessionThreads: [...s.threads.values()].filter((t) => t.body.startsWith("🎙")).map((t) => `${t.id} ${t.file}:${t.anchor.type === "code" ? t.anchor.range.join("-") : ""}`),
+    summaryFile: head ? await git(["show", `${head}:.flightdeck/epics/${epic}/sessions/${sid}.md`], { cwd: h.wf.cfg.repo }).catch(() => null) : null,
+    status: h.statusText(),
+    warnings: h.wf.warnings.splice(0),
+  });
+}
+
+async function m6ParkHome(h: ScenarioHooks, log: Log) {
+  // 앞선 시도의 에픽이 남아 있을 수 있어 가장 최근에 시작한 에픽의 질문을 고른다
+  const item = await until("M6 질문", async () => {
+    let best: { i: Awaited<ReturnType<typeof h.wf.inbox>>[number]; at: number } | null = null;
+    for (const i of await h.wf.inbox()) {
+      const s = await h.wf.epicState(i.epic);
+      const started = (await h.wf.store.list(i.epic)).find((e) => e.type === "epic.started");
+      const at = started ? Date.parse(started.at) : 0;
+      if (s.phase === "ANALYSIS" && Date.now() - at < 30 * 60_000 && (!best || at > best.at)) best = { i, at };
+    }
+    // 방금 시작한 에픽의 질문이 아직 안 왔으면 조금 더 기다린다
+    return best && Date.now() - best.at < 5 * 60_000 ? best.i : null;
+  }, 10 * 60_000, 3000);
+  await log("받은 질문", { epic: item.epic, thread: item.thread.id });
+  await h.openViewer(item.epic, item.commit);
+}
+
+/** [park] 질문 창: 회의 시작 알림 → 파일을 본다(포커스) → 게시된 회의 요약 답글을 받는다 */
+async function m6ParkViewer(h: ScenarioHooks, log: Log) {
+  const epic = h.epic!;
+  const wt = h.worktree!;
+  const note = await until("회의 시작 알림", async () => h.notifications.find((n) => n.includes("회의를 시작했습니다")), 10 * 60_000, 1000);
+  await log("회의 시작 알림", { note });
+  // 회의 중 보는 곳: 분석 문서의 TTL 질문, 그다음 token.js의 rotate
+  const a = await vscode.workspace.openTextDocument(vscode.Uri.file(path.join(wt, ".flightdeck/epics", epic, "analysis.md")));
+  const ea = await vscode.window.showTextDocument(a);
+  const ttl = a.getText().split("\n").findIndex((l) => l.includes("TTL"));
+  ea.selection = new vscode.Selection(ttl, 0, ttl, 10);
+  await sleep(6000);
+  const tk = path.join(wt, "src/token.js");
+  if ((await readFile(tk, "utf8").catch(() => null)) !== null) {
+    const d = await vscode.workspace.openTextDocument(vscode.Uri.file(tk));
+    const ed = await vscode.window.showTextDocument(d);
+    const line = d.getText().split("\n").findIndex((l) => l.includes("reused"));
+    ed.selection = new vscode.Selection(Math.max(0, line), 0, Math.max(0, line), 5);
+    await sleep(6000);
+  }
+  const t1 = Date.now();
+  const s = await until("회의 요약 답글", async () => {
+    await h.wf.pull();
+    const x = await h.wf.epicState(epic);
+    return [...x.threads.values()].some((t) => t.replies.some((r) => r.source === "session")) ? x : null;
+  }, 15 * 60_000, 3000);
+  await h.refresh();
+  await log("회의 요약 받음", {
+    waitSec: Math.round((Date.now() - t1) / 1000),
+    threads: [...s.threads.values()].map((t) => ({ id: t.id, author: t.author, body: t.body.split("\n")[0], replies: t.replies.map((r) => `@${r.author}(${r.source}): ${r.body.split("\n")[0]}`) })),
+    notifications: h.notifications.filter((n) => n.includes("답했습니다")).slice(-3),
+  });
 }
 
 // ---------------------------------------------------------------- M8: 조종수 모델 (docs/m8-plan.md)
