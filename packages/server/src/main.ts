@@ -10,13 +10,17 @@
 //   --memory                         메모리 저장소
 //   --bootstrap-admin <id>:<email>   활성 어드민이 없으면 이 어드민을 만든다
 //   --import-product <폴더>          <폴더>/pipeline.yaml, rules/*.md를 그 제품의 설정이 없을 때 첫 버전으로 가져온다
-//   --repo <url>                     가져올 때 pipeline.yaml의 repo를 이 값으로 바꾼다
+//   --repo <url|builtin>             가져올 때 pipeline.yaml의 repo를 이 값으로 바꾼다
+//   --import-repo <url>              --import-product 제품이 내장 git(repo: builtin)이고 내장 레포가 없으면, 이 레포의 모든 ref를 가져와 만든다 (M5.5 Z1)
+// 명령
+//   flightdeck-server backup <폴더>  내장 git 레포마다 bundle을 만들고 검증한다 (M5.5 Z6)
 import { existsSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 import { generateServerKey, keyFingerprint, publicKeyOf } from "@flightdeck/core";
 import { parsePipeline } from "@flightdeck/schema";
+import { BUILTIN_REPO, GitHost } from "./githost.ts";
 import { createApp } from "./http.ts";
 import { PgStore } from "./pg.ts";
 import { EventSigner } from "./signer.ts";
@@ -52,6 +56,14 @@ function arg(name: string): string | undefined {
 
 async function main() {
   const dataDir = path.resolve(process.env.FD_DATA_DIR ?? ".flightdeck-server");
+  if (process.argv[2] === "backup") {
+    const out = process.argv[3];
+    if (!out) throw new Error("사용법: flightdeck-server backup <폴더>");
+    const keys = await loadServerKey(dataDir);
+    const host = new GitHost({ dataDir, secret: keys.privateKeyPem, trust: async () => ({ mode: "dev" }), isActive: async () => false, target: async () => "main" });
+    for (const f of await host.backup(out)) console.log(f);
+    return;
+  }
   const host = process.env.FD_HOST ?? "127.0.0.1";
   const port = Number(process.env.FD_PORT ?? 8787);
   const devLogin = process.env.FD_DEV_LOGIN === "1";
@@ -68,17 +80,38 @@ async function main() {
     await store.upsertMember({ id, email, active: true, admin: true }, "bootstrap");
   }
   const imp = arg("--import-product");
+  let imported: string | undefined;
   if (imp) {
     const p = await readProductDir(imp, arg("--repo"));
+    imported = p.product;
     if (!(await store.currentConfig(p.product))) await store.addConfigVersion({ ...p, created_by: "bootstrap", note: `가져옴: ${imp}` });
   }
 
   const keys = await loadServerKey(dataDir);
-  const signer = new EventSigner({ store, dataDir, ...keys });
+  let signer: EventSigner | undefined;
+  const githost = new GitHost({
+    dataDir,
+    secret: keys.privateKeyPem,
+    trust: () => signer!.trust(),
+    isActive: async (m) => !!(await store.getMember(m))?.active,
+    target: async (product) => {
+      const cfg = await store.currentConfig(product);
+      return cfg ? parsePipeline(cfg.pipeline_yaml).landing.target : "main";
+    },
+  });
+  signer = new EventSigner({ store, dataDir, ...keys, githost });
+  // 내장 git 제품의 레포를 만들고(없으면) 훅을 다시 설치한다
+  for (const { product } of await store.listProducts()) {
+    const cfg = await store.currentConfig(product);
+    if (!cfg || parsePipeline(cfg.pipeline_yaml).repo !== BUILTIN_REPO) continue;
+    const importUrl = product === imported ? arg("--import-repo") : undefined;
+    await githost.ensureRepo(product, importUrl ? { importUrl } : {});
+  }
   const g = process.env.FD_GOOGLE_CLIENT_ID && process.env.FD_GOOGLE_CLIENT_SECRET
     ? { clientId: process.env.FD_GOOGLE_CLIENT_ID, clientSecret: process.env.FD_GOOGLE_CLIENT_SECRET, publicUrl: process.env.FD_PUBLIC_URL ?? `http://${host}:${port}` }
     : undefined;
-  const app = createApp({ store, signer, keys, devLogin, ...(g ? { google: g } : {}) });
+  const app = createApp({ store, signer, keys, devLogin, githost, ...(g ? { google: g } : {}) });
+  githost.attach(`http://${host === "::1" ? "[::1]" : host}:${port}`);
   // 반영 보조 경로 (§11.1): 1분마다 반영 대기 에픽을 찾는다. 재시작 뒤 복구도 이것으로 한다
   const scan = () => void signer.scanLanding().catch((e) => console.error("[land scan]", e instanceof Error ? e.message : e));
   setTimeout(scan, 5_000);

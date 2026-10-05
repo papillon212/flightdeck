@@ -35,6 +35,16 @@ describe("쓰기 권한 (설계 §6.2)", () => {
     expect(write("VERIFICATION", "src/app.ts").allow).toBe(false);
   });
 
+  it("내장 git 토큰 파일은 어느 단계·창에서도 읽을 수 없다 (M5.5 Z3)", () => {
+    const f = "/repo/.git/flightdeck/git-credentials";
+    for (const phase of ["IMPLEMENTATION", "VERIFICATION", "ANALYSIS"] as Phase[]) {
+      expect(decide({ ...base, phase, tool: { name: "Read", kind: "read", paths: [f] } }).allow).toBe(false);
+      expect(decide({ ...base, phase, role: "review", tool: { name: "Read", kind: "read", paths: [f] } }).allow).toBe(false);
+    }
+    expect(bash("IMPLEMENTATION", `cat ${f}`).allow).toBe(false);
+    expect(read("IMPLEMENTATION", "src/app.ts").allow).toBe(true);
+  });
+
   it("작업 폴더 밖에는 쓸 수 없다", () => {
     expect(decide({ ...base, phase: "IMPLEMENTATION", tool: { name: "Write", kind: "write", paths: ["/etc/hosts"] } }).allow).toBe(false);
     expect(write("IMPLEMENTATION", "../other/x").allow).toBe(false);

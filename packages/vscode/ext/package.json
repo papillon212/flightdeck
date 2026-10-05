@@ -17,6 +17,7 @@
       { "command": "flightdeck.inbox", "title": "받은 질문", "category": "Flightdeck" },
       { "command": "flightdeck.login", "title": "서버 로그인", "category": "Flightdeck" },
       { "command": "flightdeck.logout", "title": "서버 로그아웃", "category": "Flightdeck" },
+      { "command": "flightdeck.cloneFromServer", "title": "서버 레포 받기", "category": "Flightdeck" },
       { "command": "flightdeck.setTrackerToken", "title": "일감 도구(ClickUp) 개인 토큰 설정", "category": "Flightdeck" },
       { "command": "flightdeck.requestReview", "title": "리뷰 요청", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
       { "command": "flightdeck.approve", "title": "승인", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },

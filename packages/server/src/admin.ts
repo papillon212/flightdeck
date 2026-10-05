@@ -24,6 +24,13 @@ ${who ? `<span class="muted" style="margin-left:auto">${esc(who)}</span><form me
 <h1>${esc(title)}</h1>${body}</body></html>`;
 }
 
+/** 마지막 미러 결과. 미러가 갈라졌거나 실패했으면 눈에 띄게 (M5.5 Z5) */
+function mirrorCell(m: { at: string; pushed: string[]; problems: string[]; error?: string } | undefined): string {
+  if (!m) return `<span class="muted">-</span>`;
+  const bad = m.error ? [m.error] : m.problems;
+  return bad.length ? `<span class="bad">${bad.map(esc).join("<br>")}</span> <span class="muted">${esc(m.at)}</span>` : `정상 <span class="muted">${esc(m.at)}</span>`;
+}
+
 function send(ctx: Ctx, status: number, html: string, headers: Record<string, string> = {}) {
   ctx.res.writeHead(status, { "content-type": "text/html; charset=utf-8", ...headers });
   ctx.res.end(html);
@@ -82,7 +89,7 @@ export async function adminRoutes(ctx: Ctx): Promise<void> {
 <h3>등록·수정</h3><form method="post" action="/admin/members" class="row">
 <input name="id" placeholder="멤버 ID (예: dh.lee)" required pattern="[a-z0-9][a-z0-9._-]*"><input name="email" type="email" placeholder="Google 이메일" required>
 <input name="tracker_id" placeholder="일감 도구 ID"><label><input type="checkbox" name="active" checked> 활성</label><label><input type="checkbox" name="admin"> 어드민</label><button>저장</button></form>
-<h2>제품</h2><table><tr><th>제품</th><th>현재 설정 버전</th></tr>${products.map((x) => `<tr><td><a href="/admin/products/${esc(x.product)}">${esc(x.product)}</a></td><td>${esc(x.current)}</td></tr>`).join("")}</table>
+<h2>제품</h2><table><tr><th>제품</th><th>현재 설정 버전</th><th>외부 미러 (M5.5)</th></tr>${products.map((x) => `<tr><td><a href="/admin/products/${esc(x.product)}">${esc(x.product)}</a></td><td>${esc(x.current)}</td><td>${mirrorCell(opts.signer.mirrorState.get(x.product))}</td></tr>`).join("")}</table>
 <form method="get" action="/admin/products/new" class="row" style="margin-top:8px"><input name="product" placeholder="새 제품 ID" pattern="[a-z0-9][a-z0-9-]*" required><button>만들기</button></form>`,
         who,
       ),

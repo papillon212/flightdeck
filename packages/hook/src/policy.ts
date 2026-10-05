@@ -52,6 +52,11 @@ export function decide(p: PolicyInput): Decision {
   };
   const epicDir = `.flightdeck/epics/${p.epic}`;
 
+  // 모든 단계·창: 내장 git 토큰 파일(<git 공용 폴더>/flightdeck/git-credentials, M5.5 Z3)은 작업 폴더 밖이라 경로 이름으로 막는다
+  if (p.tool.paths.some((abs) => abs.split(path.sep).join("/").includes("/flightdeck/git-credentials")) || /git-credentials/.test(p.tool.command ?? "")) {
+    return deny("Flightdeck git 토큰 파일은 읽거나 쓸 수 없습니다.");
+  }
+
   // 모든 단계: 보호 경로는 읽기·쓰기 모두 차단 (§6.2)
   for (const abs of p.tool.paths) {
     if (!inside(abs)) continue;

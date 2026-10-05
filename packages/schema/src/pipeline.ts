@@ -26,7 +26,10 @@ const Review = z.object({
 export const Pipeline = z.object({
   version: z.literal(1),
   product: z.string().min(1),
+  /** 외부 git URL, 또는 `builtin`(서버 내장 git, `<서버>/git/<product>.git`) (설계 §1.5, M5.5 Z1) */
   repo: z.string().min(1),
+  /** 내장 git의 외부 미러. 반영된 main(과 태그)만 올린다 (M5.5 Z5) */
+  mirror: z.object({ url: z.string().min(1), refs: z.array(z.string().min(1)).default(["main", "tags/*"]) }).optional(),
 
   agent: z.object({
     allowed: z.array(z.string().min(1)).min(1),

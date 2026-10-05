@@ -13,6 +13,7 @@ import { git, RemoteEventStore } from "@flightdeck/git";
 import { appendEditRecords, readEditLog, readState } from "@flightdeck/hook";
 import { parsePipeline, type EditRecord, type LocalEpicState, type Phase } from "@flightdeck/schema";
 import { ClickUpTracker, type TrackerAdapter } from "@flightdeck/tracker";
+import { BUILTIN_REPO, cloneFromServer, configureGitAccess, hostedUrl, needsRenew, remoteMismatch, storedToken, useHostedRemote } from "./gitaccess.ts";
 import { cacheConfig, loadCachedConfig, ServerClient, ServerRequestError } from "./server-client.ts";
 import { ARTIFACT_FILES, EpicWorkflow, type InboxItem } from "./workflow.ts";
 
@@ -31,6 +32,18 @@ interface Ctx {
   blocked?: string;
   /** 서버에 닿지 못해 캐시한 설정으로 동작 중 */
   offline?: boolean;
+  /** 내장 git 서버 제품 (M5.5): 서버 레포 주소, 원격이 그것이 아니면 지금 주소 */
+  hosted?: { want: string; remote: string; mismatch: string | null; error?: string };
+}
+
+/** 내장 git 서버 인증 설정: git 토큰이 없거나 하루 안에 끝나면 새로 받고, credential helper를 맞춘다 (M5.5 Z3) */
+async function gitAccess(server: ServerClient, product: string, dataDir: string, member: string, remote: string): Promise<NonNullable<Ctx["hosted"]>> {
+  const repo = path.dirname(dataDir); // git 공용 폴더
+  const t = await storedToken(dataDir);
+  const token = needsRenew(t, member) ? (await server.gitToken()).token : t!.token;
+  await configureGitAccess({ repo, dataDir, serverUrl: server.url, member, token });
+  const want = hostedUrl(server.url, product);
+  return { want, remote, mismatch: await remoteMismatch(repo, remote, want) };
 }
 
 const EXT_ID = "flightdeck.flightdeck";
@@ -42,7 +55,7 @@ async function serverSetup(
   ext: vscode.ExtensionContext,
   dataDir: string,
   retried = false,
-): Promise<{ server: ServerClient; member: string; config: ConfigPayload; product: string; tracker?: TrackerAdapter; offline: boolean } | { blocked: string }> {
+): Promise<{ server: ServerClient; member: string; config: ConfigPayload; product: string; tracker?: TrackerAdapter; offline: boolean; hosted?: Ctx["hosted"] } | { blocked: string }> {
   const cfg = vscode.workspace.getConfiguration("flightdeck");
   const url = cfg.get<string>("serverUrl")!;
   const fp = cfg.get<string>("serverKeyFingerprint") ?? "";
@@ -84,7 +97,14 @@ async function serverSetup(
   if (tok && tcfg.provider === "clickup" && tcfg.clickup) {
     tracker = new ClickUpTracker({ token: tok, list_ids: tcfg.clickup.list_ids ?? [], tag: tcfg.clickup.tag, status_map: tcfg.clickup.status_map ?? {} });
   }
-  return { server, member, config, product, ...(tracker ? { tracker } : {}), offline };
+  let hosted: Ctx["hosted"];
+  if (parsePipeline(config.pipeline_yaml).repo === BUILTIN_REPO) {
+    const remote = cfg.get<string>("gitRemote") || "origin";
+    // 서버에 닿지 못하면 저장한 토큰·설정 그대로 둔다 (push·fetch도 서버라 어차피 안 된다)
+    const plain = async () => ({ want: hostedUrl(url, product), remote, mismatch: await remoteMismatch(path.dirname(dataDir), remote, hostedUrl(url, product)) });
+    hosted = offline ? await plain() : await gitAccess(server, product, dataDir, member, remote).catch(async (e) => ({ ...(await plain()), error: (e as Error).message }));
+  }
+  return { server, member, config, product, ...(tracker ? { tracker } : {}), offline, ...(hosted ? { hosted } : {}) };
 }
 
 async function gitOut(args: string[], cwd: string): Promise<string | null> {
@@ -123,6 +143,7 @@ async function resolveCtx(ext: vscode.ExtensionContext): Promise<Ctx | null> {
   let mode: Ctx["mode"] = "dev";
   let blocked: string | undefined;
   let offline = false;
+  let hosted: Ctx["hosted"];
   if (cfg.get<string>("serverUrl")) {
     mode = "server";
     const r = await serverSetup(ext, dataDir);
@@ -131,6 +152,7 @@ async function resolveCtx(ext: vscode.ExtensionContext): Promise<Ctx | null> {
       wf = new EpicWorkflow({ ...base, member: "unknown", configDir: path.join(ext.extensionPath, "config", "sample") });
     } else {
       offline = r.offline;
+      hosted = r.hosted;
       wf = new EpicWorkflow({
         ...base,
         member: r.member,
@@ -164,7 +186,7 @@ async function resolveCtx(ext: vscode.ExtensionContext): Promise<Ctx | null> {
       }
     }
   }
-  return { wf, repo, epic, worktree: epic ? top : null, role, mode, ...(blocked ? { blocked } : {}), offline };
+  return { wf, repo, epic, worktree: epic ? top : null, role, mode, ...(blocked ? { blocked } : {}), offline, ...(hosted ? { hosted } : {}) };
 }
 
 // ---------------------------------------------------------------- 쓰레드 화면 (Comments API, §3.3·§9.2)
@@ -625,6 +647,33 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     }, 3000);
   }
 
+  // 내장 git 서버 (M5.5 Z3·Z7): 원격 주소 확인, git 토큰 갱신(6시간마다 확인, 하루 남으면 새로)
+  if (ctx?.hosted && !ctx.blocked) {
+    const h = ctx.hosted;
+    if (h.error) out.appendLine(`[git] 내장 git 토큰을 받지 못했다: ${h.error}`);
+    if (h.mismatch !== null) {
+      void vscode.window
+        .showWarningMessage(`Flightdeck: 이 제품은 서버 내장 git을 씁니다. 원격 ${h.remote}가 서버 레포가 아닙니다 (지금: ${h.mismatch || "없음"})`, "서버 레포로 바꾸기")
+        .then(async (pick) => {
+          if (!pick) return;
+          await useHostedRemote(ctx.repo, h.remote, h.want);
+          await vscode.commands.executeCommand("workbench.action.reloadWindow");
+        })
+        .then(undefined, (e) => vscode.window.showErrorMessage(`Flightdeck: ${(e as Error).message}`));
+    }
+    const server = ctx.wf.cfg.remote?.server;
+    const renew = async () => {
+      const dir = await ctx.wf.eng.dataDir();
+      const t = await storedToken(dir);
+      if (!server || !needsRenew(t, ctx.wf.cfg.member)) return;
+      const r = await server.gitToken();
+      await configureGitAccess({ repo: ctx.repo, dataDir: dir, serverUrl: server.url, member: ctx.wf.cfg.member, token: r.token });
+      out.appendLine(`[git] git 토큰을 새로 받았다 (${r.expires_at}까지)`);
+    };
+    const timer = setInterval(() => void renew().catch((e) => out.appendLine(`[git] 토큰 갱신 실패: ${e}`)), 6 * 3600_000);
+    ext.subscriptions.push({ dispose: () => clearInterval(timer) });
+  }
+
   // 읽기 전용 창: 파일을 읽기 전용으로 연다 (§2.4). 이 창의 변경은 다음 공유 커밋으로 옮길 때 버려진다
   if (ctx?.epic && ctx.role === "viewer") {
     await vscode.workspace.getConfiguration("files").update("readonlyInclude", { "**": true }, vscode.ConfigurationTarget.Workspace).then(undefined, () => undefined);
@@ -981,6 +1030,26 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       const me = await new ServerClient(url, token, "").me();
       const pick = await vscode.window.showInformationMessage(`Flightdeck: @${me.id}(으)로 로그인했습니다. 창을 다시 불러옵니다.`, "다시 불러오기");
       if (pick) await vscode.commands.executeCommand("workbench.action.reloadWindow");
+    }),
+
+    // 서버 레포 받기 (M5.5 Z7): 내장 git 제품의 레포를 받아 연다. 레포를 아직 열지 않은 창에서도 쓴다
+    run("flightdeck.cloneFromServer", async () => {
+      const cfg = vscode.workspace.getConfiguration("flightdeck");
+      const url = cfg.get<string>("serverUrl");
+      const product = cfg.get<string>("product");
+      if (!url || !product) throw new Error("flightdeck.serverUrl·flightdeck.product 설정이 필요합니다");
+      const client = new ServerClient(url, (await ext.secrets.get(tokenKey(url))) ?? null, cfg.get<string>("serverKeyFingerprint") ?? "");
+      const dev = cfg.get<string>("devLoginMember");
+      if (!client.loggedIn && dev) await ext.secrets.store(tokenKey(url), await client.devLogin(dev));
+      if (!client.loggedIn) throw new Error("먼저 서버에 로그인하세요 (Flightdeck: 서버 로그인)");
+      if (parsePipeline((await client.config(product)).pipeline_yaml).repo !== BUILTIN_REPO) throw new Error(`${product}는 내장 git을 쓰지 않습니다. 레포 주소는 관리자에게 받으세요`);
+      const parent = await vscode.window.showOpenDialog({ canSelectFolders: true, canSelectFiles: false, openLabel: "이 폴더 안에 받기", title: `${product} 레포를 받을 폴더` });
+      if (!parent?.[0]) return;
+      const t = await client.gitToken();
+      const dest = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Flightdeck: ${product} 레포 받는 중` }, () =>
+        cloneFromServer({ serverUrl: url, product, member: t.member, token: t.token, dest: path.join(parent[0]!.fsPath, product) }),
+      );
+      await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(dest));
     }),
 
     run("flightdeck.logout", async () => {

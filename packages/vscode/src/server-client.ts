@@ -70,6 +70,11 @@ export class ServerClient {
     return verifyConfig(await this.call<SignedConfig>("GET", `/config?${q}`), this.fingerprint);
   }
 
+  /** 내장 git 전용 토큰 (M5.5 Z3). git 경로에만 쓸 수 있다 */
+  gitToken(): Promise<{ member: string; token: string; expires_at: string }> {
+    return this.call("POST", "/git/token");
+  }
+
   /** 서버 서명 이벤트 요청 (§12 서명 요청). 서버가 검증·서명·push한 이벤트를 돌려준다 */
   async requestEvent(product: string, epic: string, type: string, data: Record<string, unknown>): Promise<Event> {
     return (await this.call<{ event: Event }>("POST", "/events", { product, epic, type, data })).event;

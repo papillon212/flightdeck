@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { keyFingerprint } from "@flightdeck/core";
 import { buildConfig } from "./config.ts";
 import { adminRoutes } from "./admin.ts";
+import type { GitHost } from "./githost.ts";
 import { RequestError, type EventSigner } from "./signer.ts";
 import type { Member, ServerStore } from "./store.ts";
 
@@ -15,6 +16,8 @@ export interface AppOptions {
   devLogin?: boolean;
   google?: { clientId: string; clientSecret: string; publicUrl: string };
   sessionTtlMs?: number;
+  /** 내장 git 서버 (§1.5, M5.5) */
+  githost?: GitHost;
 }
 
 export interface Ctx {
@@ -117,6 +120,26 @@ export function createApp(opts: AppOptions) {
 
       if (p.startsWith("/admin")) return await adminRoutes(ctx);
 
+      // ── 내장 git (§1.5, M5.5) ──
+      if (p === "/internal/git/pre-receive" && req.method === "POST") {
+        // 레포 훅의 판정 요청. push ID를 모르면 거부하므로 루프백 확인은 이중 안전장치다
+        if (!opts.githost || !isLoopback(req)) throw new RequestError(404, `없는 경로: ${p}`);
+        return json(res, 200, await opts.githost.preReceive(JSON.parse(await ctx.body())));
+      }
+      const gm = /^\/git\/([^/]+)\.git(\/.*)$/.exec(p);
+      if (gm && opts.githost) {
+        // git 전용 토큰만 받는다 (Z3). 로그인 세션 토큰은 서명 요청까지 할 수 있어 git이 읽는 곳에 두지 않는다
+        const basic = /^Basic (.+)$/.exec(req.headers.authorization ?? "");
+        const pass = basic ? Buffer.from(basic[1]!, "base64").toString("utf8").split(":").slice(1).join(":") : "";
+        const who = pass ? opts.githost.verifyToken(pass) : null;
+        const m = who ? await opts.store.getMember(who) : null;
+        if (!m?.active) {
+          res.writeHead(401, { "www-authenticate": 'Basic realm="flightdeck"', "content-type": "text/plain; charset=utf-8" });
+          return void res.end(who ? `비활성 멤버: ${who}\n` : "Flightdeck git 토큰이 필요하다 (확장에서 서버 로그인)\n");
+        }
+        return await opts.githost.serve(req, res, gm[1]!, gm[2]!, m.id);
+      }
+
       // ── API: 로그인 필요 ──
       if (!ctx.member) throw new RequestError(401, member && !member.active ? `비활성 멤버: ${member.id}` : "로그인이 필요하다");
       if (p === "/me" && req.method === "GET") {
@@ -128,6 +151,10 @@ export function createApp(opts: AppOptions) {
         const c = await buildConfig(opts.store, product, opts.keys, url.searchParams.get("version") ?? undefined);
         if (!c) throw new RequestError(404, `설정이 없는 제품·버전: ${product}`);
         return json(res, 200, c);
+      }
+      if (p === "/git/token" && req.method === "POST") {
+        if (!opts.githost) throw new RequestError(404, "내장 git 서버가 꺼져 있다");
+        return json(res, 200, { member: ctx.member.id, ...opts.githost.issueToken(ctx.member.id) });
       }
       if (p === "/events" && req.method === "POST") {
         const body = JSON.parse(await ctx.body());

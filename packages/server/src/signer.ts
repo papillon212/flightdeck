@@ -7,6 +7,7 @@ import path from "node:path";
 import { artifactHash, checkImplLog, checkSections, configVersionOf, nowIso, reduce, reviewOf, signEvent, ulid } from "@flightdeck/core";
 import { git, GitEngine, GitError, RemoteEventStore } from "@flightdeck/git";
 import { Event as EventSchema, GateCommands, parsePipeline, PHASE_ARTIFACT, type Event, type Phase, type Trust } from "@flightdeck/schema";
+import { BUILTIN_REPO, type GitHost } from "./githost.ts";
 import { landEpic, type LandDeps } from "./landing.ts";
 import type { Member, ServerStore } from "./store.ts";
 
@@ -45,22 +46,48 @@ export class EventSigner {
   private queues = new Map<string, Promise<unknown>>();
 
   constructor(
-    private deps: { store: ServerStore; dataDir: string; privateKeyPem: string; publicKey: string },
+    private deps: { store: ServerStore; dataDir: string; privateKeyPem: string; publicKey: string; githost?: GitHost },
   ) {}
 
-  /** 제품 레포의 서버 쪽 사본. 없으면 만든다 */
+  /**
+   * 제품 레포의 서버 쪽 사본. 없으면 만든다.
+   * 내장 git(`repo: builtin`)이면 원격이 내장 레포(로컬 경로)다. 서명·반영 코드는 두 방식에서 같다 (M5.5 Z2)
+   */
   async mirror(product: string): Promise<{ dir: string; target: string }> {
     const cfg = await this.deps.store.currentConfig(product);
     if (!cfg) throw new RequestError(404, `설정이 없는 제품: ${product}`);
     const pipeline = parsePipeline(cfg.pipeline_yaml);
+    let source = pipeline.repo;
+    if (source === BUILTIN_REPO) {
+      if (!this.deps.githost) throw new RequestError(503, "내장 git 서버가 꺼져 있다");
+      source = this.deps.githost.repoDir(product);
+      if (!existsSync(source)) await this.deps.githost.ensureRepo(product, { target: pipeline.landing.target });
+    }
     const dir = path.join(this.deps.dataDir, "repos", `${product}.git`);
     if (!existsSync(dir)) {
       await mkdir(path.dirname(dir), { recursive: true });
-      await git(["clone", "-q", "--bare", "--no-tags", pipeline.repo, dir], { cwd: this.deps.dataDir });
+      await git(["clone", "-q", "--bare", "--no-tags", source, dir], { cwd: this.deps.dataDir });
       for (const [k, v] of [["user.name", SERVER_IDENTITY.name], ["user.email", SERVER_IDENTITY.email]]) await git(["config", k!, v!], { cwd: dir });
+    } else if ((await git(["config", "remote.origin.url"], { cwd: dir }).catch(() => "")).trim() !== source) {
+      await git(["remote", "set-url", "origin", source], { cwd: dir }); // 방식을 바꿨다 (진행 중 에픽이 없을 때만, Z1)
     }
     return { dir, target: pipeline.landing.target };
   }
+
+  /** 내장 git 제품의 외부 미러를 맞춘다 (Z5). 미러가 없거나 외부 방식이면 아무것도 안 한다 */
+  async syncMirror(product: string): Promise<{ pushed: string[]; problems: string[] } | null> {
+    const cfg = await this.deps.store.currentConfig(product);
+    const pipeline = cfg ? parsePipeline(cfg.pipeline_yaml) : null;
+    if (!pipeline?.mirror || pipeline.repo !== BUILTIN_REPO || !this.deps.githost) return null;
+    const refs = pipeline.mirror.refs.map((r) => (r === "main" ? pipeline.landing.target : r));
+    const r = await this.deps.githost.syncMirror(product, { url: pipeline.mirror.url, refs });
+    for (const p of r.problems) console.error(`[mirror ${product}] ${p}`);
+    this.mirrorState.set(product, { at: nowIso(), ...r });
+    return r;
+  }
+
+  /** 제품별 마지막 미러 결과 (어드민 화면) */
+  readonly mirrorState = new Map<string, { at: string; pushed: string[]; problems: string[]; error?: string }>();
 
   async trust(): Promise<Trust> {
     const deactivated: Record<string, string> = {};
@@ -97,8 +124,17 @@ export class EventSigner {
       } catch (e) {
         Object.assign(job, { status: "error", message: e instanceof Error ? e.message : String(e) });
       }
+      if ((job as LandJob).status === "landed") await this.mirrorQuietly(product);
     });
     return job;
+  }
+
+  private async mirrorQuietly(product: string): Promise<void> {
+    await this.syncMirror(product).catch((e) => {
+      const error = e instanceof Error ? e.message : String(e);
+      console.error(`[mirror ${product}] ${error}`);
+      this.mirrorState.set(product, { at: nowIso(), pushed: [], problems: [], error });
+    });
   }
 
   job(id: string): LandJob | undefined {
@@ -109,6 +145,7 @@ export class EventSigner {
   async scanLanding(): Promise<LandJob[]> {
     const out: LandJob[] = [];
     for (const { product } of await this.deps.store.listProducts()) {
+      await this.enqueue(product, () => this.mirrorQuietly(product)); // 미러 실패분 재시도 (Z5)
       const ctx = await this.loadProduct(product).catch(() => null);
       if (!ctx) continue;
       for (const epic of await ctx.store.listEpics()) {
