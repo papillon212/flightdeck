@@ -166,7 +166,7 @@ describe("구현·기록 (M4 완료 기준)", { timeout: 60_000 }, () => {
     const server = A.cfg.remote!.server;
     await expect(server.requestEvent("sample", EPIC, "gate.reported", { commit: "f".repeat(40), commands: [] })).rejects.toThrow(/원격 에픽 브랜치에 없음/);
     await expect(server.requestEvent("sample", EPIC, "phase.completed", { phase: "IMPLEMENTATION" })).rejects.toThrow(/실패한 명령/);
-    await expect(P.cfg.remote!.server.requestEvent("sample", EPIC, "gate.reported", { commit: (await A.epicState(EPIC)).gates.keys().next().value, commands: [] })).rejects.toThrow(/담당자만/);
+    await expect(P.cfg.remote!.server.requestEvent("sample", EPIC, "gate.reported", { commit: (await A.epicState(EPIC)).gates.keys().next().value, commands: [] })).rejects.toThrow(/조종수만/);
   });
 
   it("고쳐서 다시 제출 → 서버 서명 gate.reported·phase.completed → VERIFICATION", async () => {

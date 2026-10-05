@@ -54,7 +54,7 @@ describe("VERIFICATION 티어 리뷰 (Y1)", () => {
       request(C2),
       ev("thread.resolved", "choi", { thread: "t-BBBBBBBB" }),
     ]);
-    expect(reasons(s)).toEqual(["수정 제안은 수정 요청 쓰레드에만 붙인다", "담당자만 수정 제안을 반영할 수 있음"]);
+    expect(reasons(s)).toEqual(["수정 제안은 수정 요청 쓰레드에만 붙인다", "조종수만 수정 제안을 반영할 수 있음"]);
     expect(s.threads.get("t-BBBBBBBB")).toMatchObject({ patch, applied: [expect.any(String)] });
     expect(reviewOf(s)?.current?.name).toBe("lead"); // 새 해시: 앞 승인 무효
   });

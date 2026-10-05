@@ -72,6 +72,26 @@ export class ServerClient {
     return verifyConfig(await this.call<SignedConfig>("GET", `/config?${q}`), this.fingerprint);
   }
 
+  // ---- 실시간 중계 (서버 ④, M8 L1) ----
+
+  liveSend(product: string, epic: string, type: string, data: unknown, to?: string[]): Promise<{ id: number }> {
+    return this.call("POST", `/live/${encodeURIComponent(epic)}?product=${encodeURIComponent(product)}`, { type, data, ...(to ? { to } : {}) });
+  }
+
+  livePresence(product: string, epic: string): Promise<Record<string, { online: boolean; offlineAt: string | null }>> {
+    return this.call("GET", `/live/${encodeURIComponent(epic)}/presence?product=${encodeURIComponent(product)}`);
+  }
+
+  /** SSE 응답 (본문을 읽는 쪽이 메시지로 나눈다). after: 마지막으로 받은 메시지 번호 */
+  async liveStream(product: string, epic: string, after: number, signal: AbortSignal): Promise<Response> {
+    const r = await this.f(`${this.url.replace(/\/$/, "")}/live/${encodeURIComponent(epic)}?product=${encodeURIComponent(product)}&after=${after}`, {
+      headers: { accept: "text/event-stream", ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) },
+      signal,
+    });
+    if (!r.ok || !r.body) throw new ServerRequestError(r.status, `실시간 연결 실패 (${r.status})`);
+    return r;
+  }
+
   // ---- 편집 기록 (서버 ③, M7) ----
 
   /** 편집 기록 올리기. seq가 이어지지 않으면 409 (data.last = 서버의 마지막 seq) */

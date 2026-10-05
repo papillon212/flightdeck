@@ -9,7 +9,7 @@ import { existsSync, realpathSync } from "node:fs";
 import { chmod, mkdir, readdir, writeFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
-import { reduce } from "@flightdeck/core";
+import { reduce, writerOf } from "@flightdeck/core";
 import { EMPTY_TREE, git, GitError, LocalEventStore, META_BRANCH } from "@flightdeck/git";
 import { Event, eventFileName, SERVER_SIGNED_TYPES, type Trust } from "@flightdeck/schema";
 
@@ -304,13 +304,14 @@ export async function judgePush(p: {
   const server = p.pusher === SERVER_PUSHER;
   if (!server && !(await p.isActive(p.pusher))) return [`비활성 멤버: ${p.pusher}`];
   const g = (args: string[], input?: string) => git(args, { cwd: p.dir, env: p.env, ...(input !== undefined ? { input } : {}) });
-  const owners = new Map<string, string | null>();
+  // 에픽 브랜치·세션 원본에 쓰는 사람 = 현재 조종수 (처음은 담당자, M8 L2·L3)
+  const writers = new Map<string, string | null>();
   const ownerOf = async (epic: string) => {
-    if (!owners.has(epic)) {
+    if (!writers.has(epic)) {
       const events = await new LocalEventStore(p.dir).list(epic);
-      owners.set(epic, reduce(epic, events, p.trust).owner);
+      writers.set(epic, writerOf(reduce(epic, events, p.trust)));
     }
-    return owners.get(epic)!;
+    return writers.get(epic)!;
   };
   const ff = async (u: RefUpdate) => u.old === ZERO || (u.new !== ZERO && (await isAncestor(p.dir, u.old, u.new, p.env)));
   const problems: string[] = [];
@@ -328,7 +329,7 @@ export async function judgePush(p: {
     } else if ((m = /^refs\/heads\/flightdeck\/([^/]+)$/.exec(u.ref))) {
       if (server) continue;
       const owner = await ownerOf(m[1]!);
-      if (owner !== p.pusher) problems.push(`${u.ref}: 에픽 담당자(@${owner ?? "없음"})만 쓸 수 있다 (${who})`);
+      if (owner !== p.pusher) problems.push(`${u.ref}: 에픽 조종수(@${owner ?? "없음"})만 쓸 수 있다 (${who})`);
       else if (del) problems.push(`${u.ref}: 에픽 브랜치는 반영 서버만 지운다`);
       else if (!(await ff(u))) problems.push(`${u.ref}: 에픽 브랜치는 fast-forward만`);
     } else if ((m = /^refs\/flightdeck\/ckpt\/([^/]+)\/([^/]+)$/.exec(u.ref))) {
@@ -336,7 +337,7 @@ export async function judgePush(p: {
     } else if ((m = /^refs\/flightdeck\/runs\/([^/]+)$/.exec(u.ref))) {
       if (server) continue;
       const owner = await ownerOf(m[1]!);
-      if (owner !== p.pusher) problems.push(`${u.ref}: 에픽 담당자(@${owner ?? "없음"})만 세션 원본을 올린다 (${who})`);
+      if (owner !== p.pusher) problems.push(`${u.ref}: 에픽 조종수(@${owner ?? "없음"})만 세션 원본을 올린다 (${who})`);
       else if (del || !(await ff(u))) problems.push(`${u.ref}: 세션 원본은 fast-forward만`);
     } else {
       problems.push(`${u.ref}: Flightdeck이 쓰지 않는 ref`);

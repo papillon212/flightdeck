@@ -90,6 +90,20 @@ export async function appendMemo(dataDir: string, m: EditMemo): Promise<void> {
   await appendFile(file, JSON.stringify(EditMemo.parse(m)) + "\n");
 }
 
+/**
+ * 편집 기록·메모를 통째로 바꾼다 (조종을 넘겨받을 때, M8 L4: 서버의 편집 기록이 이 PC의 기록이 된다).
+ * 이 PC에서 이 에픽의 편집 기록을 쓰는 다른 경로가 없을 때만 부른다
+ */
+export async function replaceEditLog(dataDir: string, epic: string, records: EditRecord[], memos: EditMemo[]): Promise<void> {
+  const file = editlogPath(dataDir, epic);
+  await mkdir(path.dirname(file), { recursive: true });
+  await withLock(file + ".lock", async () => {
+    await writeFile(file, records.map((r) => JSON.stringify(EditRecord.parse(r)) + "\n").join(""));
+  });
+  await mkdir(path.dirname(memosPath(dataDir, epic)), { recursive: true });
+  await writeFile(memosPath(dataDir, epic), memos.map((m) => JSON.stringify(EditMemo.parse(m)) + "\n").join(""));
+}
+
 export async function lastSeq(dataDir: string, epic: string): Promise<number> {
   return (await readEditLog(dataDir, epic)).at(-1)?.seq ?? 0;
 }

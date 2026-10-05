@@ -15,7 +15,10 @@ export interface ScenarioHooks {
   wf: EpicWorkflow;
   epic: string | null;
   worktree: string | null;
-  role: "owner" | "viewer" | "review";
+  role: "owner" | "viewer" | "review" | "live";
+  /** 조종수 모델 (M8): 관찰자 창 / 조종수 창 */
+  live?: () => import("./live-ui.ts").LiveWindow | null;
+  pilot?: () => import("./live-ui.ts").PilotWindow | null;
   /** 이 창에 그려진 쓰레드 (Comments API) */
   commentThread(id: string): vscode.CommentThread | undefined;
   /** 이 창에 그려진 쓰레드 초안 (Comments API) */

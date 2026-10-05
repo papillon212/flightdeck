@@ -23,6 +23,7 @@ import { generateServerKey, keyFingerprint, publicKeyOf } from "@flightdeck/core
 import { parsePipeline } from "@flightdeck/schema";
 import { BUILTIN_REPO, GitHost } from "./githost.ts";
 import { createApp } from "./http.ts";
+import { LiveHub } from "./live.ts";
 import { PgStore } from "./pg.ts";
 import { EventSigner } from "./signer.ts";
 import { MemoryStore, type ServerStore } from "./store.ts";
@@ -113,7 +114,7 @@ async function main() {
   const g = process.env.FD_GOOGLE_CLIENT_ID && process.env.FD_GOOGLE_CLIENT_SECRET
     ? { clientId: process.env.FD_GOOGLE_CLIENT_ID, clientSecret: process.env.FD_GOOGLE_CLIENT_SECRET, publicUrl: process.env.FD_PUBLIC_URL ?? `http://${host}:${port}` }
     : undefined;
-  const app = createApp({ store, signer, keys, devLogin, githost, ...(g ? { google: g } : {}) });
+  const app = createApp({ store, signer, keys, devLogin, githost, live: new LiveHub(), ...(g ? { google: g } : {}) });
   githost.attach(`http://${host === "::1" ? "[::1]" : host}:${port}`);
   // 반영 보조 경로 (§11.1): 1분마다 반영 대기 에픽을 찾는다. 재시작 뒤 복구도 이것으로 한다
   const scan = () => void signer.scanLanding().catch((e) => console.error("[land scan]", e instanceof Error ? e.message : e));

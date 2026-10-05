@@ -129,6 +129,63 @@ export class GitEngine {
     return { path: wt, commit: target };
   }
 
+  /**
+   * 관찰자의 읽기 전용 창 `<epic>@live` (설계 §2.4, §8.3, M8 L8): 조종수의 체크포인트 커밋을 분리 상태로 연다.
+   * 이미 있으면 그 커밋으로 옮기고 그 사이 실시간으로 적용한 변경은 버린다
+   */
+  async openLiveWorktree(epic: string, commit: string): Promise<string> {
+    const wt = this.worktreePath(`${epic}@live`);
+    await this.ensureExcludes();
+    if (existsSync(wt)) {
+      await this.g(["checkout", "-q", "-f", "--detach", commit], wt);
+      await this.g(["clean", "-fdq", "-e", ".flightdeck/.runtime"], wt);
+    } else {
+      await mkdir(path.dirname(wt), { recursive: true });
+      await this.g(["worktree", "add", "-q", "--detach", wt, commit]);
+    }
+    return wt;
+  }
+
+  /** 원격의 그 멤버 체크포인트를 받는다. 없으면 null (M8: 관찰·조종 인계의 시작점) */
+  async fetchCheckpoint(epic: string, member: string, remote = "origin"): Promise<string | null> {
+    const ref = GitEngine.checkpointRef(epic, member);
+    try {
+      await this.g(["fetch", "-q", "--no-tags", remote, `+${ref}:${ref}`]);
+    } catch (e) {
+      if (e instanceof GitError && isMissingRemoteRef(e)) return null;
+      throw e;
+    }
+    return this.tryRevParse(ref);
+  }
+
+  /**
+   * 조종을 넘겨받은 사람의 작업 폴더 (M8 L4): 에픽 브랜치 끝(head)을 꺼내고, 작업 트리를 이전 조종수의 체크포인트 트리로 바꾼다.
+   * 체크포인트에 있는 공유 안 된 작업이 그대로 이어진다. 이미 그 폴더가 있으면(읽기 전용 창이었으면) 브랜치로 바꿔 쓴다
+   */
+  async adoptEpicWorktree(epic: string, head: string, ckpt: string): Promise<string> {
+    const wt = this.worktreePath(epic);
+    const branch = GitEngine.epicBranch(epic);
+    await this.ensureExcludes();
+    if (existsSync(wt)) {
+      await this.g(["checkout", "-q", "-f", "-B", branch, head], wt);
+      await this.g(["clean", "-fdq", "-e", ".flightdeck/.runtime"], wt);
+    } else {
+      await mkdir(path.dirname(wt), { recursive: true });
+      await this.g(["worktree", "add", "-q", "-B", branch, wt, head]);
+    }
+    const headTree = (await this.g(["rev-parse", `${head}^{tree}`], wt)).trim();
+    const dir = await mkdtemp(path.join(tmpdir(), "fd-idx-"));
+    const env = { GIT_INDEX_FILE: path.join(dir, "index"), ...RAW_ENV };
+    try {
+      await this.g([...RAW_ARGS, "read-tree", headTree], wt, { env });
+      await this.g([...RAW_ARGS, "update-index", "-q", "--refresh"], wt, { env }).catch(() => "");
+      await this.g([...RAW_ARGS, "read-tree", "-m", "-u", headTree, `${ckpt}^{tree}`], wt, { env });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+    return wt;
+  }
+
   async removeWorktree(name: string, force = false): Promise<void> {
     await this.g(["worktree", "remove", ...(force ? ["--force"] : []), this.worktreePath(name)]);
   }

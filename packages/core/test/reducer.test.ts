@@ -49,7 +49,7 @@ describe("reducer (설계 §4)", () => {
       ev("thread.resolved", "park", { thread: "t-AAAAAAAA" }), // 생성자·담당자 아님
       ev("phase.completed", "park", { phase: "ANALYSIS" }), // 담당자 아님
     ]);
-    expect(s.ignored.map((i) => i.reason)).toEqual(["쓰레드 생성 권한 없음", "답글 권한 없음", "resolve/reopen 권한 없음", "담당자만 단계를 완료할 수 있음"]);
+    expect(s.ignored.map((i) => i.reason)).toEqual(["쓰레드 생성 권한 없음", "답글 권한 없음", "resolve/reopen 권한 없음", "조종수만 단계를 완료할 수 있음"]);
     expect(s.threads.get("t-AAAAAAAA")?.status).toBe("open");
   });
 

@@ -131,7 +131,7 @@ describe("내장 git 서버 (§1.5, M5.5)", { timeout: 60_000 }, () => {
     await git(["checkout", "-q", "-b", "e", "FETCH_HEAD"], { cwd: park });
     await writeFile(path.join(park, "a.txt"), "park\n");
     await git(["commit", "-q", "-am", "park"], { cwd: park });
-    expect(await tryPush(park, ["origin", `HEAD:refs/heads/flightdeck/${EPIC}`])).toContain("에픽 담당자(@dh.lee)만");
+    expect(await tryPush(park, ["origin", `HEAD:refs/heads/flightdeck/${EPIC}`])).toContain("에픽 조종수(@dh.lee)만");
     await git(["commit", "-q", "--amend", "-m", "a2"], { cwd: owner });
     expect(await tryPush(owner, ["-f", "origin", `HEAD:refs/heads/flightdeck/${EPIC}`])).toContain("fast-forward만");
     expect(await tryPush(owner, ["origin", `:refs/heads/flightdeck/${EPIC}`])).toContain("반영 서버만 지운다");
@@ -140,7 +140,7 @@ describe("내장 git 서버 (§1.5, M5.5)", { timeout: 60_000 }, () => {
   it("체크포인트는 그 멤버만, 세션 원본은 담당자만", async () => {
     expect(await tryPush(park, ["origin", `HEAD:refs/flightdeck/ckpt/${EPIC}/park`])).toBeNull();
     expect(await tryPush(park, ["origin", `HEAD:refs/flightdeck/ckpt/${EPIC}/dh.lee`])).toContain("그 멤버(@dh.lee)의 체크포인트만");
-    expect(await tryPush(park, ["origin", `HEAD:refs/flightdeck/runs/${EPIC}`])).toContain("담당자(@dh.lee)만 세션 원본");
+    expect(await tryPush(park, ["origin", `HEAD:refs/flightdeck/runs/${EPIC}`])).toContain("조종수(@dh.lee)만 세션 원본");
     expect(await tryPush(owner, ["origin", `HEAD:refs/flightdeck/runs/${EPIC}`])).toBeNull();
   });
 

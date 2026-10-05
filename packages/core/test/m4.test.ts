@@ -217,7 +217,7 @@ describe("IMPLEMENTATION 관문 (X5)", () => {
       "검사한 커밋(commit)이 없음",
       "이 커밋의 테스트 결과 보고(gate.reported)가 없음",
       "이 커밋의 테스트 결과 보고에 실패한 명령이 있음",
-      "담당자만 테스트 결과를 보고할 수 있음",
+      "조종수만 테스트 결과를 보고할 수 있음",
     ]);
     expect(s.phase).toBe("VERIFICATION");
   });

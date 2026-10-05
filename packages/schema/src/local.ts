@@ -31,7 +31,8 @@ export const LocalEpicState = z.object({
    * 쓰레드 렌더링을 편집 기록에 남기지 않는다
    */
   /** review: VERIFICATION 리뷰어의 쓰기 가능한 리뷰 사본 (M5 Y3). 고쳐도 기록하지 않고, 바꾼 것은 수정 제안(패치)으로만 나간다 */
-  role: z.enum(["owner", "viewer", "review"]).default("owner"),
+  /** live: 관찰자의 읽기 전용 창 (§8.3, M8 L8). 조종수의 체크포인트 + 편집 기록을 실시간으로 따라간다. 이름의 owner는 "이 PC의 작업 폴더(조종수)"다 */
+  role: z.enum(["owner", "viewer", "review", "live"]).default("owner"),
   /** 서버 모드의 제품 ID (설정·서명 요청) */
   product: z.string().optional(),
   phase: Phase,
@@ -59,6 +60,8 @@ export const LocalEpicState = z.object({
         /** 이 세션에 마지막으로 룰을 넣은 단계. 다르면 UserPromptSubmit에서 새 룰을 붙인다 (§6.1) */
         context_phase: Phase,
         started_at: z.string(),
+        /** 세션 기록 파일 (훅 입력 transcript_path). 조종수 확장이 따라 읽어 관찰자에게 보낸다 (§8.3, L6) */
+        transcript: z.string().optional(),
       }),
     )
     .default({}),

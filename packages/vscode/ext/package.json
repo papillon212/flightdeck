@@ -18,6 +18,16 @@
       { "command": "flightdeck.login", "title": "서버 로그인", "category": "Flightdeck" },
       { "command": "flightdeck.logout", "title": "서버 로그아웃", "category": "Flightdeck" },
       { "command": "flightdeck.cloneFromServer", "title": "서버 레포 받기", "category": "Flightdeck" },
+      { "command": "flightdeck.watch", "title": "관찰 시작", "category": "Flightdeck" },
+      { "command": "flightdeck.sendOpinion", "title": "의견 보내기", "category": "Flightdeck", "icon": "$(comment)" },
+      { "command": "flightdeck.requestPilot", "title": "조종 요청", "category": "Flightdeck" },
+      { "command": "flightdeck.handOff", "title": "조종 넘기기", "category": "Flightdeck" },
+      { "command": "flightdeck.adoptPilot", "title": "넘겨받은 조종 이어서 작업", "category": "Flightdeck" },
+      { "command": "flightdeck.takeover", "title": "조종 강제 인수 (조종수 이탈)", "category": "Flightdeck" },
+      { "command": "flightdeck.opinion.deliver", "title": "에이전트에 전달", "category": "Flightdeck", "icon": "$(arrow-right)" },
+      { "command": "flightdeck.opinion.urgent", "title": "급한 의견으로 전달 (지금 멈춤)", "category": "Flightdeck", "icon": "$(debug-stop)" },
+      { "command": "flightdeck.opinion.reply", "title": "답장", "category": "Flightdeck", "icon": "$(reply)" },
+      { "command": "flightdeck.opinion.dismiss", "title": "닫기", "category": "Flightdeck", "icon": "$(close)" },
       { "command": "flightdeck.setTrackerToken", "title": "일감 도구(ClickUp) 개인 토큰 설정", "category": "Flightdeck" },
       { "command": "flightdeck.requestReview", "title": "리뷰 요청", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
       { "command": "flightdeck.approve", "title": "승인", "category": "Flightdeck", "enablement": "flightdeck.inEpic" },
@@ -42,7 +52,20 @@
       { "command": "flightdeck.resolve", "title": "해결", "icon": "$(check)" },
       { "command": "flightdeck.reopen", "title": "다시 열기", "icon": "$(issue-reopened)" }
     ],
+    "views": {
+      "explorer": [
+        { "id": "flightdeck.live", "name": "Flightdeck 실시간 대화" },
+        { "id": "flightdeck.opinions", "name": "Flightdeck 의견" }
+      ]
+    },
     "menus": {
+      "view/item/context": [
+        { "command": "flightdeck.sendOpinion", "group": "inline", "when": "view == flightdeck.live && viewItem == fd-chat" },
+        { "command": "flightdeck.opinion.deliver", "group": "inline@1", "when": "view == flightdeck.opinions && viewItem == fd-opinion-new" },
+        { "command": "flightdeck.opinion.urgent", "group": "inline@2", "when": "view == flightdeck.opinions && viewItem == fd-opinion-new" },
+        { "command": "flightdeck.opinion.reply", "group": "inline@3", "when": "view == flightdeck.opinions && viewItem == fd-opinion-new" },
+        { "command": "flightdeck.opinion.dismiss", "group": "inline@4", "when": "view == flightdeck.opinions && viewItem == fd-opinion-new" }
+      ],
       "comments/commentThread/context": [
         { "command": "flightdeck.reply", "group": "inline", "when": "commentController == flightdeck" }
       ],
@@ -55,6 +78,10 @@
         { "command": "flightdeck.discardDraft", "group": "navigation", "when": "commentController == flightdeck && commentThread =~ /^fd-draft/" }
       ],
       "commandPalette": [
+        { "command": "flightdeck.opinion.deliver", "when": "false" },
+        { "command": "flightdeck.opinion.urgent", "when": "false" },
+        { "command": "flightdeck.opinion.reply", "when": "false" },
+        { "command": "flightdeck.opinion.dismiss", "when": "false" },
         { "command": "flightdeck.reply", "when": "false" },
         { "command": "flightdeck.resolve", "when": "false" },
         { "command": "flightdeck.reopen", "when": "false" },

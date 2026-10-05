@@ -5,12 +5,13 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
-import { applyTextEdit, artifactHash, auditMain, blame, checkSections, configHash, moveLines, type BlameEntry, configVersionOf, diffRecords, diffToEdits, draftText, ensureParagraphIds, insertDrafts, linesLabel, mapLines, myOpenThreads, type AuditFinding, type MainCommit, needsServerSignature, nowIso, parseDrafts, parseImplLog, pipelineFromDir, reduce, removeDrafts, renderThreads, replay, restoreParagraphIds, reviewOf, sha256, stripThreads, threadIdFrom, trustFromConfig, ulid, type ConfigPayload, type CoverageReport, type Draft, type EpicState, type MemoGroup, type Thread } from "@flightdeck/core";
+import { applyTextEdit, artifactHash, auditMain, blame, checkSections, configHash, moveLines, writerOf, type BlameEntry, configVersionOf, diffRecords, diffToEdits, draftText, ensureParagraphIds, insertDrafts, linesLabel, mapLines, myOpenThreads, type AuditFinding, type MainCommit, needsServerSignature, nowIso, parseDrafts, parseImplLog, pipelineFromDir, reduce, removeDrafts, renderThreads, replay, restoreParagraphIds, reviewOf, sha256, stripThreads, threadIdFrom, trustFromConfig, ulid, type ConfigPayload, type CoverageReport, type Draft, type EpicState, type MemoGroup, type Thread } from "@flightdeck/core";
 import { git, gitBuffer, GitEngine, LocalEventStore, MetaRewriteError, RAW_ARGS, RAW_ENV, RemoteEventStore, RunStore, seqTrailer } from "@flightdeck/git";
 import { DEV_TRUST, HANDOFF_SECTIONS, parsePipeline, PHASE_ARTIFACT, type Anchor, type EditMemo, type EditRecord, type EditSource, type Event, type EventOf, type EventType, type LocalEpicStateInput, type Phase, type Pipeline, type Trust } from "@flightdeck/schema";
 import type { AgentAdapter } from "@flightdeck/agent";
 import type { TrackerAdapter, TrackerEpic } from "@flightdeck/tracker";
-import { appendEditRecords, appendMemo, baseContent, checkImplLogFile, computeCoverage, implLogRel, lastSeq, readEditLog, readMemos, readState, recordDrift, renderMemos, statePath, toolInProgress, writeState, type ImplContext } from "@flightdeck/hook";
+import { appendEditRecords, appendMemo, baseContent, checkImplLogFile, computeCoverage, implLogRel, lastSeq, readEditLog, readMemos, readState, recordDrift, renderMemos, queueOpinion, replaceEditLog, statePath, toolInProgress, writeState, type ImplContext, type Opinion } from "@flightdeck/hook";
+import { applyRecords } from "./live.ts";
 import { cacheConfig, configCacheDir, loadCachedConfig, ServerRequestError, type ServerClient } from "./server-client.ts";
 
 /** 서버 모드 (M2 원격 협업). 없으면 개발 모드: 로컬 설정 폴더, 로컬 메타 브랜치, 서명 없음 */
@@ -292,7 +293,7 @@ export class EpicWorkflow {
       // 나에게 온 열린 쓰레드 중 내가 마지막으로 답하지 않은 것. 내 에픽이면 리뷰어가 담당자에게 단 수정 요청·질문이다(내 작업 폴더에서 연다)
       for (const t of myOpenThreads(s, this.cfg.member).filter((x) => x.to.includes(this.cfg.member) && x.author !== this.cfg.member)) {
         const created = events.find((e) => e.type === "thread.created" && e.data.thread === t.id) as EventOf<"thread.created"> | undefined;
-        out.push({ epic, thread: t, ...(created?.data.commit ? { commit: created.data.commit } : {}), ...(s.owner === this.cfg.member ? { mine: true } : {}) });
+        out.push({ epic, thread: t, ...(created?.data.commit ? { commit: created.data.commit } : {}), ...(writerOf(s) === this.cfg.member ? { mine: true } : {}) });
       }
     }
     return out;
@@ -306,7 +307,7 @@ export class EpicWorkflow {
     await this.pull();
     const s0 = await this.epicState(epic);
     if (s0.owner === null) throw new Error(`시작되지 않은 에픽: ${epic}`);
-    if (s0.owner === this.cfg.member) throw new Error("내가 담당한 에픽은 작업 폴더에서 연다");
+    if (writerOf(s0) === this.cfg.member) throw new Error("내가 조종하는 에픽은 작업 폴더에서 연다");
     const dataDir = await this.eng.dataDir();
     // 올리지 않은 쓰레드 초안은 커밋을 옮겨도 남긴다 (리뷰어의 에이전트가 쓴 것, §3.2)
     const kept = new Map<string, { draft: Draft; text: string }[]>();
@@ -362,8 +363,120 @@ export class EpicWorkflow {
     return { worktree: v.path, state: await this.sync(epic) };
   }
 
-  async role(epic: string): Promise<"owner" | "viewer" | "review"> {
+  async role(epic: string): Promise<"owner" | "viewer" | "review" | "live"> {
     return (await readState(await this.eng.dataDir(), epic)).role;
+  }
+
+  // ---- 조종수 모델 (§8.2~8.5, M8) ----
+
+  /**
+   * 관찰 시작 (§8.3, L8): 조종수의 마지막 체크포인트로 `<epic>@live`를 열고, 그 뒤의 서버 편집 기록을 적용한다.
+   * 다시 부르면 처음부터 다시 맞춘다. 실시간 편집은 LiveFollower가 이어서 적용한다
+   */
+  async openLive(epic: string): Promise<{ worktree: string; seq: number; pilot: string; mismatch: number | null }> {
+    const r = this.cfg.remote;
+    if (!r) throw new Error("관찰은 서버 모드에서만");
+    await this.pull();
+    const s = await this.epicState(epic);
+    const pilot = writerOf(s);
+    if (!pilot) throw new Error(`시작되지 않은 에픽: ${epic}`);
+    if (pilot === this.cfg.member) throw new Error("내가 조종하는 에픽입니다");
+    const ckpt = await this.eng.fetchCheckpoint(epic, pilot, this.gitRemote);
+    if (!ckpt) throw new Error(`조종수 @${pilot}의 체크포인트가 아직 없습니다 (조종수가 작업을 시작하면 생깁니다)`);
+    const seq = seqTrailer(await git(["log", "-1", "--format=%B", ckpt], { cwd: this.cfg.repo })) ?? 0;
+    const wt = await this.eng.openLiveWorktree(epic, ckpt);
+    const { records } = await r.server.editlog(r.product, epic, seq + 1);
+    const a = await applyRecords(wt, records);
+    return { worktree: wt, seq: a.applied || seq, pilot, mismatch: a.mismatch };
+  }
+
+  /**
+   * 조종 넘기기 (§8.5, L4): 외부 변경 기록 → 체크포인트 → push → 편집 기록 올리기 → pilot.changed.
+   * 내 작업 폴더는 그 뒤 읽기 전용(관찰자)이 된다. 새 조종수는 adoptPilot으로 이어받는다
+   */
+  async handOff(epic: string, to: string, reason: "handoff" | "request"): Promise<EpicState> {
+    const s = await this.epicState(epic);
+    if (writerOf(s) !== this.cfg.member || (await this.role(epic)) !== "owner") throw new Error("조종수의 작업 폴더에서만 넘길 수 있습니다");
+    if (to === this.cfg.member) throw new Error("자기 자신에게 넘길 수 없습니다");
+    const dataDir = await this.eng.dataDir();
+    if ((await this.recordExternal(epic)) === null) throw new Error("에이전트 도구가 실행 중입니다. 끝난 뒤 넘기세요");
+    const wt = await this.worktree(epic);
+    const seq = await lastSeq(dataDir, epic);
+    const ckpt = await this.eng.checkpoint(wt, { epic, member: this.cfg.member, message: `조종 넘기기 → @${to}`, trailers: { "Flightdeck-Source": "handoff", "Flightdeck-Seq": String(seq) } });
+    if (this.cfg.remote) {
+      await this.eng.pushCheckpoint(epic, this.cfg.member, this.gitRemote);
+      const up = await this.syncEditlog(epic);
+      if (up !== seq) throw new Error(`편집 기록을 서버에 다 올리지 못했습니다 (서버 ${up}, 로컬 ${seq}). 넘기지 않았습니다`);
+    }
+    await this.emit(epic, "pilot.changed", { from: this.cfg.member, to, reason, ckpt });
+    const { updateState } = await import("@flightdeck/hook");
+    await updateState(dataDir, epic, (st) => {
+      st.role = "viewer"; // 이제 관찰자: 훅이 쓰기를 막는다
+    });
+    return this.sync(epic);
+  }
+
+  /**
+   * 조종을 넘겨받는다 (§8.5, L4·L5): 이전 조종수의 체크포인트로 내 작업 폴더를 만들고, 서버 편집 기록·메모를 이 PC의 기록으로 둔다.
+   * takeover: 담당자의 강제 인수(조종수 이탈). pilot.changed(takeover)를 먼저 쓴다
+   */
+  async adoptPilot(epic: string, opts: { takeover?: boolean } = {}): Promise<{ worktree: string; state: EpicState; applied: number }> {
+    const r = this.cfg.remote;
+    if (!r) throw new Error("조종 넘겨받기는 서버 모드에서만");
+    await this.pull();
+    let s = await this.epicState(epic);
+    if (opts.takeover) {
+      const prev = writerOf(s);
+      if (s.owner !== this.cfg.member) throw new Error("강제 인수는 담당자만 할 수 있습니다");
+      if (!prev || prev === this.cfg.member) throw new Error("이미 내가 조종수입니다");
+      const ckpt = await this.eng.fetchCheckpoint(epic, prev, this.gitRemote);
+      await this.emit(epic, "pilot.changed", { from: prev, to: this.cfg.member, reason: "takeover", ...(ckpt ? { ckpt } : {}) });
+      s = await this.sync(epic);
+    }
+    if (writerOf(s) !== this.cfg.member) throw new Error(`조종수는 @${writerOf(s)}입니다`);
+    const last = s.pilotHistory.at(-1);
+    if (!last) throw new Error("넘겨받은 기록(pilot.changed)이 없습니다");
+    // 이전 조종수의 체크포인트 ref를 받으면 넘길 때 적은 체크포인트(그 체인의 일부)도 함께 온다
+    const latest = await this.eng.fetchCheckpoint(epic, last.from, this.gitRemote);
+    const ckpt = last.ckpt ?? latest;
+    const head = await this.eng.fetchEpicBranch(epic, this.gitRemote);
+    if (!head || !ckpt) throw new Error("에픽 브랜치나 이전 조종수의 체크포인트를 받지 못했습니다");
+    const dataDir = await this.eng.dataDir();
+    const wt = await this.eng.adoptEpicWorktree(epic, head, ckpt);
+    const ckptSeq = seqTrailer(await git(["log", "-1", "--format=%B", ckpt], { cwd: this.cfg.repo })) ?? 0;
+    const log = await r.server.editlog(r.product, epic, 1);
+    await replaceEditLog(dataDir, epic, log.records, log.memos);
+    const a = await applyRecords(wt, log.records.filter((x) => x.seq > ckptSeq));
+    if (a.mismatch !== null) this.warnings.push(`편집 기록 ${a.mismatch}가 체크포인트 내용과 맞지 않아 그 뒤를 적용하지 못했습니다`);
+    const implLog = path.join(wt, implLogRel(epic));
+    const steps = existsSync(implLog) ? parseImplLog(await readFile(implLog, "utf8")).steps.map((x) => x.n) : [];
+    const version = s.config_version;
+    const configDir = version && (await this.pipelineFor(version)) ? configCacheDir(dataDir, r.product, version) : this.cfg.configDir;
+    await writeState(dataDir, {
+      epic,
+      repo: this.cfg.repo,
+      worktree: wt,
+      member: this.cfg.member,
+      role: "owner",
+      product: r.product,
+      gitRemote: this.gitRemote,
+      phase: s.phase,
+      configDir,
+      trust: this.trust,
+      excludeSecrets: this.eng.excludeSecrets,
+      impl_step: steps.length ? Math.max(...steps) : 0,
+      runs: {},
+    });
+    await this.cfg.adapter.installConfig(wt, this.hookCommand(epic), { name: "flightdeck", command: "node", args: [path.join(this.cfg.distDir, "flightdeck-mcp.mjs"), "--repo", this.cfg.repo, "--epic", epic] }, { model: this.cfg.model });
+    this.uploaded.set(epic, { last: log.last, memos: sha256(JSON.stringify(log.memos))! });
+    return { worktree: wt, state: await this.sync(epic), applied: a.applied };
+  }
+
+  /** 조종수가 고른 관찰자 의견을 에이전트 전달 대기열에 넣는다 (§8.4, L7) */
+  async deliverOpinion(epic: string, o: Opinion): Promise<void> {
+    const dataDir = await this.eng.dataDir();
+    if (!existsSync(statePath(dataDir, epic)) || (await this.role(epic)) !== "owner") throw new Error("조종수의 작업 폴더에서만 에이전트에 전달합니다");
+    await queueOpinion(await this.eng.dataDir(), epic, o);
   }
 
   async worktree(epic: string): Promise<string> {
@@ -617,7 +730,7 @@ export class EpicWorkflow {
   async requestReview(epic: string): Promise<{ ok: true; state: EpicState } | { ok: false; problems: string[] }> {
     const s0 = await this.epicState(epic);
     const problems: string[] = [];
-    if (s0.owner !== this.cfg.member) problems.push(`담당자(@${s0.owner})만 리뷰를 요청할 수 있습니다`);
+    if (writerOf(s0) !== this.cfg.member) problems.push(`조종수(@${writerOf(s0)})만 리뷰를 요청할 수 있습니다`);
     const a = PHASE_ARTIFACT[s0.phase as keyof typeof PHASE_ARTIFACT];
     if (!a || !reviewOf(s0)) problems.push(`${s0.phase} 단계는 티어 리뷰가 없습니다`);
     const wt = await this.worktree(epic);
@@ -680,7 +793,7 @@ export class EpicWorkflow {
   async checkPhase(epic: string): Promise<{ phase: Phase; problems: string[] }> {
     const s = await this.epicState(epic);
     const problems: string[] = [];
-    if (s.owner !== this.cfg.member) problems.push(`담당자(@${s.owner})만 단계를 완료할 수 있습니다 (나: @${this.cfg.member})`);
+    if (writerOf(s) !== this.cfg.member) problems.push(`조종수(@${writerOf(s)})만 단계를 완료할 수 있습니다 (나: @${this.cfg.member})`);
     const a = PHASE_ARTIFACT[s.phase as keyof typeof PHASE_ARTIFACT];
     if (!a) return { phase: s.phase, problems: [`${s.phase} 단계 완료는 M1 범위 밖입니다`] };
     const wt = await this.worktree(epic);
@@ -856,7 +969,7 @@ export class EpicWorkflow {
     opts: { onOutput?: (s: string) => void } = {},
   ): Promise<{ ok: true; commit: string; phase: Phase } | { ok: false; problems: string[]; coverage?: CoverageReport }> {
     const s0 = await this.epicState(epic);
-    if (s0.owner !== this.cfg.member) return { ok: false, problems: [`담당자(@${s0.owner})만 제출할 수 있습니다`] };
+    if (writerOf(s0) !== this.cfg.member) return { ok: false, problems: [`조종수(@${writerOf(s0)})만 제출할 수 있습니다`] };
     if (s0.phase !== "IMPLEMENTATION") return { ok: false, problems: [`지금은 ${s0.phase} 단계입니다`] };
     const open = [...s0.threads.values()].filter((t) => t.phase === s0.phase && t.status === "open");
     const r = await this.commitAndReport(epic, "구현 제출", "IMPLEMENTATION", opts, open.length ? [`열린 쓰레드 ${open.length}개`] : []);
@@ -908,7 +1021,7 @@ export class EpicWorkflow {
   /** 검증 중 다시 요청 (Y1): 수정 제안을 반영한 뒤. 관문 검사 → 커밋 → 테스트 보고 → 리뷰 요청 (재승인은 reapproval대로) */
   async requestVerification(epic: string, opts: { onOutput?: (s: string) => void } = {}): Promise<{ ok: true; state: EpicState } | { ok: false; problems: string[]; coverage?: CoverageReport }> {
     const s0 = await this.epicState(epic);
-    if (s0.owner !== this.cfg.member) return { ok: false, problems: [`담당자(@${s0.owner})만 리뷰를 요청할 수 있습니다`] };
+    if (writerOf(s0) !== this.cfg.member) return { ok: false, problems: [`조종수(@${writerOf(s0)})만 리뷰를 요청할 수 있습니다`] };
     if (s0.phase !== "VERIFICATION") return { ok: false, problems: [`지금은 ${s0.phase} 단계입니다`] };
     const r = await this.commitAndReport(epic, "검증 다시 요청", "VERIFICATION", opts);
     if (!r.ok) return r;
@@ -947,7 +1060,7 @@ export class EpicWorkflow {
     const patch = await this.copyDiff(wt);
     if (!patch.trim()) throw new Error("리뷰 사본에서 고친 내용이 없습니다");
     const s = await this.epicState(epic);
-    const thread = await this.createCodeThread(epic, { ...t, kind: "change_request", to: t.to ?? (s.owner ? [s.owner] : []), patch });
+    const thread = await this.createCodeThread(epic, { ...t, kind: "change_request", to: t.to ?? (writerOf(s) ? [writerOf(s)!] : []), patch });
     await git(["checkout", "-q", "-f", "HEAD", "--", "."], { cwd: wt });
     await git(["clean", "-fdq", "-e", ".flightdeck/.runtime"], { cwd: wt });
     return thread;
@@ -1075,7 +1188,7 @@ export class EpicWorkflow {
    */
   async applyPatch(epic: string, threadId: string): Promise<string[]> {
     const s = await this.epicState(epic);
-    if (s.owner !== this.cfg.member || (await this.role(epic)) !== "owner") throw new Error("수정 제안은 담당자의 작업 폴더에서 반영한다");
+    if (writerOf(s) !== this.cfg.member || (await this.role(epic)) !== "owner") throw new Error("수정 제안은 조종수의 작업 폴더에서 반영한다");
     const t = s.threads.get(threadId);
     const patch = t?.replies.filter((r) => r.patch).at(-1)?.patch ?? t?.patch;
     if (!t || !patch) throw new Error("수정 제안이 없는 쓰레드");
@@ -1114,7 +1227,7 @@ export class EpicWorkflow {
    * needs_report: 서버가 main을 병합한 커밋으로 작업 폴더를 fast-forward하고, 테스트를 다시 실행·보고한다(서버가 그 서명 뒤 반영을 다시 건다)
    */
   async followLanding(epic: string, s: EpicState, opts: { onOutput?: (s: string) => void } = {}): Promise<"reported" | "waiting" | null> {
-    if (s.phase !== "LANDING" || !s.landing || s.owner !== this.cfg.member) return null;
+    if (s.phase !== "LANDING" || !s.landing || writerOf(s) !== this.cfg.member) return null;
     if (s.landing.status !== "needs_report") return "waiting";
     const commit = s.landing.commit;
     if (s.gates.has(commit)) return "waiting";

@@ -193,10 +193,11 @@ export class EventSigner {
   /** 업로드 권한 확인용 담당자 캐시: 업로드는 몇 초마다 오므로 매번 메타 브랜치를 받지 않는다 (조종수 바뀜은 M8) */
   private writers = new Map<string, { writer: string | null; at: number }>();
 
-  private async writerOf(product: string, epic: string, fresh = false): Promise<string | null> {
+  async writerOf(product: string, epic: string, fresh = false): Promise<string | null> {
     const key = `${product}\0${epic}`;
     const hit = this.writers.get(key);
-    if (!fresh && hit && Date.now() - hit.at < 60_000) return hit.writer;
+    // 실시간 스트림(편집·대화, 초당 여러 번)은 캐시로 본다. 넘기면 이전 조종수 확장은 스스로 스트림을 멈춘다
+    if (!fresh && hit && Date.now() - hit.at < 10_000) return hit.writer;
     const s = await this.enqueue(product, async () => (await this.loadProduct(product)).state(epic));
     const writer = writerOf(s);
     this.writers.set(key, { writer, at: Date.now() });
@@ -206,8 +207,10 @@ export class EventSigner {
   /** 편집 기록 올리기 (E1·E4·E8). seq가 이어지지 않으면 409와 서버의 마지막 seq */
   async uploadEditlog(member: Member, product: string, body: unknown): Promise<{ last: number }> {
     const u = parseUpload(body);
-    let writer = await this.writerOf(product, u.epic);
-    if (writer !== member.id) writer = await this.writerOf(product, u.epic, true);
+    // 무언가를 쓰는 업로드는 조종수를 항상 새로 확인한다: 넘긴 직후의 이전 조종수가 캐시로 통과하면 안 된다 (M8 L5)
+    const writes = u.records.length > 0 || u.memos !== undefined;
+    let writer = await this.writerOf(product, u.epic, writes);
+    if (writer !== member.id && !writes) writer = await this.writerOf(product, u.epic, true);
     if (writer !== member.id) throw new RequestError(403, `편집 기록은 조종수(@${writer ?? "없음"})만 올린다`);
     if (u.records.length && !(await this.deps.store.appendEditlog(product, u.epic, u.records))) {
       throw new RequestError(409, JSON.stringify({ last: await this.deps.store.editlogLast(product, u.epic) }));

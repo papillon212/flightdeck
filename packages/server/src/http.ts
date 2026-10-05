@@ -5,6 +5,7 @@ import { keyFingerprint } from "@flightdeck/core";
 import { buildConfig } from "./config.ts";
 import { adminRoutes } from "./admin.ts";
 import type { GitHost } from "./githost.ts";
+import { MEMBER_TYPES, PILOT_TYPES, type LiveHub } from "./live.ts";
 import { RequestError, type EventSigner } from "./signer.ts";
 import type { Member, ServerStore } from "./store.ts";
 
@@ -18,6 +19,8 @@ export interface AppOptions {
   sessionTtlMs?: number;
   /** 내장 git 서버 (§1.5, M5.5) */
   githost?: GitHost;
+  /** 실시간 중계 (서버 ④, M8) */
+  live?: LiveHub;
 }
 
 export interface Ctx {
@@ -75,7 +78,7 @@ export function createApp(opts: AppOptions) {
     const memberId = token ? await opts.store.sessionMember(token) : null;
     const member = memberId ? await opts.store.getMember(memberId) : null;
     // 편집 기록 묶음은 큰 파일의 내용을 담을 수 있다 (M7)
-    const limit = url.pathname === "/editlog" ? 16 << 20 : 1 << 20;
+    const limit = url.pathname === "/editlog" || url.pathname.startsWith("/live/") ? 16 << 20 : 1 << 20;
     const ctx: Ctx = { req, res, url, opts, member: member?.active ? member : null, body: () => (bodyCache ??= readBody(req, limit)) };
     const p = url.pathname;
     try {
@@ -154,6 +157,27 @@ export function createApp(opts: AppOptions) {
         if (!c) throw new RequestError(404, `설정이 없는 제품·버전: ${product}`);
         return json(res, 200, c);
       }
+      // ── 실시간 중계 (서버 ④, M8 L1) ──
+      const lv = /^\/live\/([^/]+)(\/presence)?$/.exec(p);
+      if (lv && opts.live) {
+        const product = url.searchParams.get("product") ?? "";
+        const epic = decodeURIComponent(lv[1]!);
+        if (lv[2] && req.method === "GET") return json(res, 200, opts.live.presence(product, epic));
+        if (req.method === "GET") return opts.live.subscribe(product, epic, ctx.member.id, res, Number(req.headers["last-event-id"] ?? url.searchParams.get("after")) || 0);
+        if (req.method === "POST") {
+          const body = JSON.parse(await ctx.body()) as { type?: string; data?: unknown; to?: string[] };
+          const type = String(body.type ?? "");
+          if (PILOT_TYPES.has(type)) {
+            // 조종수만 (편집 기록·대화·활동). 서명 요청처럼 reducer의 조종수로 확인한다
+            let w = await opts.signer.writerOf(product, epic);
+            if (w !== ctx.member.id) w = await opts.signer.writerOf(product, epic, true);
+            if (w !== ctx.member.id) throw new RequestError(403, `조종수(@${w ?? "없음"})만 보낼 수 있다: ${type}`);
+          } else if (!MEMBER_TYPES.has(type)) throw new RequestError(400, `모르는 실시간 메시지: ${type}`);
+          const to = Array.isArray(body.to) ? body.to.map(String) : undefined;
+          return json(res, 200, { id: opts.live.publish(product, epic, ctx.member.id, type, body.data ?? null, to).id });
+        }
+      }
+
       // ── 편집 기록 (서버 ③, M7) ──
       if (p === "/editlog" && req.method === "POST") {
         const product = url.searchParams.get("product") ?? "";

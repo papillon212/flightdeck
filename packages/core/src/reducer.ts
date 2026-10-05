@@ -57,6 +57,9 @@ export interface EpicState {
   epic: string;
   phase: Phase;
   owner: string | null;
+  /** 현재 조종수 (§8.2, M8 L2): 처음은 담당자, pilot.changed로 바뀐다 */
+  pilot: string | null;
+  pilotHistory: { from: string; to: string; reason: "handoff" | "request" | "takeover"; at: string; event: string; ckpt?: string }[];
   base_sha: string | null;
   config_version: string | null;
   tracker_ref: string | null;
@@ -95,6 +98,8 @@ export function initialState(epic: string): EpicState {
     epic,
     phase: "INTAKE",
     owner: null,
+    pilot: null,
+    pilotHistory: [],
     base_sha: null,
     config_version: null,
     tracker_ref: null,
@@ -130,9 +135,9 @@ export function reduce(epic: string, events: Event[], trust: Trust, opts: Reduce
   return s;
 }
 
-/** 에픽 작업 폴더에 쓰는 사람: 편집 기록을 올리고 에픽 브랜치에 쓴다 (§8.2). 조종수 모델(M8) 전에는 담당자 */
+/** 에픽 작업 폴더에 쓰는 사람 = 조종수 (§8.2): 편집 기록을 올리고, 에픽 브랜치·세션 원본에 쓰고, 작업 결과(테스트 보고·완료·리뷰 요청)를 낸다 */
 export function writerOf(s: EpicState): string | null {
-  return s.owner;
+  return s.pilot ?? s.owner;
 }
 
 /** 이 에픽이 고정한 설정 버전 (epic.started). 파이프라인을 미리 불러올 때 쓴다 */
@@ -187,7 +192,19 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
         s.config_mismatch = { version: e.data.config_version, signed: e.data.config_hash, actual };
       } else s.pipeline = findPipeline(e.data.config_version);
       s.tracker_ref = e.data.tracker_ref;
+      s.pilot = e.data.owner; // 처음 조종수는 담당자 (§8.2)
       move("ANALYSIS"); // INTAKE는 자동으로 지나간다 (§4.1)
+      return;
+    }
+
+    case "pilot.changed": {
+      // 조종 넘기기 (§8.5, M8 제안 L2): 넘기기·요청 수락은 현재 조종수가, 강제 인수는 담당자가 쓴다
+      const d = e.data;
+      if (d.from !== s.pilot) return ignore(`현재 조종수(@${s.pilot})가 아님`);
+      if (d.to === d.from) return ignore("같은 사람에게 넘길 수 없음");
+      if (d.reason === "takeover" ? e.author !== s.owner : e.author !== s.pilot) return ignore(d.reason === "takeover" ? "담당자만 강제 인수할 수 있음" : "현재 조종수만 조종을 넘길 수 있음");
+      s.pilot = d.to;
+      s.pilotHistory.push({ from: d.from, to: d.to, reason: d.reason, at: e.at, event: e.id, ...(d.ckpt ? { ckpt: d.ckpt } : {}) });
       return;
     }
 
@@ -195,8 +212,8 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
       const d = e.data;
       if (s.threads.has(d.thread)) return ignore("이미 있는 쓰레드 ID");
       if (d.patch && d.kind !== "change_request") return ignore("수정 제안은 수정 요청 쓰레드에만 붙인다");
-      // 생성 권한 (§3.4): 해당 단계 담당자 / 현재 티어 리뷰어 (리뷰 요청 이후)
-      if (e.author !== s.owner) {
+      // 생성 권한 (§3.4): 해당 단계 담당자·조종수 / 현재 티어 리뷰어 (리뷰 요청 이후)
+      if (e.author !== s.owner && e.author !== s.pilot) {
         const cur = s.review.requested ? reviewOf(s)?.current : null;
         if (!cur?.reviewers.includes(e.author)) return ignore("쓰레드 생성 권한 없음");
       }
@@ -228,10 +245,10 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
     }
 
     case "patch.applied": {
-      // 수정 제안 반영 (§9.3, M5 Y4): 조종수(M5는 담당자)가 반영한다
+      // 수정 제안 반영 (§9.3, M5 Y4): 조종수가 반영한다 (M8 L3)
       const t = s.threads.get(e.data.thread);
       if (!t) return ignore("없는 쓰레드");
-      if (e.author !== s.owner) return ignore("담당자만 수정 제안을 반영할 수 있음");
+      if (e.author !== s.pilot) return ignore("조종수만 수정 제안을 반영할 수 있음");
       if (!t.patch && !t.replies.some((r) => r.patch)) return ignore("수정 제안이 없는 쓰레드");
       t.applied.push(e.id);
       return;
@@ -242,7 +259,7 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
       const t = s.threads.get(e.data.thread);
       if (!t) return ignore("없는 쓰레드");
       // resolve/reopen 권한 (§3.4): 쓰레드 생성자. 분석 단계에서는 담당자도
-      const ok = e.author === t.author || (t.phase === "ANALYSIS" && e.author === s.owner);
+      const ok = e.author === t.author || (t.phase === "ANALYSIS" && (e.author === s.owner || e.author === s.pilot));
       if (!ok) return ignore("resolve/reopen 권한 없음");
       const want = e.type === "thread.resolved" ? "resolved" : "open";
       if (t.status === want) return ignore(`이미 ${want}`);
@@ -253,14 +270,14 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
     case "thread.moved": {
       const t = s.threads.get(e.data.thread);
       if (!t) return ignore("없는 쓰레드");
-      if (e.author !== s.owner && e.author !== t.author) return ignore("쓰레드 이동 권한 없음");
+      if (e.author !== s.owner && e.author !== s.pilot && e.author !== t.author) return ignore("쓰레드 이동 권한 없음");
       t.anchor = e.data.anchor;
       return;
     }
 
     case "phase.completed": {
       if (e.data.phase !== s.phase) return ignore(`현재 단계(${s.phase})가 아님`);
-      if (e.author !== s.owner) return ignore("담당자만 단계를 완료할 수 있음");
+      if (e.author !== s.pilot) return ignore("조종수만 단계를 완료할 수 있음");
       if (!COMPLETABLE.has(s.phase)) return ignore(`${s.phase}는 단계 완료가 아니라 티어 리뷰로 넘어간다 (§4.2)`);
       // ANALYSIS 관문 (§4.1): 그 단계의 쓰레드 전부 resolved
       const open = openThreads(s);
@@ -280,7 +297,7 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
       // 구현 관문의 명령 결과 (§7.5): 담당자의 확장이 실행해 보고한다
       // 구현 제출, 검증 중 다시 요청(Y1), 반영 중 main 이동 후 재보고(Y6)
       if (!["IMPLEMENTATION", "VERIFICATION", "LANDING"].includes(s.phase)) return ignore(`${s.phase} 단계에서는 테스트 결과를 보고하지 않음`);
-      if (e.author !== s.owner) return ignore("담당자만 테스트 결과를 보고할 수 있음");
+      if (e.author !== s.pilot) return ignore("조종수만 테스트 결과를 보고할 수 있음");
       s.gates.set(e.data.commit, { ok: e.data.commands.every((c) => c.exit === 0), event: e.id, author: e.author, at: e.at });
       if (s.phase === "LANDING" && s.landing?.status === "needs_report" && s.landing.commit === e.data.commit && s.gates.get(e.data.commit)!.ok) s.landing.status = "pending";
       return;
@@ -310,7 +327,7 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
 
     case "review.requested": {
       if (e.data.phase !== s.phase) return ignore(`현재 단계(${s.phase})가 아님`);
-      if (e.author !== s.owner) return ignore("담당자만 리뷰를 요청할 수 있음");
+      if (e.author !== s.pilot) return ignore("조종수만 리뷰를 요청할 수 있음");
       if (!reviewConfig(s.pipeline, s.phase)) return ignore(s.pipeline ? `${s.phase}는 티어 리뷰가 없는 단계` : "파이프라인 없음 (설정 버전을 찾지 못함)");
       // VERIFICATION 리뷰는 테스트가 통과한 커밋만 (M5 Y1)
       if (s.phase === "VERIFICATION") {
@@ -337,7 +354,7 @@ function apply(s: EpicState, e: Event, findPipeline: (v: string) => Pipeline | u
 
     case "phase.reverted": {
       if (e.data.from !== s.phase) return ignore(`현재 단계(${s.phase})가 아님`);
-      if (e.author !== s.owner) return ignore("담당자만 되돌릴 수 있음");
+      if (e.author !== s.owner && e.author !== s.pilot) return ignore("담당자·조종수만 되돌릴 수 있음");
       // §4.3: DESIGN → ANALYSIS, VERIFICATION → IMPLEMENTATION (구현 재개)
       const ok = (e.data.from === "DESIGN" && e.data.to === "ANALYSIS") || (e.data.from === "VERIFICATION" && e.data.to === "IMPLEMENTATION");
       if (!ok) return ignore("허용하지 않는 되돌림");
@@ -389,6 +406,7 @@ function pick(e: EventOf<"run.started">): Omit<Run, "finished"> {
 function threadMembers(t: Thread, s: EpicState): Set<string> {
   const m = new Set([t.author, ...t.to, ...t.replies.map((r) => r.author)]);
   if (s.owner) m.add(s.owner);
+  if (s.pilot) m.add(s.pilot);
   return m;
 }
 

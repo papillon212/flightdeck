@@ -158,7 +158,7 @@ describe("서버 서명 이벤트 (§3.1, §4.2, §12)", { timeout: 60_000 }, ()
     expect((await done("dh.lee")).data.error).toMatch(/열린 쓰레드 1개/);
 
     await ownerStore().append({ v: 1, id: ulid(), type: "thread.resolved", epic: EPIC, author: "dh.lee", at: new Date().toISOString(), data: { thread: "t-AAAAAAAA" } } as Event);
-    expect((await done("park")).data.error).toMatch(/담당자만 단계를 완료할 수 있음 \(요청자: park/);
+    expect((await done("park")).data.error).toMatch(/조종수만 단계를 완료할 수 있음 \(요청자: park/);
     expect((await done("dh.lee", { artifact_hash: artifactHash("다른 내용") })).data.error).toMatch(/요청한 내용과 다름/);
     expect((await api("dh.lee", "POST", "/events", { product: "sample", epic: EPIC, type: "review.approved", data: {} })).data.error).toBe("리뷰 요청 전");
     expect((await api("dh.lee", "POST", "/events", { product: "sample", epic: EPIC, type: "gate.reported", data: {} })).status).toBe(400); // 아직 지원하지 않음
@@ -244,7 +244,7 @@ describe("티어 리뷰 서명 (§4.2 v0.13)", { timeout: 60_000 }, () => {
   it("리뷰 요청: 담당자만, 원격 design.md 형식 확인, commit·해시는 서버가 채운다", async () => {
     expect((await ev("dh.lee", "review.requested", { phase: "DESIGN" })).data.error).toMatch(/design.md가 없음/);
     const c1 = await put("design.md", DESIGN);
-    expect((await ev("park", "review.requested", { phase: "DESIGN" })).data.error).toMatch(/담당자만 리뷰를 요청할 수 있음/);
+    expect((await ev("park", "review.requested", { phase: "DESIGN" })).data.error).toMatch(/조종수만 리뷰를 요청할 수 있음/);
     const r = await ev("dh.lee", "review.requested", { phase: "DESIGN", artifact_hash: artifactHash(DESIGN) });
     expect(r.status).toBe(200);
     expect(r.data.event.data).toEqual({ phase: "DESIGN", artifact_hash: artifactHash(DESIGN), commit: c1 });

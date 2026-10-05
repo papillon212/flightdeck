@@ -8,8 +8,9 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import * as vscode from "vscode";
 import { ClaudeCodeAdapter, cleanEnv } from "@flightdeck/agent";
-import { coalesce, linesLabel, nowIso, parseBlocks, parseDrafts, PID_LINE, restoreParagraphIds, reviewOf, sha256, type ConfigPayload, type EpicState, type Thread } from "@flightdeck/core";
+import { coalesce, linesLabel, nowIso, parseBlocks, parseDrafts, PID_LINE, restoreParagraphIds, reviewOf, sha256, writerOf, type ConfigPayload, type EpicState, type Thread } from "@flightdeck/core";
 import { blameLabel } from "./blame-label.ts";
+import { adoptedButNotOpened, ChatTree, handleOpinion, liveFolderEpic, OpinionTree, sendOpinion, startLiveWindow, startPilotWindow, type LiveWindow, type OpinionMsg, type PilotWindow } from "./live-ui.ts";
 import { git, RemoteEventStore } from "@flightdeck/git";
 import { appendEditRecords, readEditLog, readState } from "@flightdeck/hook";
 import { parsePipeline, type EditRecord, type LocalEpicState, type Phase } from "@flightdeck/schema";
@@ -26,8 +27,8 @@ interface Ctx {
   /** 이 창이 에픽 작업 폴더(또는 읽기 전용 창)면 그 에픽 */
   epic: string | null;
   worktree: string | null;
-  /** review: VERIFICATION 리뷰 사본 (쓰기 가능, 기록 안 함, M5 Y3) */
-  role: "owner" | "viewer" | "review";
+  /** review: VERIFICATION 리뷰 사본 (쓰기 가능, 기록 안 함, M5 Y3). live: 관찰자의 실시간 읽기 전용 창 (M8 L8) */
+  role: "owner" | "viewer" | "review" | "live";
   mode: "server" | "dev";
   /** 서버 모드인데 로그인이 안 됐거나 서버에 닿지 못해 쓸 수 없는 이유 */
   blocked?: string;
@@ -177,6 +178,9 @@ async function resolveCtx(ext: vscode.ExtensionContext): Promise<Ctx | null> {
   const real = realpathSync(top);
   let epic: string | null = null;
   let role: Ctx["role"] = "owner";
+  // 관찰자 창 `<repo>.flightdeck/<epic>@live` (M8 L8): 상태 파일 없이 폴더 이름으로 안다
+  const liveEpic = liveFolderEpic(top);
+  if (liveEpic) return { wf, repo, epic: liveEpic, worktree: top, role: "live", mode, ...(blocked ? { blocked } : {}), offline, ...(hosted ? { hosted } : {}) };
   if (existsSync(stateDir)) {
     for (const f of readdirSync(stateDir).filter((n) => n.endsWith(".json"))) {
       try {
@@ -480,6 +484,10 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
 
   let view: ThreadView | null = null;
   let human: HumanEdits | null = null;
+  /** 조종수 모델 (M8): 관찰자 창 / 조종수 창 */
+  let liveWin: LiveWindow | null = null;
+  let pilotWin: PilotWindow | null = null;
+  let opinionsSent = 0;
   /** 구현 단계 상태 표시 (Step·설명 필요 수). 저장하지 않은 편집이 있으면 계산하지 않고 직전 값을 쓴다 */
   let implLabel = "";
   /** 저장하고 사람 편집 기록을 비운다. 그래야 편집 기록 재적용 = 디스크 비교(외부 변경 감지)가 맞다 */
@@ -514,6 +522,16 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     if (!ctx?.epic) {
       status.text = `$(rocket) Flightdeck${ctx?.mode === "server" ? ` · @${ctx.wf.cfg.member}` : ""}${ctx?.offline ? " · 서버 연결 안 됨" : ""}`;
       status.tooltip = ctx?.mode === "server" ? "Flightdeck: 내 일감 / 받은 질문" : "Flightdeck: 새 에픽";
+      status.command = "flightdeck.menu";
+      status.show();
+      return;
+    }
+    if (ctx.role === "live") {
+      // 관찰자 창: 작업 폴더 상태·렌더링 없이 메타 상태와 실시간 상태만 (M8)
+      await ctx.wf.pull().catch(() => undefined);
+      const ls = await ctx.wf.epicState(ctx.epic);
+      status.text = `$(eye) Flightdeck · ${ctx.epic} · ${ls.phase} · ${liveWin?.status() ?? "관찰 준비 중"}${opinionsSent ? ` · 보낸 의견 ${opinionsSent}` : ""}`;
+      status.tooltip = "관찰자 창 (읽기 전용): 의견 보내기·조종 요청";
       status.command = "flightdeck.menu";
       status.show();
       return;
@@ -564,7 +582,10 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       const st = await ctx.wf.implementationStatus(ctx.epic).catch((e) => (out.appendLine(`[impl] ${e}`), null));
       if (st) implLabel = ` · Step ${st.step + 1}${st.coverage.unexplained.length ? ` · 설명 필요 ${st.coverage.unexplained.length}` : ""}`;
     } else if (s.phase !== "IMPLEMENTATION") implLabel = "";
-    status.text = `$(rocket) Flightdeck · ${ctx.epic} · ${s.phase}${tier}${implLabel}${landing}${ro}${myTurn ? " · 내 리뷰 차례" : ""}${open ? ` · 열린 쓰레드 ${open}` : ""}${drafts ? ` · 초안 ${drafts}` : ""}${ctx.offline ? " · 서버 연결 안 됨" : ""}${s.config_mismatch ? " · ⚠ 설정 불일치" : ""}`;
+    // 조종수 모델 (M8): 내가 조종수가 아니면 표시, 조종수 창은 받은 의견 수
+    const pilot = writerOf(s);
+    const pilotLabel = pilot && pilot !== me && ctx.role === "owner" ? ` · 조종수 @${pilot} (관찰자)` : pilotWin?.opinions.pending ? ` · 의견 ${pilotWin.opinions.pending}` : "";
+    status.text = `$(rocket) Flightdeck · ${ctx.epic} · ${s.phase}${tier}${implLabel}${landing}${ro}${pilotLabel}${myTurn ? " · 내 리뷰 차례" : ""}${open ? ` · 열린 쓰레드 ${open}` : ""}${drafts ? ` · 초안 ${drafts}` : ""}${ctx.offline ? " · 서버 연결 안 됨" : ""}${s.config_mismatch ? " · ⚠ 설정 불일치" : ""}`;
     status.tooltip = s.config_mismatch
       ? `설정 불일치 (M5.5 Z9): 이 에픽은 ${s.config_mismatch.version}로 시작했는데 서버의 ${s.config_mismatch.version} 내용이 다릅니다. 단계 통과를 판정하지 않습니다. 관리자에게 원래 설정 복구를 요청하세요`
       : ctx.role === "viewer" ? "읽기 전용 창: 받은 쓰레드에 답글, 리뷰 차례면 수정 요청·승인" : "Flightdeck: 단계 완료·리뷰 요청 / 초안 / 이어서 작업";
@@ -620,9 +641,23 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
     const onChange = async () => {
       try {
         // 리뷰 요청된(없으면 최신 공유) 커밋으로. 반영이 끝난 에픽은 에픽 브랜치가 없어 옮기지 않는다
-        if (ctx.epic && ctx.role !== "owner") {
+        if (ctx.epic && (ctx.role === "viewer" || ctx.role === "review")) {
           const s = await ctx.wf.epicState(ctx.epic);
-          if (s.phase !== "LANDING" && s.phase !== "DONE") await ctx.wf.openAsViewer(ctx.epic);
+          // 조종을 넘겨받았으면 (M8 L4) 리뷰·질문 창으로 되돌리지 않고 이어서 작업을 권한다
+          if (writerOf(s) === ctx.wf.cfg.member) await offerAdopt(ctx.epic);
+          else if (s.phase !== "LANDING" && s.phase !== "DONE") await ctx.wf.openAsViewer(ctx.epic);
+        } else if (ctx.epic && ctx.role === "owner") {
+          const s = await ctx.wf.epicState(ctx.epic);
+          if (writerOf(s) !== ctx.wf.cfg.member && pilotWin) {
+            // 조종을 넘겼다: 스트림을 멈춘다
+            pilotWin.dispose();
+            pilotWin = null;
+          }
+        }
+        for (const e of await ctx.wf.store.listEpics()) {
+          if (e === ctx.epic) continue;
+          const s = await ctx.wf.epicState(e);
+          if (adoptedButNotOpened(s, ctx.wf.cfg.member, null)) await offerAdopt(e);
         }
         await refresh();
         await notifyInbox(await ctx.wf.inbox());
@@ -678,8 +713,50 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
   }
 
   // 읽기 전용 창: 파일을 읽기 전용으로 연다 (§2.4). 이 창의 변경은 다음 공유 커밋으로 옮길 때 버려진다
-  if (ctx?.epic && ctx.role === "viewer") {
+  if (ctx?.epic && (ctx.role === "viewer" || ctx.role === "live")) {
     await vscode.workspace.getConfiguration("files").update("readonlyInclude", { "**": true }, vscode.ConfigurationTarget.Workspace).then(undefined, () => undefined);
+  }
+
+  // 조종수 모델 (M8): 관찰자 창은 실시간 적용·대화 뷰, 조종수 창은 스트림·의견 패널
+  if (ctx?.epic && ctx.worktree && ctx.mode === "server" && !ctx.blocked) {
+    const lc = { wf: ctx.wf, epic: ctx.epic, worktree: ctx.worktree };
+    try {
+      if (ctx.role === "live") {
+        liveWin = await startLiveWindow(lc, out, notify, () => void refresh());
+        ext.subscriptions.push({ dispose: () => liveWin?.dispose() });
+      } else if (ctx.role === "owner" && writerOf(await ctx.wf.epicState(ctx.epic)) === ctx.wf.cfg.member) {
+        pilotWin = await startPilotWindow(lc, out, notify, () => void refresh(), (from) => {
+          void notify(`Flightdeck: @${from}이(가) 조종을 요청했습니다 (${ctx.epic})`, "수락", "거절").then(async (pick) => {
+            const r = ctx.wf.cfg.remote!;
+            if (pick === "수락") {
+              await saveAll();
+              await ctx.wf.handOff(ctx.epic!, from, "request");
+              await r.server.liveSend(r.product, ctx.epic!, "pilot.answer", { accepted: true, to: from });
+              void notify(`Flightdeck: 조종을 @${from}에게 넘겼습니다. 이 창은 이제 관찰자입니다`);
+              pilotWin?.dispose();
+              pilotWin = null;
+              await refresh();
+            } else if (pick === "거절") await r.server.liveSend(r.product, ctx.epic!, "pilot.answer", { accepted: false, to: from });
+          }, (e) => vscode.window.showErrorMessage(`Flightdeck: ${(e as Error).message}`));
+        });
+        ext.subscriptions.push({ dispose: () => pilotWin?.dispose() });
+      }
+    } catch (e) {
+      out.appendLine(`[실시간] ${(e as Error).message}`);
+      void vscode.window.showWarningMessage(`Flightdeck 실시간: ${(e as Error).message}`);
+    }
+  }
+  ext.subscriptions.push(
+    vscode.window.registerTreeDataProvider("flightdeck.live", liveWin?.chat ?? new ChatTree()),
+    vscode.window.registerTreeDataProvider("flightdeck.opinions", pilotWin?.opinions ?? new OpinionTree()),
+  );
+  /** 조종을 넘겨받았다 (M8 L4): 한 번만 묻는다 */
+  const offered = new Set<string>();
+  async function offerAdopt(epic: string): Promise<void> {
+    if (offered.has(epic)) return;
+    offered.add(epic);
+    const pick = await notify(`Flightdeck: ${epic}의 조종을 넘겨받았습니다`, "이어서 작업");
+    if (pick) await vscode.commands.executeCommand("flightdeck.adoptPilot", epic);
   }
 
   if (ctx?.epic && ctx.worktree) {
@@ -692,8 +769,8 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       ext.subscriptions.push(checkpointTimers(ctx as Ctx & { epic: string; worktree: string }, out, refresh));
       ext.subscriptions.push(editlogTimers(ctx as Ctx & { epic: string; worktree: string }, out, refresh));
     }
-    // 줄 단위 출처 hover (M7 E6): 담당자 창은 로컬 편집 기록, 다른 창은 서버
-    ext.subscriptions.push(vscode.languages.registerHoverProvider({ scheme: "file" }, new BlameHover(ctx as Ctx & { epic: string; worktree: string }, out)));
+    // 줄 단위 출처 hover (M7 E6): 담당자 창은 로컬 편집 기록, 리뷰·질문 창은 서버
+    if (ctx.role !== "live") ext.subscriptions.push(vscode.languages.registerHoverProvider({ scheme: "file" }, new BlameHover(ctx as Ctx & { epic: string; worktree: string }, out)));
     // 에이전트가 산출물을 고치면(디스크 변경) 다시 그린다: 담당자 창은 문단 ID·쓰레드, 읽기 전용 창은 초안만 남기고 되돌림
     const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.join(ctx.worktree, ".flightdeck", "epics", ctx.epic), "{analysis,design}.md"));
     let t: NodeJS.Timeout | null = null;
@@ -1038,6 +1115,83 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
       if (pick) await vscode.commands.executeCommand("workbench.action.reloadWindow");
     }),
 
+    // ---- 조종수 모델 (§8.2~8.5, M8) ----
+    // 관찰 시작: 조종수의 체크포인트 + 편집 기록으로 `<epic>@live`를 만들어 새 창으로 연다
+    run("flightdeck.watch", async (epicArg?: string) => {
+      if (!ctx || ctx.mode !== "server") throw new Error("서버 모드에서만 관찰할 수 있습니다");
+      const epic = epicArg ?? ctx.epic ?? (await vscode.window.showInputBox({ title: "관찰할 에픽 ID", ignoreFocusOut: true }));
+      if (!epic) return;
+      const o = await ctx.wf.openLive(epic);
+      await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(o.worktree), { forceNewWindow: true });
+    }),
+    // 의견 보내기 (§8.4): 대화 블록, 에디터의 줄, 또는 일반
+    run("flightdeck.sendOpinion", async (item?: { block?: { text: string; role: string } }) => {
+      if (!ctx?.epic || ctx.role !== "live" || !liveWin) throw new Error("관찰자 창에서 보냅니다 (Flightdeck: 관찰 시작)");
+      const ed = vscode.window.activeTextEditor;
+      const target = item?.block
+        ? `대화: ${item.block.text.split("\n")[0]!.slice(0, 60)}`
+        : ed && ctx.worktree && ed.document.uri.fsPath.startsWith(ctx.worktree)
+          ? `${path.relative(ctx.worktree, ed.document.uri.fsPath).split(path.sep).join("/")}:${ed.selection.start.line + 1}`
+          : undefined;
+      if (await sendOpinion({ wf: ctx.wf, epic: ctx.epic, worktree: ctx.worktree! }, liveWin.pilot, target)) {
+        opinionsSent++;
+        await refresh();
+      }
+    }),
+    run("flightdeck.requestPilot", async () => {
+      if (!ctx?.epic || ctx.mode !== "server") throw new Error("에픽 창에서 요청합니다");
+      const pilot = writerOf(await ctx.wf.epicState(ctx.epic));
+      if (!pilot || pilot === ctx.wf.cfg.member) throw new Error("이미 내가 조종수입니다");
+      const r = ctx.wf.cfg.remote!;
+      await r.server.liveSend(r.product, ctx.epic, "pilot.request", {}, [pilot]);
+      void notify(`Flightdeck: @${pilot}에게 조종을 요청했습니다`);
+    }),
+    run("flightdeck.handOff", async (to?: string) => {
+      if (!ctx?.epic || ctx.role !== "owner") throw new Error("조종수의 작업 폴더에서 넘깁니다");
+      const members = (ctx.wf.cfg.remote?.config.members ?? []).filter((m) => m.active && m.id !== ctx.wf.cfg.member).map((m) => m.id);
+      const pick = to ?? (await vscode.window.showQuickPick(members, { title: "조종을 넘길 멤버" }));
+      if (!pick) return;
+      await saveAll();
+      await ctx.wf.handOff(ctx.epic, pick, "handoff");
+      pilotWin?.dispose();
+      pilotWin = null;
+      void notify(`Flightdeck: 조종을 @${pick}에게 넘겼습니다. 이 창은 이제 관찰자입니다`);
+      await refresh();
+    }),
+    // 넘겨받은 조종을 이어서 (L4) / 담당자의 강제 인수 (L5)
+    run("flightdeck.adoptPilot", async (epicArg?: string, opts: { takeover?: boolean } = {}) => {
+      if (!ctx || ctx.mode !== "server") throw new Error("서버 모드에서만");
+      const epic = epicArg ?? ctx.epic;
+      if (!epic) throw new Error("에픽을 정하세요");
+      const r = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Flightdeck: ${epic} 조종 이어받는 중` }, () => ctx.wf.adoptPilot(epic, opts));
+      flushWarnings();
+      await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(r.worktree), { forceNewWindow: ctx.worktree !== r.worktree });
+    }),
+    run("flightdeck.takeover", async () => {
+      if (!ctx?.epic) throw new Error("에픽 창에서");
+      const s = await ctx.wf.epicState(ctx.epic);
+      const pilot = writerOf(s);
+      if (s.owner !== ctx.wf.cfg.member) throw new Error("강제 인수는 담당자만 할 수 있습니다");
+      if (!pilot || pilot === ctx.wf.cfg.member) throw new Error("이미 내가 조종수입니다");
+      const r = ctx.wf.cfg.remote!;
+      const p = (await r.server.livePresence(r.product, ctx.epic))[pilot];
+      const limit = (s.pipeline?.pilot.takeover_after_minutes ?? 10) * 60_000;
+      const away = p?.online ? 0 : p?.offlineAt ? Date.now() - Date.parse(p.offlineAt) : Infinity;
+      if (away < limit) throw new Error(`조종수 @${pilot}이(가) ${p?.online ? "접속 중입니다" : `끊긴 지 ${Math.round(away / 60_000)}분입니다`}. ${limit / 60_000}분이 지나야 강제 인수할 수 있습니다`);
+      await vscode.commands.executeCommand("flightdeck.adoptPilot", ctx.epic, { takeover: true });
+    }),
+    ...(["deliver", "urgent", "reply", "dismiss"] as const).map((action) =>
+      run(`flightdeck.opinion.${action}`, async (item?: { o?: OpinionMsg }) => {
+        if (!ctx?.epic || !pilotWin || !item?.o) return;
+        let text: string | undefined;
+        if (action === "reply") text = await vscode.window.showInputBox({ title: `@${item.o.from}에게 답장`, ignoreFocusOut: true });
+        else if (action === "deliver" || action === "urgent") text = await vscode.window.showInputBox({ title: action === "urgent" ? "급한 의견으로 전달 (다음 도구 호출을 멈춘다)" : "에이전트에 전달", value: item.o.body, ignoreFocusOut: true });
+        if ((action === "reply" || action === "deliver" || action === "urgent") && !text) return;
+        await handleOpinion({ wf: ctx.wf, epic: ctx.epic, worktree: ctx.worktree! }, pilotWin.opinions, item.o, action, text);
+        await refresh();
+      }),
+    ),
+
     // 서버 레포 받기 (M5.5 Z7): 내장 git 제품의 레포를 받아 연다. 레포를 아직 열지 않은 창에서도 쓴다
     run("flightdeck.cloneFromServer", async () => {
       const cfg = vscode.workspace.getConfiguration("flightdeck");
@@ -1162,6 +1316,7 @@ export async function activate(ext: vscode.ExtensionContext): Promise<void> {
         wf: ctx.wf, epic: ctx.epic, worktree: ctx.worktree, role: ctx.role,
         commentThread: (id) => view?.get(id), draftThreads: () => view?.draftList() ?? [], commentThreadCount: () => view?.size ?? 0, statusText: () => status.text,
         notifications: notified, refresh, openViewer,
+        live: () => liveWin, pilot: () => pilotWin,
       },
       scenario,
     );

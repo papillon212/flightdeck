@@ -14,6 +14,7 @@ import type { AgentAdapter, HookEvent, HookResponse } from "@flightdeck/agent";
 import { git, GitEngine, isSecret, LocalEventStore, pushDetached, RAW_ARGS, RAW_ENV, RunStore } from "@flightdeck/git";
 import { phaseChangedContext, sessionContext, viewerContext } from "./context.ts";
 import { saveTranscript } from "./impl.ts";
+import { lastDeny, markDelivered, pendingOpinions, renderOpinion, SAME_MESSAGE_MS, setLastDeny, type Opinion } from "./opinions.ts";
 import { decide } from "./policy.ts";
 import { appendEditRecords, hookLog, lastSeq, saveSnapshot, takeSnapshot, updateState } from "./store.ts";
 
@@ -98,12 +99,13 @@ async function onSessionStart(ev: HookEvent, d: HandlerDeps): Promise<HookRespon
     } satisfies Event;
     await new LocalEventStore(s.repo).append(event);
     const updated = await updateState(d.dataDir, s.epic, (st) => {
-      st.runs[ev.sessionId] = { run_id: runId, context_phase: st.phase, started_at: iso(d) };
+      st.runs[ev.sessionId] = { run_id: runId, context_phase: st.phase, started_at: iso(d), ...(ev.transcriptPath ? { transcript: ev.transcriptPath } : {}) };
     });
     run = updated.runs[ev.sessionId]!;
   } else {
     await updateState(d.dataDir, s.epic, (st) => {
       st.runs[ev.sessionId]!.context_phase = st.phase;
+      if (ev.transcriptPath) st.runs[ev.sessionId]!.transcript = ev.transcriptPath;
     });
   }
   const text = await sessionContext({ epic: s.epic, phase: s.phase, runId: run.run_id, worktree: s.worktree, configDir: s.configDir, state: await loadEpicState(d) });
@@ -112,12 +114,45 @@ async function onSessionStart(ev: HookEvent, d: HandlerDeps): Promise<HookRespon
 
 async function onPromptSubmit(ev: HookEvent, d: HandlerDeps): Promise<HookResponse> {
   const run = d.state.runs[ev.sessionId];
-  if (!run || run.context_phase === d.state.phase) return { kind: "allow" };
+  // 멈춰 있는 동안 조종수가 전달한 의견은 다음 프롬프트에 붙인다 (§8.4). 급한 의견도 이때는 일반으로
+  const opinions = await deliverOpinions(d, "UserPromptSubmit", () => true);
+  if (!run || run.context_phase === d.state.phase) return opinions ? { kind: "context", text: opinions } : { kind: "allow" };
   const text = await phaseChangedContext({ epic: d.state.epic, from: run.context_phase, to: d.state.phase, runId: run.run_id, configDir: d.state.configDir });
   await updateState(d.dataDir, d.state.epic, (st) => {
     st.runs[ev.sessionId]!.context_phase = st.phase;
   });
-  return { kind: "context", text };
+  return { kind: "context", text: opinions ? `${text}\n\n${opinions}` : text };
+}
+
+/** 대기 중인 의견을 꺼내 추가 컨텍스트 글로 (§8.4, L7). 없으면 null */
+async function deliverOpinions(d: HandlerDeps, via: string, pick: (o: Opinion) => boolean): Promise<string | null> {
+  const list = (await pendingOpinions(d.dataDir, d.state.epic)).filter(pick);
+  if (!list.length) return null;
+  await markDelivered(d.dataDir, d.state.epic, list.map((o) => o.id), via, iso(d));
+  await hookLog(d.dataDir, d.state.epic, { kind: "opinion", via, ids: list.map((o) => o.id) });
+  return list.map(renderOpinion).join("\n");
+}
+
+/**
+ * 급한 의견 (§8.4): 대기 중이면 이 도구 호출을 거부하고 의견을 사유로 돌려준다.
+ * 직전 거부 1초 안의 호출은 같은 메시지의 나머지 호출이라 함께 거부한다. 판정 중 오류는 거부(fail-closed)
+ */
+async function urgentDeny(d: HandlerDeps): Promise<string | null> {
+  const now = (d.now?.() ?? new Date()).getTime();
+  try {
+    const urgent = await deliverOpinions(d, "PreToolUse", (o) => o.urgent);
+    if (urgent) {
+      await setLastDeny(d.dataDir, d.state.epic, now);
+      return `${urgent}\n[Flightdeck] 조종수가 급한 의견으로 이 도구 호출을 멈췄습니다. 의견대로 계획을 다시 세우세요.`;
+    }
+    if (now - (await lastDeny(d.dataDir, d.state.epic)) <= SAME_MESSAGE_MS) {
+      await setLastDeny(d.dataDir, d.state.epic, now);
+      return "[Flightdeck] 조종수의 급한 의견으로 같은 메시지의 나머지 도구 호출도 멈췄습니다. 의견대로 다시 계획하세요.";
+    }
+    return null;
+  } catch (e) {
+    return `[Flightdeck] 급한 의견 확인 중 오류로 멈췄습니다 (${e instanceof Error ? e.message : e})`;
+  }
 }
 
 /** 존재하지 않는 경로도 가장 가까운 상위 폴더를 realpath로 풀어 정규화한다 (§6.1 경로 정규화) */
@@ -153,6 +188,11 @@ async function onToolBefore(ev: HookEvent, d: HandlerDeps): Promise<HookResponse
     await hookLog(d.dataDir, s.epic, { kind: "deny", tool: t.name, paths, command: t.command, reason: decision.reason });
     return { kind: "deny", reason: decision.reason };
   }
+  const urgent = await urgentDeny(d);
+  if (urgent) {
+    await hookLog(d.dataDir, s.epic, { kind: "urgent_deny", tool: t.name });
+    return { kind: "deny", reason: urgent };
+  }
   // 편집 기록용 스냅샷 (§8.6 v0.10: 디스크 전후)
   if (t.kind === "write") {
     const files: Record<string, string | null> = {};
@@ -173,6 +213,14 @@ async function onToolBefore(ev: HookEvent, d: HandlerDeps): Promise<HookResponse
 }
 
 async function onToolAfter(ev: HookEvent, d: HandlerDeps): Promise<HookResponse> {
+  const r = await recordToolAfter(ev, d);
+  // 실행 중 조종수가 전달한 의견: 다음 모델 턴부터 반영된다 (§8.4)
+  const opinions = await deliverOpinions(d, "PostToolUse", (o) => !o.urgent);
+  if (!opinions) return r;
+  return { kind: "context", text: r.kind === "context" ? `${r.text}\n\n${opinions}` : opinions };
+}
+
+async function recordToolAfter(ev: HookEvent, d: HandlerDeps): Promise<HookResponse> {
   const t = ev.tool!;
   const s = d.state;
   const snap = await takeSnapshot(d.dataDir, s.epic, t.useId);

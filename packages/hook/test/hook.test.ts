@@ -8,7 +8,7 @@ import { ClaudeCodeAdapter } from "@flightdeck/agent";
 import { replay, sha256, ulid } from "@flightdeck/core";
 import { git, GitEngine, LocalEventStore } from "@flightdeck/git";
 import type { LocalEpicState } from "@flightdeck/schema";
-import { handle, readEditLog, readState, writeState } from "../src/index.ts";
+import { deliveredOpinions, handle, pendingOpinions, queueOpinion, readEditLog, readState, writeState } from "../src/index.ts";
 
 const CONFIG = path.resolve(import.meta.dirname, "../../../examples/flightdeck-config/products/sample");
 const DIST_HOOK = path.resolve(import.meta.dirname, "../../../dist/flightdeck-hook.mjs");
@@ -156,6 +156,29 @@ describe("flightdeck-hook (설계 §6.1)", () => {
     expect(ctx).toContain("단계가 ANALYSIS → DESIGN로 바뀌었습니다");
     expect(ctx).toContain("## 설계 단계");
     expect((await fire("UserPromptSubmit", { prompt: "다시" })).out.stdout).toBe("");
+  });
+
+  it("관찰자 의견 (§8.4, M8 L7): 일반은 다음 PostToolUse·UserPromptSubmit에, 급한 의견은 PreToolUse 거부 + 1초 안의 나머지 호출도", async () => {
+    const read = tool("Read", { file_path: path.join(wt, "app.txt") });
+    await queueOpinion(dataDir, EPIC, { id: "o1", from: "park", body: "테스트부터 고쳐 주세요", urgent: false, at: new Date().toISOString(), target: "src/a.js:3" });
+    const after = await fire("PostToolUse", { ...read, tool_response: {} });
+    expect(after.resp).toEqual({ kind: "context", text: "[관찰자 @park 의견 · 조종수 전달] (src/a.js:3) 테스트부터 고쳐 주세요" });
+    expect(JSON.parse(after.out.stdout).hookSpecificOutput.additionalContext).toContain("테스트부터");
+    expect((await fire("PostToolUse", { ...read, tool_response: {} })).resp).toEqual({ kind: "allow" }); // 한 번만
+
+    await queueOpinion(dataDir, EPIC, { id: "o2", from: "park", body: "멈추세요, 파일 삭제 금지", urgent: true, at: new Date().toISOString() });
+    const d1 = await fire("PreToolUse", tool("Read", { file_path: path.join(wt, "app.txt") }));
+    expect(d1.resp).toMatchObject({ kind: "deny", reason: expect.stringContaining("멈추세요, 파일 삭제 금지") });
+    const d2 = await fire("PreToolUse", tool("Read", { file_path: path.join(wt, "app.txt") })); // 같은 메시지의 나머지 호출
+    expect(d2.resp).toMatchObject({ kind: "deny", reason: expect.stringContaining("나머지 도구 호출") });
+    await new Promise((r) => setTimeout(r, 1100));
+    expect((await fire("PreToolUse", tool("Read", { file_path: path.join(wt, "app.txt") }))).resp).toEqual({ kind: "allow" }); // 새 턴
+
+    await queueOpinion(dataDir, EPIC, { id: "o3", from: "choi", body: "이름을 바꿔 주세요", urgent: false, at: new Date().toISOString() });
+    const p = await fire("UserPromptSubmit", { prompt: "계속" });
+    expect(p.resp).toMatchObject({ kind: "context", text: expect.stringContaining("@choi 의견") });
+    expect((await pendingOpinions(dataDir, EPIC)).length).toBe(0);
+    expect((await deliveredOpinions(dataDir, EPIC)).map((x) => `${x.ids}:${x.via}`)).toEqual(["o1:PostToolUse", "o2:PreToolUse", "o3:UserPromptSubmit"]);
   });
 
   it("session.stop: 바뀐 게 있을 때만 체크포인트 (§8.1)", async () => {
